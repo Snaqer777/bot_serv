@@ -1,9 +1,17 @@
 import asyncio
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не найден! Проверь .env или Variables в Railway.")
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
-BOT_TOKEN = "8810047635:AAF8OBrPkZ5zAmaBoyEaZ-HL9gQHq23oeSI"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -14,7 +22,6 @@ TARIFFS = {
     "premium": {"name": "Премиум", "price": 599, "traffic": "Безлимит", "ips": 10, "locations": "Все локации"},
 }
 
-# --- КЛАВИАТУРЫ ---
 def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔐 Подключить VPN", callback_data="connect_vpn")],
@@ -34,7 +41,6 @@ def tariffs_kb():
 def back_kb():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад в меню", callback_data="main_menu")]])
 
-# --- СТАРТ + ЛИЦЕНЗИЯ ---
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -57,7 +63,6 @@ async def accept_license(callback: CallbackQuery):
 async def main_menu(cb: CallbackQuery):
     await cb.message.edit_text("🏠 Главное меню:", reply_markup=main_menu_kb())
 
-# --- ТАРИФЫ ---
 @dp.callback_query(F.data == "tariffs")
 async def tariffs(cb: CallbackQuery):
     text = "<b>Выберите тариф:</b>\n\n"
@@ -79,40 +84,51 @@ async def buy(cb: CallbackQuery):
 @dp.callback_query(F.data == "fake_pay")
 async def fake_pay(cb: CallbackQuery):
     await cb.answer("Оплата успешна (демо)!", show_alert=True)
-    await cb.message.edit_text("✅ Оплата прошла (заглушка). Перейди в профиль.", reply_markup=back_kb())
+    await cb.message.edit_text("✅ Оплата прошла (заглушка). Перейди в профиль или активируй по инструкции.", reply_markup=back_kb())
 
-# --- ПРОФИЛЬ ---
 @dp.callback_query(F.data == "profile")
 async def profile(cb: CallbackQuery):
     await cb.message.edit_text("👤 Профиль:\n\nСтатус: нет активной подписки.\n(Данные появятся после подключения 3x-ui и БД)", reply_markup=back_kb())
 
-# --- ПОДКЛЮЧИТЬ VPN ---
 @dp.callback_query(F.data == "connect_vpn")
 async def connect(cb: CallbackQuery):
     await cb.message.edit_text("🔐 Для подключения выбери тариф 👇", reply_markup=tariffs_kb())
 
-# --- ИНСТРУКЦИЯ ПО АКТИВАЦИИ ---
 @dp.callback_query(F.data == "activation")
 async def activation(cb: CallbackQuery):
     await cb.message.edit_text(
-        "📋 <b>Инструкция по активации</b>\n\n"
-        "• Android → <b>V2Box</b>\n"
-        "• iOS → <b>Wispy, INCY, Happ, V2RayTun</b> / Shadowrocket\n"
-        "• PC → <b>Happ, V2RayTun</b>\n\n"
-        "1. Установи приложение.\n"
-        "2. Скопируй ключ из профиля или после оплаты.\n"
-        "3. Добавь ключ в приложение и подключись.",
-        reply_markup=back_kb(), parse_mode="HTML"
+        "📋 <b>Инструкция по активации от А до Я</b>\n\n"
+        "<b>🍎 iOS (iPhone / iPad)</b>\n"
+        "1. Скачай одно из приложений:\n"
+        "   • <a href='https://apps.apple.com/app/happ'>Happ</a>\n"
+        "   • <a href='https://apps.apple.com/app/incy'>INCY</a>\n"
+        "   • <a href='https://apps.apple.com/app/wispy'>Wispy</a>\n"
+        "2. Открой приложение → нажми <b>«+</b> (добавить)\n"
+        "3. Выбери <b>«Импорт из буфера»</b> или вставь ссылку вручную\n"
+        "4. Нажми <b>«Подключить»</b> (значок Play)\n"
+        "5. Разреши добавление VPN в настройках iOS\n\n"
+        "<b>🤖 Android</b>\n"
+        "1. Скачай: <a href='https://play.google.com/store/apps/details?id=com.v2box.v2box'>v2box</a>\n"
+        "2. Открой → нажми <b>«+»</b> внизу справа\n"
+        "3. Жми <b>«Импорт из буфера обмена»</b>\n"
+        "4. Вставь свой ключ из профиля → жми <b>«Сохранить»</b>\n"
+        "5. Нажми на профиль → кнопка <b>«Старт»</b>\n\n"
+        "<b>💻 PC (Windows / Mac)</b>\n"
+        "1. Скачай: <a href='https://github.com/v2raytun/v2raytun'>v2raytun</a> или <a href='https://gethapp.app'>Happ</a>\n"
+        "2. Установи и запусти программу\n"
+        "3. Нажми <b>«Add» / «Добавить»</b> → выбери <b>«Import URL»</b>\n"
+        "4. Вставь ссылку VLESS из профиля → <b>«Сохранить»</b>\n"
+        "5. Жми <b>«Connect»</b> и разреши VPN в системе\n\n"
+        "<i>Не работает? Пиши в поддержку 👇</i>",
+        reply_markup=back_kb(), parse_mode="HTML", disable_web_page_preview=True
     )
 
-# --- ПОДДЕРЖКА ---
 @dp.callback_query(F.data == "support")
 async def support(cb: CallbackQuery):
-    # Замени ссылку на своего юзера или аккаунт поддержки
     await cb.message.edit_text(
         "💬 <b>Поддержка</b>\n\n"
         "По всем вопросам пиши сюда:\n"
-        "👉 @Suppr_XYZ\n"
+        "👉 <a href='https://t.me/Suppr_XYZ'>@Suppr_XYZ</a>\n\n"
         "Отвечаем обычно в течение часа.",
         reply_markup=back_kb(), parse_mode="HTML"
     )
