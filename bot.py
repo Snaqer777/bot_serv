@@ -35,16 +35,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не найден! Добавь его в Railway Variables.")
 
-ADMIN_ID = int(os.getenv("ADMIN_ID") or "0")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or "0")
 
 XUI_URL = os.getenv("XUI_URL", "").strip().rstrip("/")
-XUI_USERNAME = os.getenv("XUI_USERNAME", "")
-XUI_PASSWORD = os.getenv("XUI_PASSWORD", "")
-XUI_INBOUND_ID = int(os.getenv("XUI_INBOUND_ID") or "0")
+XUI_USERNAME = os.getenv("XUI_USERNAME", "").strip()
+XUI_PASSWORD = os.getenv("XUI_PASSWORD", "").strip()
+XUI_INBOUND_ID = int(os.getenv("XUI_INBOUND_ID", "0").strip() or "0")
 
 VPN_HOST = os.getenv("VPN_HOST", "").strip()
 
@@ -93,11 +93,11 @@ TARIFFS = {
 # =========================================================
 
 class XUIError(Exception):
-    """Ошибки взаимодействия с 3x-ui для вывода в чат."""
+    """Кастомная ошибка для вывода в чат."""
 
 
 def as_dict(value):
-    """Парсинг JSON-строки или словаря."""
+    """Безопасный парсинг в словарь."""
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -111,7 +111,7 @@ def as_dict(value):
 
 
 async def xui_request(session: aiohttp.ClientSession, method: str, path: str, **kwargs):
-    """Выполнение запроса к 3x-ui с подробным ответом при ошибке."""
+    """Выполнение запроса к 3x-ui API."""
     url = f"{XUI_URL}{path}"
     
     async with session.request(method, url, allow_redirects=True, **kwargs) as response:
@@ -120,17 +120,15 @@ async def xui_request(session: aiohttp.ClientSession, method: str, path: str, **
         if response.status >= 400:
             logger.error("3x-ui HTTP %s: %s", response.status, resp_text)
             raise XUIError(
-                f"3x-ui вернула <b>HTTP {response.status}</b> на запрос <code>{path}</code>.\n\n"
-                f"Ответ панели:\n<code>{escape(resp_text[:350])}</code>\n\n"
-                "💡 <i>Если там ошибка входа или бан — выполни <code>x-ui restart</code> на сервере.</i>"
+                f"❌ 3x-ui вернула <b>HTTP {response.status}</b> на запрос <code>{path}</code>.\n\n"
+                f"Ответ панели:\n<code>{escape(resp_text[:300])}</code>"
             )
 
         try:
             result = json.loads(resp_text)
         except Exception as exc:
             raise XUIError(
-                f"Панель вернула не JSON-ответ.\n"
-                f"Ответ сервера:\n<code>{escape(resp_text[:250])}</code>"
+                f"Панель вернула не JSON.\nОтвет: <code>{escape(resp_text[:200])}</code>"
             ) from exc
 
     if not isinstance(result, dict):
@@ -145,9 +143,12 @@ async def xui_request(session: aiohttp.ClientSession, method: str, path: str, **
 
 @asynccontextmanager
 async def xui_session():
-    """Создание сессии с браузерными заголовками."""
+    """Авторизация в 3x-ui с автоматическим перебором вариантов."""
     if not XUI_URL or not XUI_USERNAME or not XUI_PASSWORD:
-        raise XUIError("В Railway Variables не заполнены XUI_URL, XUI_USERNAME или XUI_PASSWORD.")
+        raise XUIError(
+            "В Railway Variables не заполнены:\n"
+            "<code>XUI_URL</code>, <code>XUI_USERNAME</code> или <code>XUI_PASSWORD</code>."
+        )
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -167,27 +168,67 @@ async def xui_session():
             "password": XUI_PASSWORD,
         }
 
-        login_url = f"{XUI_URL}/login"
-        
-        # Пробуем войти через Form-Data
-        async with session.post(login_url, data=login_payload, allow_redirects=True) as resp:
-            text = await resp.text()
+        login_success = False
+        last_error_text = ""
+        last_status = 0
+
+        # Перебираем возможные точки входа панели
+        login_endpoints = ["/login", "/login/", "/api/login"]
+
+        for endpoint in login_endpoints:
+            target_url = f"{XUI_URL}{endpoint}"
             
-            # Если 403 или не JSON, пробуем второй метод: POST JSON
-            if resp.status == 403 or "success" not in text.lower():
-                async with session.post(login_url, json=login_payload, allow_redirects=True) as json_resp:
-                    json_text = await json_resp.text()
-                    if json_resp.status >= 400:
-                        raise XUIError(
-                            f"3x-ui вернула <b>HTTP {json_resp.status}</b> при входе (/login).\n\n"
-                            f"Ответ панели:\n<code>{escape(json_text[:300])}</code>\n\n"
-                            "💡 <i>Перезапусти панель командой <code>x-ui restart</code> на сервере.</i>"
-                        )
-            elif resp.status >= 400:
-                raise XUIError(
-                    f"3x-ui вернула <b>HTTP {resp.status}</b> при входе (/login).\n\n"
-                    f"Ответ панели:\n<code>{escape(text[:300])}</code>"
-                )
+            # Вариант А: отправка form-urlencoded
+            try:
+                async with session.post(target_url, data=login_payload, allow_redirects=True) as resp:
+                    resp_text = await resp.text()
+                    last_status = resp.status
+                    last_error_text = resp_text
+
+                    if resp.status == 200:
+                        try:
+                            json_data = json.loads(resp_text)
+                            if json_data.get("success") is True:
+                                login_success = True
+                                break
+                        except Exception:
+                            # Если вернулся 200 OK без JSON, но установлена кука
+                            if len(session.cookie_jar) > 0:
+                                login_success = True
+                                break
+            except Exception as e:
+                logger.warning("Ошибка при попытке входа на %s: %s", target_url, e)
+
+            # Вариант Б: отправка JSON
+            try:
+                async with session.post(target_url, json=login_payload, allow_redirects=True) as resp:
+                    resp_text = await resp.text()
+                    last_status = resp.status
+                    last_error_text = resp_text
+
+                    if resp.status == 200:
+                        try:
+                            json_data = json.loads(resp_text)
+                            if json_data.get("success") is True:
+                                login_success = True
+                                break
+                        except Exception:
+                            if len(session.cookie_jar) > 0:
+                                login_success = True
+                                break
+            except Exception as e:
+                logger.warning("Ошибка при попытке JSON входа на %s: %s", target_url, e)
+
+        if not login_success:
+            raise XUIError(
+                f"❌ Не удалось войти в 3x-ui (<b>HTTP {last_status}</b>).\n\n"
+                f"<b>URL:</b> <code>{XUI_URL}/login</code>\n"
+                f"<b>Логин:</b> <code>{XUI_USERNAME}</code>\n"
+                f"<b>Ответ сервера:</b>\n<code>{escape(last_error_text[:300])}</code>\n\n"
+                "💡 <b>Как исправить:</b>\n"
+                "1. Проверь логин и пароль в Railway Variables (без пробелов).\n"
+                "2. Выполни <code>x-ui restart</code> в SSH сервера для сброса бана IP."
+            )
 
         yield session
 
@@ -195,10 +236,10 @@ async def xui_session():
 def get_reality_parameters(inbound: dict):
     """Извлечение ключей Reality."""
     if inbound.get("protocol") != "vless":
-        raise XUIError("Выбранный Inbound не является VLESS.")
+        raise XUIError("Выбранный Inbound не использует протокол VLESS.")
 
     if not inbound.get("enable"):
-        raise XUIError("Выбранный Inbound выключен в панели.")
+        raise XUIError("Выбранный Inbound отключен в панели.")
 
     stream = as_dict(inbound.get("streamSettings"))
     reality = as_dict(stream.get("realitySettings"))
@@ -225,11 +266,11 @@ def get_reality_parameters(inbound: dict):
 
     if not public_key or not sni:
         raise XUIError(
-            "Не удалось автоматически извлечь параметры Reality.\n"
+            "Не удалось получить ключи Reality.\n"
             "Добавь в Railway Variables:\n"
-            "REALITY_PUBLIC_KEY — Public Key Reality\n"
-            "REALITY_SNI — Server Name (например, google.com)\n"
-            "REALITY_SHORT_ID — Short ID"
+            "<code>REALITY_PUBLIC_KEY</code> — Public Key\n"
+            "<code>REALITY_SNI</code> — Server Name (например, google.com)\n"
+            "<code>REALITY_SHORT_ID</code> — Short ID"
         )
 
     return {
@@ -284,7 +325,7 @@ async def create_or_get_test_client(telegram_id: int):
         )
 
         if not isinstance(inbound, dict):
-            raise XUIError("Inbound с указанным ID не найден в панели.")
+            raise XUIError("Inbound с таким ID не найден в панели.")
 
         reality = get_reality_parameters(inbound)
         settings = as_dict(inbound.get("settings"))
@@ -327,7 +368,7 @@ async def create_or_get_test_client(telegram_id: int):
 
 
 async def show_xui_error(message: Message, error: Exception):
-    """Вывод ошибок в чат."""
+    """Вывод ошибок пользователю."""
     if isinstance(error, XUIError):
         text = str(error)
     elif isinstance(error, asyncio.TimeoutError):
@@ -345,19 +386,13 @@ async def show_xui_error(message: Message, error: Exception):
 
 def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🔐 Подключить VPN", callback_data="connect_vpn")
-        ],
+        [InlineKeyboardButton(text="🔐 Подключить VPN", callback_data="connect_vpn")],
         [
             InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile"),
             InlineKeyboardButton(text="💰 Тарифы", callback_data="tariffs"),
         ],
-        [
-            InlineKeyboardButton(text="📋 Инструкция по активации", callback_data="activation")
-        ],
-        [
-            InlineKeyboardButton(text="💬 Поддержка", callback_data="support")
-        ],
+        [InlineKeyboardButton(text="📋 Инструкция по активации", callback_data="activation")],
+        [InlineKeyboardButton(text="💬 Поддержка", callback_data="support")],
     ])
 
 
@@ -378,17 +413,14 @@ def tariffs_kb():
 
 def back_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="◀️ Назад в меню", callback_data="main_menu")
-        ]
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="main_menu")]
     ])
 
 
 # =========================================================
-# 4. ХЕНДЛЕРЫ КОМАНД
+# 4. ОБРАБОТЧИКИ КОМАНД
 # =========================================================
 
-# Поддерживаем и /myid, и /myip, и /id, и /ip
 @dp.message(Command("myid", "myip", "id", "ip"), F.chat.type == "private")
 async def cmd_myid(message: Message):
     await message.answer(
@@ -401,7 +433,7 @@ async def cmd_myid(message: Message):
 @dp.message(Command("inbounds"), F.chat.type == "private")
 async def cmd_inbounds(message: Message):
     if ADMIN_ID != 0 and message.from_user.id != ADMIN_ID:
-        await message.answer("⛔️ Эта команда доступна только администратору.")
+        await message.answer("⛔️ Эта команда доступна только администратору бота.")
         return
 
     try:
@@ -409,10 +441,10 @@ async def cmd_inbounds(message: Message):
             items = await xui_request(session, "GET", "/panel/api/inbounds/list")
 
         if not items:
-            await message.answer("В панели нет входящих подключений (inbounds). Создай VLESS Inbound.")
+            await message.answer("В панели нет подключений (inbounds). Создай VLESS Inbound.")
             return
 
-        text = "<b>Список ваших Inbounds в 3x-ui:</b>\n\n"
+        text = "<b>Список подключений в 3x-ui:</b>\n\n"
         for item in items:
             stream = as_dict(item.get("streamSettings"))
             text += (
@@ -431,7 +463,7 @@ async def cmd_inbounds(message: Message):
 @dp.message(Command("test_vpn"), F.chat.type == "private")
 async def cmd_test_vpn(message: Message):
     if ADMIN_ID != 0 and message.from_user.id != ADMIN_ID:
-        await message.answer("⛔️ Эта команда доступна только администратору.")
+        await message.answer("⛔️ Эта команда доступна только администратору бота.")
         return
 
     try:
@@ -442,7 +474,7 @@ async def cmd_test_vpn(message: Message):
         await message.answer(
             f"{title}\n\n"
             f"<code>{escape(link)}</code>\n\n"
-            "Нажми на ключ выше, чтобы скопировать его, и импортируй в VPN-приложение.",
+            "Нажми на ключ выше для копирования и вставь его в приложение (V2rayN, Happ, Streisand, Nekobox).",
             parse_mode="HTML",
         )
     except Exception as error:
@@ -456,8 +488,8 @@ async def cmd_start(message: Message):
     ])
     await message.answer(
         "📄 <b>Лицензионное соглашение</b>\n\n"
-        "1. Использование сервиса строго в рамках закона.\n"
-        "2. Передача ключей третьим лицам запрещена.\n"
+        "1. Сервис предоставляется в ознакомительных целях.\n"
+        "2. Запрещена противоправная деятельность.\n"
         "3. Нажмите кнопку ниже для продолжения.",
         reply_markup=keyboard,
         parse_mode="HTML",
@@ -562,7 +594,6 @@ async def support_callback(cb: CallbackQuery):
     )
 
 
-# Ответ на любое непонятное текстовое сообщение
 @dp.message(F.chat.type == "private")
 async def fallback_text(message: Message):
     await message.answer(
@@ -575,7 +606,7 @@ async def fallback_text(message: Message):
 
 
 # =========================================================
-# 5. ЗАПУСК БОТА
+# 5. ТОЧКА ВХОДА
 # =========================================================
 
 async def main():
