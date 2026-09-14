@@ -23,20 +23,21 @@ from aiogram.types import (
 )
 
 
-# ==================
-# НАСТРОЙКИ
-# ==================
+# =========================================================
+# 1. НАСТРОЙКИ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# =========================================================
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError(
-        "BOT_TOKEN не найден! Добавь его в Railway Variables."
-    )
+    raise ValueError("BOT_TOKEN не найден! Добавь его в Railway Variables.")
 
 ADMIN_ID = int(os.getenv("ADMIN_ID") or "0")
 
@@ -47,16 +48,17 @@ XUI_INBOUND_ID = int(os.getenv("XUI_INBOUND_ID") or "0")
 
 VPN_HOST = os.getenv("VPN_HOST", "").strip()
 
+# Параметры для тестового ключа
 TEST_HOURS = 24
 TEST_TRAFFIC_BYTES = 1024 ** 3  # 1 ГиБ
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Защита от одновременного создания клиента в одном процессе.
+# Блокировка от одновременных кликов
 test_lock = asyncio.Lock()
 
-
+# Тарифная сетка
 TARIFFS = {
     "school": {
         "name": "Школьник",
@@ -70,7 +72,7 @@ TARIFFS = {
         "price": 249,
         "traffic": "Безлимит",
         "ips": 3,
-        "locations": "2 (Стокгольм...)",
+        "locations": "2 локации",
     },
     "family": {
         "name": "Семейный",
@@ -89,89 +91,79 @@ TARIFFS = {
 }
 
 
-# ==================
-# РАБОТА С API 3X-UI
-# ==================
+# =========================================================
+# 2. ИНТЕГРАЦИЯ С 3X-UI API
+# =========================================================
 
 class XUIError(Exception):
-    """Ошибка, которую можно безопасно показать в Telegram."""
+    """Кастомное исключение с понятным текстом для пользователя."""
 
 
 def as_dict(value):
-    """Настройки 3x-ui могут приходить JSON-строкой."""
+    """Безопасный парсинг JSON-строки или словаря."""
     if isinstance(value, str):
-        value = json.loads(value)
+        try:
+            value = json.loads(value)
+        except Exception:
+            return {}
 
-    if value is None:
+    if value is None or not isinstance(value, dict):
         return {}
-
-    if not isinstance(value, dict):
-        raise XUIError(
-            "Неожиданный формат настроек в ответе 3x-ui. "
-            "Нужно проверить совместимость с версией панели."
-        )
 
     return value
 
 
-async def xui_request(session, method, path, **kwargs):
-    async with session.request(
-        method,
-        f"{XUI_URL}{path}",
-        **kwargs,
-    ) as response:
+async def xui_request(session: aiohttp.ClientSession, method: str, path: str, **kwargs):
+    """Выполнение HTTP-запроса к API панели 3x-ui."""
+    url = f"{XUI_URL}{path}"
+    
+    async with session.request(method, url, **kwargs) as response:
         if response.status >= 400:
             raise XUIError(
-                f"3x-ui вернула HTTP {response.status} "
-                f"для запроса {path}.\n"
-                "Проверь адрес панели, доступ к API и данные входа."
+                f"3x-ui вернула HTTP {response.status} на запрос {path}.\n"
+                "Проверь логин, пароль и URL панели."
             )
 
         try:
             result = await response.json(content_type=None)
         except ValueError as exc:
             raise XUIError(
-                "Панель вернула не JSON.\n"
-                "Проверь XUI_URL: нужен базовый адрес панели "
-                "с её секретным путём, без /panel/inbounds."
+                "Панель вернула не JSON-ответ.\n"
+                "Проверь XUI_URL: нужен базовый адрес панели с секретным путём (без /panel/inbounds)."
             ) from exc
 
     if not isinstance(result, dict):
-        raise XUIError("Неожиданный ответ API 3x-ui.")
+        raise XUIError("Неожиданный формат ответа от 3x-ui.")
 
     if result.get("success") is not True:
-        # Не пересылаем сырой ответ панели в Telegram:
-        # в нём могут оказаться чувствительные данные.
-        raise XUIError(
-            f"3x-ui отклонила запрос {path}.\n"
-            "Проверь логин, пароль, настройки API и журнал панели."
-        )
+        msg = result.get("msg", "Запрос отклонен панелью")
+        raise XUIError(f"Ошибка 3x-ui: {msg}")
 
     return result.get("obj")
 
 
 @asynccontextmanager
 async def xui_session():
+    """Контекстный менеджер для авторизованной сессии в 3x-ui."""
     if not XUI_URL or not XUI_USERNAME or not XUI_PASSWORD:
         raise XUIError(
-            "Добавь в Railway Variables:\n"
-            "XUI_URL\nXUI_USERNAME\nXUI_PASSWORD\n"
-            "Затем перезапусти бота."
+            "В Railway не заполнены переменные:\n"
+            "XUI_URL, XUI_USERNAME или XUI_PASSWORD."
         )
 
-    # Для подключения Railway к публичной панели требуем HTTPS.
-    if not XUI_URL.startswith("https://"):
-        raise XUIError(
-            "XUI_URL должен начинаться с https://.\n"
-            "Настрой HTTPS для панели с действительным сертификатом."
-        )
+    # Имитируем реальный браузер (защита от 403 Forbidden)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "X-Requested-With": "XMLHttpRequest",
+    }
 
-    # unsafe=True разрешает cookie для адреса в виде IP.
-    # Проверка TLS-сертификата остаётся включённой.
     async with aiohttp.ClientSession(
         cookie_jar=aiohttp.CookieJar(unsafe=True),
-        timeout=aiohttp.ClientTimeout(total=25),
+        timeout=aiohttp.ClientTimeout(total=20),
+        headers=headers,
     ) as session:
+        # Авторизация в панели
         await xui_request(
             session,
             "POST",
@@ -184,36 +176,19 @@ async def xui_session():
         yield session
 
 
-def get_reality_parameters(inbound):
+def get_reality_parameters(inbound: dict):
+    """Извлечение Reality параметров (pbk, sni, sid, spiderX)."""
     if inbound.get("protocol") != "vless":
-        raise XUIError("Выбранный inbound не использует VLESS.")
+        raise XUIError("Выбранный Inbound не является VLESS.")
 
     if not inbound.get("enable"):
-        raise XUIError("Выбранный inbound выключен в панели.")
+        raise XUIError("Выбранный Inbound выключен в панели.")
 
     stream = as_dict(inbound.get("streamSettings"))
-
-    if (
-        stream.get("network") not in ("tcp", "raw")
-        or stream.get("security") != "reality"
-    ):
-        raise XUIError(
-            "Этот код рассчитан на VLESS + TCP/RAW + Reality."
-        )
-
-    tcp_settings = as_dict(
-        stream.get("tcpSettings") or stream.get("rawSettings")
-    )
-    header = as_dict(tcp_settings.get("header"))
-
-    if header.get("type", "none") != "none":
-        raise XUIError(
-            "Для этого теста нужен обычный TCP без HTTP-заголовка."
-        )
-
     reality = as_dict(stream.get("realitySettings"))
     client_settings = as_dict(reality.get("settings"))
 
+    # Поиск публичного ключа Reality
     public_key = (
         os.getenv("REALITY_PUBLIC_KEY")
         or client_settings.get("publicKey")
@@ -221,61 +196,43 @@ def get_reality_parameters(inbound):
     )
 
     server_names = reality.get("serverNames") or []
+    if isinstance(server_names, str):
+        server_names = [s.strip() for s in server_names.split(",")]
+
     short_ids = reality.get("shortIds") or []
+    if isinstance(short_ids, str):
+        short_ids = [s.strip() for s in short_ids.split(",")]
 
-    sni = os.getenv("REALITY_SNI") or (
-        server_names[0] if server_names else ""
-    )
-
+    sni = os.getenv("REALITY_SNI") or (server_names[0] if server_names else "")
     short_id = os.getenv("REALITY_SHORT_ID")
     if short_id is None:
-        short_id = short_ids[0] if short_ids else None
+        short_id = short_ids[0] if short_ids else ""
 
-    if not public_key or not sni or short_id is None:
+    if not public_key or not sni:
         raise XUIError(
-            "Не удалось получить все параметры Reality из API.\n\n"
+            "Не удалось автоматически извлечь Reality ключи из панели.\n"
             "Добавь в Railway Variables:\n"
             "REALITY_PUBLIC_KEY — публичный ключ Reality\n"
-            "REALITY_SNI — один из Server Names\n"
-            "REALITY_SHORT_ID — один из Short IDs\n\n"
-            "Бери значения из существующего inbound. "
-            "Private Key сюда не подходит."
-        )
-
-    if "*" in sni:
-        raise XUIError(
-            "Укажи REALITY_SNI: конкретное допустимое имя сервера "
-            "для этого inbound, без символа *."
+            "REALITY_SNI — Server Name (например: dl.google.com)\n"
+            "REALITY_SHORT_ID — Short ID"
         )
 
     return {
         "public_key": public_key,
         "sni": sni,
         "short_id": short_id,
-        "spider_x": client_settings.get("spiderX") or "/",
+        "spider_x": client_settings.get("spiderX") or reality.get("spiderX") or "/",
     }
 
 
-def build_vless_link(client, inbound, reality):
-    if not VPN_HOST or any(
-        character in VPN_HOST for character in "/?#@"
-    ):
-        raise XUIError(
-            "Укажи VPN_HOST в Railway: публичный домен или IP "
-            "VPN-сервера без https://, пути и порта."
-        )
+def build_vless_link(client: dict, inbound: dict, reality: dict) -> str:
+    """Сборка рабочей ссылки подключения vless://..."""
+    if not VPN_HOST:
+        raise XUIError("Переменная VPN_HOST не заполнена в Railway Variables.")
 
-    try:
-        port = int(os.getenv("VPN_PORT") or inbound["port"])
-    except (ValueError, TypeError, KeyError) as exc:
-        raise XUIError("Не удалось определить порт VPN.") from exc
-
-    if not 1 <= port <= 65535:
-        raise XUIError("Некорректный порт VPN.")
-
+    port = int(os.getenv("VPN_PORT") or inbound["port"])
     host = VPN_HOST
 
-    # IPv6 в ссылке должен находиться в квадратных скобках.
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
 
@@ -294,21 +251,15 @@ def build_vless_link(client, inbound, reality):
         params["flow"] = client["flow"]
 
     query = urlencode(params, quote_via=quote)
-    label = quote("VPN test", safe="")
+    label = quote(f"VPN-{client.get('email', 'Key')}", safe="")
 
-    return (
-        f"vless://{client['id']}@{host}:{port}"
-        f"?{query}#{label}"
-    )
+    return f"vless://{client['id']}@{host}:{port}?{query}#{label}"
 
 
-async def create_or_get_test_client(telegram_id):
+async def create_or_get_test_client(telegram_id: int):
+    """Поиск или создание клиента в выбранном Inbound."""
     if XUI_INBOUND_ID <= 0:
-        raise XUIError(
-            "Сначала отправь /inbounds.\n"
-            "Запиши ID нужного подключения в XUI_INBOUND_ID "
-            "в Railway и перезапусти бота."
-        )
+        raise XUIError("Сначала отправь /inbounds и установи XUI_INBOUND_ID в Railway.")
 
     async with xui_session() as session:
         inbound = await xui_request(
@@ -318,24 +269,15 @@ async def create_or_get_test_client(telegram_id):
         )
 
         if not isinstance(inbound, dict):
-            raise XUIError("Inbound с таким ID не найден.")
+            raise XUIError("Inbound с указанным ID не найден в панели.")
 
         reality = get_reality_parameters(inbound)
         settings = as_dict(inbound.get("settings"))
 
-        # Постоянное имя позволяет найти клиента после
-        # перезапуска Railway без отдельной базы данных.
-        email = f"tg-test-{telegram_id}-{XUI_INBOUND_ID}"
-
-        client = next(
-            (
-                item
-                for item in (settings.get("clients") or [])
-                if item.get("email") == email
-            ),
-            None,
-        )
-
+        email = f"tg-{telegram_id}"
+        clients = settings.get("clients") or []
+        
+        client = next((c for c in clients if c.get("email") == email), None)
         created = client is None
         now_ms = int(time.time() * 1000)
 
@@ -345,435 +287,269 @@ async def create_or_get_test_client(telegram_id):
                 "email": email,
                 "flow": "xtls-rprx-vision",
                 "enable": True,
-                "limitIp": 1,
-                # Несмотря на имя поля, API принимает байты.
+                "limitIp": 2,
                 "totalGB": TEST_TRAFFIC_BYTES,
-                # API принимает срок в миллисекундах Unix.
-                "expiryTime": (
-                    now_ms + TEST_HOURS * 60 * 60 * 1000
-                ),
+                "expiryTime": now_ms + TEST_HOURS * 60 * 60 * 1000,
                 "subId": secrets.token_hex(8),
                 "reset": 0,
             }
-        else:
-            if not client.get("enable", True):
-                raise XUIError(
-                    f"Тестовый клиент {email} выключен в панели."
-                )
 
-            expiry_time = int(client.get("expiryTime") or 0)
-
-            if 0 < expiry_time <= now_ms:
-                raise XUIError(
-                    "Срок тестового доступа закончился.\n"
-                    f"Для нового теста удали клиента {email} "
-                    "в панели и снова отправь /test_vpn."
-                )
-
-        # Проверяем возможность собрать ссылку до создания клиента.
-        link = build_vless_link(client, inbound, reality)
-
-        if created:
             await xui_request(
                 session,
                 "POST",
                 "/panel/api/inbounds/addClient",
                 json={
                     "id": XUI_INBOUND_ID,
-                    "settings": json.dumps({
-                        "clients": [client],
-                    }),
+                    "settings": json.dumps({"clients": [client]}),
                 },
             )
+        else:
+            if not client.get("enable", True):
+                raise XUIError("Твой ключ отключен администратором в панели.")
 
+        link = build_vless_link(client, inbound, reality)
         return link, created
 
 
-async def show_xui_error(message, error):
+async def show_xui_error(message: Message, error: Exception):
+    """Обработчик и вывод ошибок пользователю."""
     if isinstance(error, XUIError):
         text = str(error)
     elif isinstance(error, asyncio.TimeoutError):
-        text = (
-            "Панель не ответила вовремя.\n"
-            "Проверь её доступность из Railway и повтори команду. "
-            "При повторе бот сначала проверит наличие клиента."
-        )
-    elif isinstance(error, aiohttp.ClientSSLError):
-        text = (
-            "Не удалось проверить HTTPS-сертификат панели.\n"
-            "Проверь сертификат и соответствие домена в XUI_URL. "
-            "Проверку TLS отключать не нужно."
-        )
+        text = "Панель 3x-ui не ответила вовремя (таймаут соединения)."
     else:
-        # Не записываем в лог ключи или сырой ответ панели.
-        logger.error(
-            "Ошибка интеграции 3x-ui: %s",
-            type(error).__name__,
-        )
-        text = (
-            "Не удалось выполнить запрос к 3x-ui.\n"
-            "Проверь доступность панели из Railway, настройки "
-            "и совместимость API с версией панели.\n"
-            f"Тип ошибки: {type(error).__name__}"
-        )
+        logger.exception("Непредвиденная ошибка интеграции:")
+        text = f"Произошла ошибка: {type(error).__name__}\n{error}"
 
     await message.answer(text, parse_mode=None)
 
 
-# ==================
-# ТЕСТОВЫЕ КОМАНДЫ
-# ==================
-
-@dp.message(Command("myid"), F.chat.type == "private")
-async def my_id(message: Message):
-    await message.answer(
-        f"Твой Telegram ID: {message.from_user.id}\n\n"
-        "Укажи его в Railway Variables → ADMIN_ID "
-        "и перезапусти бота."
-    )
-
-
-@dp.message(
-    Command("inbounds"),
-    F.chat.type == "private",
-    F.from_user.id == ADMIN_ID,
-)
-async def list_inbounds(message: Message):
-    try:
-        async with xui_session() as session:
-            items = await xui_request(
-                session,
-                "GET",
-                "/panel/api/inbounds/list",
-            )
-
-        if not items:
-            await message.answer(
-                "В панели нет входящих подключений."
-            )
-            return
-
-        await message.answer(
-            "Входящие подключения 3x-ui:\n"
-            "Найди нужный VLESS inbound."
-        )
-
-        for item in items:
-            stream = as_dict(item.get("streamSettings"))
-            text = (
-                f"ID: {item['id']}\n"
-                f"Название: {item.get('remark', '')}\n"
-                f"Протокол: {item.get('protocol', '?')}\n"
-                f"Транспорт: {stream.get('network', '?')}\n"
-                f"Защита: {stream.get('security', '?')}\n"
-                f"Порт: {item.get('port', '?')}"
-            )
-            await message.answer(text[:4000], parse_mode=None)
-
-        await message.answer(
-            "Запиши нужный ID в Railway Variables → "
-            "XUI_INBOUND_ID.\n"
-            "Перезапусти бота и отправь /test_vpn."
-        )
-
-    except Exception as error:
-        await show_xui_error(message, error)
-
-
-@dp.message(
-    Command("test_vpn"),
-    F.chat.type == "private",
-    F.from_user.id == ADMIN_ID,
-)
-async def test_vpn(message: Message):
-    try:
-        async with test_lock:
-            link, created = await create_or_get_test_client(
-                message.from_user.id
-            )
-
-        title = (
-            "✅ Тестовый клиент создан!\n"
-            "Срок: 24 часа. Трафик: 1 ГиБ."
-            if created
-            else "🔐 Твой существующий тестовый ключ."
-        )
-
-        await message.answer(
-            f"{title}\n\n"
-            f"<code>{escape(link)}</code>\n\n"
-            "Скопируй ссылку и импортируй её "
-            "в VPN-приложение.\n\n"
-            "Повторная команда не продлевает доступ "
-            "и не сбрасывает расход трафика.",
-            parse_mode="HTML",
-            protect_content=True,
-        )
-
-    except Exception as error:
-        await show_xui_error(message, error)
-
-
-# ==================
-# КЛАВИАТУРЫ
-# ==================
+# =========================================================
+# 3. КЛАВИАТУРЫ И ИНТЕРФЕЙС
+# =========================================================
 
 def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(
-                text="🔐 Подключить VPN",
-                callback_data="connect_vpn",
-            )
+            InlineKeyboardButton(text="🔐 Подключить VPN", callback_data="connect_vpn")
         ],
         [
-            InlineKeyboardButton(
-                text="👤 Мой профиль",
-                callback_data="profile",
-            ),
-            InlineKeyboardButton(
-                text="💰 Тарифы",
-                callback_data="tariffs",
-            ),
+            InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile"),
+            InlineKeyboardButton(text="💰 Тарифы", callback_data="tariffs"),
         ],
         [
-            InlineKeyboardButton(
-                text="📋 Инструкция по активации",
-                callback_data="activation",
-            )
+            InlineKeyboardButton(text="📋 Инструкция по активации", callback_data="activation")
         ],
         [
-            InlineKeyboardButton(
-                text="💬 Поддержка",
-                callback_data="support",
-            )
+            InlineKeyboardButton(text="💬 Поддержка", callback_data="support")
         ],
     ])
 
 
 def tariffs_kb():
     keyboard = []
-
     for key, data in TARIFFS.items():
         keyboard.append([
             InlineKeyboardButton(
-                text=f"{data['name']} — {data['price']} ₽",
+                text=f"{data['name']} — {data['price']} ₽/мес",
                 callback_data=f"buy_{key}",
             )
         ])
-
     keyboard.append([
-        InlineKeyboardButton(
-            text="◀️ Назад в меню",
-            callback_data="main_menu",
-        )
+        InlineKeyboardButton(text="◀️ Назад в меню", callback_data="main_menu")
     ])
-
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
 def back_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(
-                text="◀️ Назад в меню",
-                callback_data="main_menu",
-            )
+            InlineKeyboardButton(text="◀️ Назад в меню", callback_data="main_menu")
         ]
     ])
 
 
-# ==================
-# ОСНОВНОЕ МЕНЮ БОТА
-# ==================
+# =========================================================
+# 4. ОБРАБОТЧИКИ КОМАНД И КНОПОК
+# =========================================================
+
+@dp.message(Command("myid"), F.chat.type == "private")
+async def cmd_myid(message: Message):
+    await message.answer(
+        f"Твой Telegram ID: <code>{message.from_user.id}</code>\n\n"
+        "Укажи его в <b>ADMIN_ID</b> в Railway Variables.",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("inbounds"), F.chat.type == "private")
+async def cmd_inbounds(message: Message):
+    if ADMIN_ID != 0 and message.from_user.id != ADMIN_ID:
+        return
+
+    try:
+        async with xui_session() as session:
+            items = await xui_request(session, "GET", "/panel/api/inbounds/list")
+
+        if not items:
+            await message.answer("В панели нет подключений. Создай VLESS Inbound.")
+            return
+
+        text = "<b>Список ваших Inbounds в 3x-ui:</b>\n\n"
+        for item in items:
+            stream = as_dict(item.get("streamSettings"))
+            text += (
+                f"🔹 <b>ID: {item['id']}</b> | {item.get('remark', 'Без имени')}\n"
+                f"Протокол: <code>{item.get('protocol')}</code> | Порт: <code>{item.get('port')}</code>\n"
+                f"Сеть: {stream.get('network')} | Защита: {stream.get('security')}\n\n"
+            )
+
+        text += "Скопируй нужный <b>ID</b> в переменную <code>XUI_INBOUND_ID</code> в Railway."
+        await message.answer(text, parse_mode="HTML")
+
+    except Exception as error:
+        await show_xui_error(message, error)
+
+
+@dp.message(Command("test_vpn"), F.chat.type == "private")
+async def cmd_test_vpn(message: Message):
+    if ADMIN_ID != 0 and message.from_user.id != ADMIN_ID:
+        return
+
+    try:
+        async with test_lock:
+            link, created = await create_or_get_test_client(message.from_user.id)
+
+        title = "✅ <b>Ключ успешно создан!</b>" if created else "🔐 <b>Твой тестовый ключ:</b>"
+        await message.answer(
+            f"{title}\n\n"
+            f"<code>{escape(link)}</code>\n\n"
+            "Нажми на код ссылки выше, чтобы скопировать её, и импортируй в VPN-клиент (V2rayN, Happ, Streisand, Nekobox).",
+            parse_mode="HTML",
+        )
+    except Exception as error:
+        await show_xui_error(message, error)
+
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="✅ Я принимаю условия",
-                callback_data="accept_license",
-            )
-        ]
+        [InlineKeyboardButton(text="✅ Принять условия", callback_data="accept_license")]
     ])
-
     await message.answer(
         "📄 <b>Лицензионное соглашение</b>\n\n"
-        "1. Использование только для легальной деятельности.\n"
-        "2. Запрещена передача ключей третьим лицам.\n"
-        "3. Администрация не несет ответственности "
-        "за действия пользователей.\n\n"
-        "<i>Нажмите кнопку ниже для продолжения.</i>",
+        "1. Использование VPN только в законных целях.\n"
+        "2. Запрещена перепродажа и спам.\n"
+        "3. Нажмите кнопку ниже для продолжения.",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
 
 
 @dp.callback_query(F.data == "accept_license")
-async def accept_license(cb: CallbackQuery):
-    await cb.answer()
-    await cb.message.edit_text(
-        "✅ Условия приняты. Выберите действие:",
-        reply_markup=main_menu_kb(),
-    )
-
-
 @dp.callback_query(F.data == "main_menu")
-async def main_menu(cb: CallbackQuery):
+async def menu_callback(cb: CallbackQuery):
     await cb.answer()
     await cb.message.edit_text(
-        "🏠 Главное меню:",
+        "🏠 <b>Главное меню:</b>\n\nВыберите нужный раздел 👇",
         reply_markup=main_menu_kb(),
-    )
-
-
-@dp.callback_query(F.data == "tariffs")
-async def tariffs(cb: CallbackQuery):
-    await cb.answer()
-
-    text = "<b>Выберите тариф:</b>\n\n"
-
-    for data in TARIFFS.values():
-        text += (
-            f"• {data['name']} — {data['price']}₽ | "
-            f"{data['traffic']} | {data['ips']} устр. | "
-            f"{data['locations']}\n"
-        )
-
-    await cb.message.edit_text(
-        text,
-        reply_markup=tariffs_kb(),
         parse_mode="HTML",
     )
 
 
+@dp.callback_query(F.data == "tariffs")
+@dp.callback_query(F.data == "connect_vpn")
+async def tariffs_callback(cb: CallbackQuery):
+    await cb.answer()
+    text = "<b>Доступные тарифы:</b>\n\n"
+    for data in TARIFFS.values():
+        text += f"• <b>{data['name']}</b> — {data['price']} ₽ | {data['traffic']} | {data['ips']} устр.\n"
+
+    await cb.message.edit_text(text, reply_markup=tariffs_kb(), parse_mode="HTML")
+
+
 @dp.callback_query(F.data.startswith("buy_"))
-async def buy(cb: CallbackQuery):
+async def buy_callback(cb: CallbackQuery):
     tariff_key = cb.data.removeprefix("buy_")
     tariff = TARIFFS.get(tariff_key)
 
-    if tariff is None:
+    if not tariff:
         await cb.answer("Тариф не найден.", show_alert=True)
         return
 
     await cb.answer()
-
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="💳 Оплатить (заглушка)",
-                callback_data="fake_pay",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="◀️ Назад",
-                callback_data="tariffs",
-            )
-        ],
+        [InlineKeyboardButton(text="💳 Оплатить (тест)", callback_data="fake_pay")],
+        [InlineKeyboardButton(text="◀️ Назад к тарифам", callback_data="tariffs")],
     ])
 
     await cb.message.edit_text(
-        f"💳 <b>{tariff['name']}</b> — {tariff['price']}₽\n\n"
-        "<i>Оплата пока не подключена.</i>",
+        f"Тариф: <b>{tariff['name']}</b>\n"
+        f"Стоимость: <b>{tariff['price']} ₽/мес</b>\n\n"
+        "<i>Подключение реального эквайринга настраивается после проверки ключей.</i>",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
 
 
 @dp.callback_query(F.data == "fake_pay")
-async def fake_pay(cb: CallbackQuery):
-    # Здесь намеренно НЕ создаётся VPN-клиент.
-    await cb.answer(
-        "Это демонстрация. Деньги не списываются, "
-        "доступ не выдаётся.",
-        show_alert=True,
-    )
-
+async def fake_pay_callback(cb: CallbackQuery):
+    await cb.answer("Демо-режим оплаты.", show_alert=True)
     await cb.message.edit_text(
-        "🧪 Демо оплаты.\n\n"
-        "Реальная оплата пока не подключена.\n"
-        "Тестовая выдача ключа доступна только администратору "
-        "по команде /test_vpn.",
+        "🧪 Оплата находится в режиме тестирования.\n\n"
+        "Чтобы получить ключ, отправь команду /test_vpn (доступно админу).",
         reply_markup=back_kb(),
     )
 
 
 @dp.callback_query(F.data == "profile")
-async def profile(cb: CallbackQuery):
+async def profile_callback(cb: CallbackQuery):
     await cb.answer()
-
     await cb.message.edit_text(
-        "👤 Профиль:\n\n"
-        "Платные подписки пока не подключены.\n"
-        "Тестовый ключ администратора выдаётся "
-        "отдельно командой /test_vpn.",
+        f"👤 <b>Ваш профиль:</b>\n\n"
+        f"ID: <code>{cb.from_user.id}</code>\n"
+        f"Статус подписки: <i>Не активна</i>\n\n"
+        "Для активации выберите тариф в меню.",
         reply_markup=back_kb(),
-    )
-
-
-@dp.callback_query(F.data == "connect_vpn")
-async def connect(cb: CallbackQuery):
-    await cb.answer()
-
-    await cb.message.edit_text(
-        "🔐 Для подключения выбери тариф 👇\n\n"
-        "Оплата пока не подключена.",
-        reply_markup=tariffs_kb(),
+        parse_mode="HTML",
     )
 
 
 @dp.callback_query(F.data == "activation")
-async def activation(cb: CallbackQuery):
+async def activation_callback(cb: CallbackQuery):
     await cb.answer()
-
     await cb.message.edit_text(
-        "📋 <b>Инструкция по активации</b>\n\n"
-        "1. Установи VPN-клиент с поддержкой "
-        "<b>VLESS + Reality</b> для своего устройства.\n\n"
-        "2. Скопируй ссылку подключения, "
-        "которая начинается с <code>vless://</code>.\n\n"
-        "3. В приложении нажми «Добавить» или «+» "
-        "и выбери импорт из буфера обмена.\n\n"
-        "4. Выбери добавленный профиль "
-        "и нажми «Подключить».\n\n"
-        "5. Если система запросит разрешение "
-        "на VPN-подключение — подтверди его.\n\n"
-        "<i>Названия кнопок зависят от приложения. "
-        "Если не работает — напиши в поддержку.</i>",
+        "📋 <b>Инструкция по подключению:</b>\n\n"
+        "1. Скачайте приложение:\n"
+        "   • <b>iOS:</b> Streisand / V2Box / FoXray\n"
+        "   • <b>Android:</b> v2rayNG / Happ / Nekobox\n"
+        "   • <b>Windows:</b> v2rayN / Nekoray\n\n"
+        "2. Скопируйте ключ формата <code>vless://...</code>\n"
+        "3. Откройте приложение и нажмите <b>«Импорт из буфера обмена» (+)</b>.\n"
+        "4. Выберите добавленный сервер и нажмите <b>Подключить</b>.",
         reply_markup=back_kb(),
         parse_mode="HTML",
     )
 
 
 @dp.callback_query(F.data == "support")
-async def support(cb: CallbackQuery):
+async def support_callback(cb: CallbackQuery):
     await cb.answer()
-
     await cb.message.edit_text(
-        "💬 <b>Поддержка</b>\n\n"
-        "По всем вопросам пиши сюда:\n"
-        "👉 <a href='https://t.me/Suppr_XYZ'>"
-        "@Suppr_XYZ</a>\n\n"
-        "Отвечаем обычно в течение часа.",
+        "💬 <b>Поддержка пользователей</b>\n\n"
+        "Если у вас возникли вопросы по настройке:\n"
+        "👉 Напишите администратору: @Suppr_XYZ",
         reply_markup=back_kb(),
         parse_mode="HTML",
     )
 
 
-# ==================
-# ЗАПУСК
-# ==================
+# =========================================================
+# 5. ТОЧКА ВХОДА
+# =========================================================
 
 async def main():
-    if ADMIN_ID == 0:
-        logger.warning(
-            "ADMIN_ID не настроен. Отправь боту /myid "
-            "и добавь свой ID в Railway Variables."
-        )
-
-    logger.info("Бот запущен")
+    logger.info("Запуск бота...")
     await dp.start_polling(bot)
 
 
