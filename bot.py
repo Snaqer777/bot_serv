@@ -93,7 +93,7 @@ TARIFFS = {
 # =========================================================
 
 class XUIError(Exception):
-    """Ошибки взаимодействия с 3x-ui для отображения пользователю."""
+    """Ошибки взаимодействия с 3x-ui для вывода в чат."""
 
 
 def as_dict(value):
@@ -111,18 +111,18 @@ def as_dict(value):
 
 
 async def xui_request(session: aiohttp.ClientSession, method: str, path: str, **kwargs):
-    """Выполнение запроса к 3x-ui с подробным логированием ответа."""
+    """Выполнение запроса к 3x-ui с подробным ответом при ошибке."""
     url = f"{XUI_URL}{path}"
     
     async with session.request(method, url, allow_redirects=True, **kwargs) as response:
         resp_text = await response.text()
         
         if response.status >= 400:
-            logger.error("3x-ui error HTTP %s: %s", response.status, resp_text)
+            logger.error("3x-ui HTTP %s: %s", response.status, resp_text)
             raise XUIError(
-                f"3x-ui вернула <b>HTTP {response.status}</b> для запроса <code>{path}</code>.\n\n"
+                f"3x-ui вернула <b>HTTP {response.status}</b> на запрос <code>{path}</code>.\n\n"
                 f"Ответ панели:\n<code>{escape(resp_text[:350])}</code>\n\n"
-                "💡 <i>Если указано 'Too Many Requests' или блокировка — выполни <code>x-ui restart</code> в SSH сервера.</i>"
+                "💡 <i>Если там ошибка входа или бан — выполни <code>x-ui restart</code> на сервере.</i>"
             )
 
         try:
@@ -130,8 +130,7 @@ async def xui_request(session: aiohttp.ClientSession, method: str, path: str, **
         except Exception as exc:
             raise XUIError(
                 f"Панель вернула не JSON-ответ.\n"
-                f"Ответ сервера: <code>{escape(resp_text[:250])}</code>\n\n"
-                "Проверь адрес XUI_URL: нужен базовый адрес панели с секретным путём (без /panel/inbounds)."
+                f"Ответ сервера:\n<code>{escape(resp_text[:250])}</code>"
             ) from exc
 
     if not isinstance(result, dict):
@@ -146,11 +145,10 @@ async def xui_request(session: aiohttp.ClientSession, method: str, path: str, **
 
 @asynccontextmanager
 async def xui_session():
-    """Создание авторизованной HTTP-сессии с 3x-ui."""
+    """Создание сессии с браузерными заголовками."""
     if not XUI_URL or not XUI_USERNAME or not XUI_PASSWORD:
         raise XUIError("В Railway Variables не заполнены XUI_URL, XUI_USERNAME или XUI_PASSWORD.")
 
-    # Полные заголовки браузера для обхода 403 Forbidden
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
@@ -169,20 +167,21 @@ async def xui_session():
             "password": XUI_PASSWORD,
         }
 
-        # Способ 1: Отправка Form-Data (стандарт для большинства версий 3x-ui)
         login_url = f"{XUI_URL}/login"
+        
+        # Пробуем войти через Form-Data
         async with session.post(login_url, data=login_payload, allow_redirects=True) as resp:
             text = await resp.text()
             
-            # Если вернулась 403 или ошибка, пробуем Способ 2: Отправка JSON
+            # Если 403 или не JSON, пробуем второй метод: POST JSON
             if resp.status == 403 or "success" not in text.lower():
                 async with session.post(login_url, json=login_payload, allow_redirects=True) as json_resp:
                     json_text = await json_resp.text()
                     if json_resp.status >= 400:
                         raise XUIError(
-                            f"3x-ui вернула <b>HTTP {json_resp.status}</b> при входе в панель (/login).\n\n"
+                            f"3x-ui вернула <b>HTTP {json_resp.status}</b> при входе (/login).\n\n"
                             f"Ответ панели:\n<code>{escape(json_text[:300])}</code>\n\n"
-                            "💡 <i>Перезапусти панель командой <code>x-ui restart</code> на сервере, чтобы сбросить временный бан IP.</i>"
+                            "💡 <i>Перезапусти панель командой <code>x-ui restart</code> на сервере.</i>"
                         )
             elif resp.status >= 400:
                 raise XUIError(
@@ -194,7 +193,7 @@ async def xui_session():
 
 
 def get_reality_parameters(inbound: dict):
-    """Извлечение параметров Reality."""
+    """Извлечение ключей Reality."""
     if inbound.get("protocol") != "vless":
         raise XUIError("Выбранный Inbound не является VLESS.")
 
@@ -226,7 +225,7 @@ def get_reality_parameters(inbound: dict):
 
     if not public_key or not sni:
         raise XUIError(
-            "Не удалось автоматически извлечь параметры Reality из Inbound.\n"
+            "Не удалось автоматически извлечь параметры Reality.\n"
             "Добавь в Railway Variables:\n"
             "REALITY_PUBLIC_KEY — Public Key Reality\n"
             "REALITY_SNI — Server Name (например, google.com)\n"
@@ -242,7 +241,7 @@ def get_reality_parameters(inbound: dict):
 
 
 def build_vless_link(client: dict, inbound: dict, reality: dict) -> str:
-    """Сборка рабочей ссылки подключения vless://..."""
+    """Сборка ссылки vless://..."""
     if not VPN_HOST:
         raise XUIError("Переменная VPN_HOST не заполнена в Railway Variables.")
 
@@ -273,9 +272,9 @@ def build_vless_link(client: dict, inbound: dict, reality: dict) -> str:
 
 
 async def create_or_get_test_client(telegram_id: int):
-    """Поиск или создание клиента в выбранном Inbound."""
+    """Поиск или создание клиента."""
     if XUI_INBOUND_ID <= 0:
-        raise XUIError("Сначала отправь /inbounds и укажи полученный ID в XUI_INBOUND_ID в Railway.")
+        raise XUIError("Сначала отправь /inbounds и укажи ID в XUI_INBOUND_ID в Railway.")
 
     async with xui_session() as session:
         inbound = await xui_request(
@@ -328,13 +327,13 @@ async def create_or_get_test_client(telegram_id: int):
 
 
 async def show_xui_error(message: Message, error: Exception):
-    """Форматированный вывод ошибок в чат."""
+    """Вывод ошибок в чат."""
     if isinstance(error, XUIError):
         text = str(error)
     elif isinstance(error, asyncio.TimeoutError):
         text = "⏳ Панель 3x-ui не ответила вовремя (таймаут соединения)."
     else:
-        logger.exception("Непредвиденная ошибка:")
+        logger.exception("Ошибка интеграции:")
         text = f"Произошла ошибка: <b>{type(error).__name__}</b>\n<code>{escape(str(error))}</code>"
 
     await message.answer(text, parse_mode="HTML")
@@ -389,11 +388,12 @@ def back_kb():
 # 4. ХЕНДЛЕРЫ КОМАНД
 # =========================================================
 
-@dp.message(Command("myid"), F.chat.type == "private")
+# Поддерживаем и /myid, и /myip, и /id, и /ip
+@dp.message(Command("myid", "myip", "id", "ip"), F.chat.type == "private")
 async def cmd_myid(message: Message):
     await message.answer(
-        f"Твой Telegram ID: <code>{message.from_user.id}</code>\n\n"
-        "Укажи его в переменной <b>ADMIN_ID</b> в Railway Variables.",
+        f"👤 <b>Твой Telegram ID:</b> <code>{message.from_user.id}</code>\n\n"
+        f"Скопируй это число и вставь в переменную <b>ADMIN_ID</b> в Railway Variables.",
         parse_mode="HTML",
     )
 
@@ -401,6 +401,7 @@ async def cmd_myid(message: Message):
 @dp.message(Command("inbounds"), F.chat.type == "private")
 async def cmd_inbounds(message: Message):
     if ADMIN_ID != 0 and message.from_user.id != ADMIN_ID:
+        await message.answer("⛔️ Эта команда доступна только администратору.")
         return
 
     try:
@@ -408,10 +409,10 @@ async def cmd_inbounds(message: Message):
             items = await xui_request(session, "GET", "/panel/api/inbounds/list")
 
         if not items:
-            await message.answer("В панели нет подключений (inbounds). Создай VLESS Inbound.")
+            await message.answer("В панели нет входящих подключений (inbounds). Создай VLESS Inbound.")
             return
 
-        text = "<b>Список подключений в 3x-ui:</b>\n\n"
+        text = "<b>Список ваших Inbounds в 3x-ui:</b>\n\n"
         for item in items:
             stream = as_dict(item.get("streamSettings"))
             text += (
@@ -430,6 +431,7 @@ async def cmd_inbounds(message: Message):
 @dp.message(Command("test_vpn"), F.chat.type == "private")
 async def cmd_test_vpn(message: Message):
     if ADMIN_ID != 0 and message.from_user.id != ADMIN_ID:
+        await message.answer("⛔️ Эта команда доступна только администратору.")
         return
 
     try:
@@ -440,7 +442,7 @@ async def cmd_test_vpn(message: Message):
         await message.answer(
             f"{title}\n\n"
             f"<code>{escape(link)}</code>\n\n"
-            "Нажми на ключ выше для копирования и вставь его в приложение (V2rayN, Happ, Streisand, Nekobox).",
+            "Нажми на ключ выше, чтобы скопировать его, и импортируй в VPN-приложение.",
             parse_mode="HTML",
         )
     except Exception as error:
@@ -454,7 +456,7 @@ async def cmd_start(message: Message):
     ])
     await message.answer(
         "📄 <b>Лицензионное соглашение</b>\n\n"
-        "1. Использование сервиса строго в рамках законодательства.\n"
+        "1. Использование сервиса строго в рамках закона.\n"
         "2. Передача ключей третьим лицам запрещена.\n"
         "3. Нажмите кнопку ниже для продолжения.",
         reply_markup=keyboard,
@@ -513,7 +515,7 @@ async def fake_pay_callback(cb: CallbackQuery):
     await cb.answer("Демо-режим оплаты.", show_alert=True)
     await cb.message.edit_text(
         "🧪 Оплата находится в режиме тестирования.\n\n"
-        "Для получения тестового ключа используй команду /test_vpn (доступна администратору).",
+        "Для получения тестового ключа используй команду /test_vpn.",
         reply_markup=back_kb(),
     )
 
@@ -560,12 +562,24 @@ async def support_callback(cb: CallbackQuery):
     )
 
 
+# Ответ на любое непонятное текстовое сообщение
+@dp.message(F.chat.type == "private")
+async def fallback_text(message: Message):
+    await message.answer(
+        "🤖 Главные команды:\n"
+        "/myid — узнать свой Telegram ID\n"
+        "/inbounds — список подключений (для админа)\n"
+        "/test_vpn — получить тестовый VPN-ключ\n"
+        "/start — главное меню"
+    )
+
+
 # =========================================================
 # 5. ЗАПУСК БОТА
 # =========================================================
 
 async def main():
-    logger.info("Бот запущен и готов к работе.")
+    logger.info("Бот успешно запущен и слушает команды.")
     await dp.start_polling(bot)
 
 
