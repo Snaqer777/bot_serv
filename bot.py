@@ -1,16 +1,18 @@
 import asyncio
+import http.cookiejar
 import json
 import logging
 import os
 import secrets
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 
-from contextlib import asynccontextmanager
 from html import escape
 from urllib.parse import quote, urlencode
 
-import aiohttp
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
@@ -41,13 +43,12 @@ if not BOT_TOKEN:
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or "0")
 
-# Получаем и очищаем URL
-raw_xui_url = os.getenv("XUI_URL", "").strip().rstrip("/")
-# Если пользователь по ошибке указал https для обычного IP панели без SSL
-if raw_xui_url.startswith("https://138.124.110.74"):
-    raw_xui_url = raw_xui_url.replace("https://", "http://", 1)
+# Получаем и очищаем URL панели
+raw_url = os.getenv("XUI_URL", "").strip().rstrip("/")
+if raw_url.startswith("https://138.124.110.74"):
+    raw_url = raw_url.replace("https://", "http://", 1)
 
-XUI_URL = raw_xui_url
+XUI_URL = raw_url
 XUI_USERNAME = os.getenv("XUI_USERNAME", "").strip()
 XUI_PASSWORD = os.getenv("XUI_PASSWORD", "").strip()
 XUI_INBOUND_ID = int(os.getenv("XUI_INBOUND_ID", "0").strip() or "0")
@@ -95,11 +96,11 @@ TARIFFS = {
 
 
 # =========================================================
-# 2. ИНТЕГРАЦИЯ С 3X-UI API
+# 2. ИНТЕГРАЦИЯ С 3X-UI (НАДЕЖНЫЙ HTTP-КЛИЕНТ)
 # =========================================================
 
 class XUIError(Exception):
-    """Кастомная ошибка для вывода в чат."""
+    """Кастомное исключение с понятным текстом ошибки."""
 
 
 def as_dict(value):
@@ -109,85 +110,120 @@ def as_dict(value):
             value = json.loads(value)
         except Exception:
             return {}
-
     if value is None or not isinstance(value, dict):
         return {}
-
     return value
 
 
-async def xui_request(session: aiohttp.ClientSession, method: str, path: str, **kwargs):
-    """Выполнение запроса к 3x-ui API."""
-    url = f"{XUI_URL}{path}"
-    
-    async with session.request(method, url, allow_redirects=True, **kwargs) as response:
-        resp_text = await response.text()
-        
-        if response.status >= 400:
-            logger.error("3x-ui HTTP %s: %s", response.status, resp_text)
+class XUIClient:
+    """Клиент 3x-ui, устойчивый к нестандартным HTTP-заголовкам и редиректам."""
+
+    def __init__(self):
+        if not XUI_URL or not XUI_USERNAME or not XUI_PASSWORD:
             raise XUIError(
-                f"❌ 3x-ui вернула <b>HTTP {response.status}</b> на запрос <code>{path}</code>.\n\n"
-                f"Ответ панели:\n<code>{escape(resp_text[:300])}</code>"
+                "В Railway Variables не заполнены:\n"
+                "<code>XUI_URL</code>, <code>XUI_USERNAME</code> или <code>XUI_PASSWORD</code>."
             )
-
-        try:
-            result = json.loads(resp_text)
-        except Exception as exc:
-            raise XUIError(
-                f"Панель вернула не JSON.\nОтвет: <code>{escape(resp_text[:200])}</code>"
-            ) from exc
-
-    if not isinstance(result, dict):
-        raise XUIError("Неожиданный формат ответа от 3x-ui.")
-
-    if result.get("success") is not True:
-        msg = result.get("msg", "Панель отклонила запрос")
-        raise XUIError(f"Ошибка 3x-ui: <b>{escape(str(msg))}</b>")
-
-    return result.get("obj")
-
-
-@asynccontextmanager
-async def xui_session():
-    """Авторизация в 3x-ui."""
-    if not XUI_URL or not XUI_USERNAME or not XUI_PASSWORD:
-        raise XUIError(
-            "В Railway Variables не заполнены:\n"
-            "<code>XUI_URL</code>, <code>XUI_USERNAME</code> или <code>XUI_PASSWORD</code>."
+        self.base_url = XUI_URL
+        self.cookie_jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cookie_jar)
         )
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-
-    async with aiohttp.ClientSession(
-        cookie_jar=aiohttp.CookieJar(unsafe=True),
-        timeout=aiohttp.ClientTimeout(total=20),
-        headers=headers,
-    ) as session:
-        login_payload = {
-            "username": XUI_USERNAME,
-            "password": XUI_PASSWORD,
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
         }
 
-        # URL для логина
-        login_url = f"{XUI_URL}/login"
+    def _request(self, path: str, method: str = "GET", data: dict = None) -> dict:
+        url = f"{self.base_url}{path}"
+        body_bytes = None
+        headers = dict(self.headers)
 
-        async with session.post(login_url, data=login_payload, allow_redirects=True) as resp:
-            resp_text = await resp.text()
+        if data is not None:
+            body_bytes = json.dumps(data).encode("utf-8")
+            headers["Content-Type"] = "application/json"
 
-            if resp.status >= 400:
-                raise XUIError(
-                    f"❌ Не удалось войти в 3x-ui (<b>HTTP {resp.status}</b>).\n\n"
-                    f"<b>URL:</b> <code>{login_url}</code>\n"
-                    f"<b>Логин:</b> <code>{XUI_USERNAME}</code>\n"
-                    f"<b>Ответ:</b> <code>{escape(resp_text[:300])}</code>\n\n"
-                    "💡 <i>Проверь логин/пароль и выполни <code>x-ui restart</code> на сервере.</i>"
-                )
+        req = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
 
-        yield session
+        try:
+            with self.opener.open(req, timeout=15) as response:
+                resp_text = response.read().decode("utf-8", errors="ignore")
+                try:
+                    result = json.loads(resp_text)
+                except Exception:
+                    raise XUIError(
+                        f"Панель вернула не JSON-ответ.\nОтвет: <code>{escape(resp_text[:200])}</code>"
+                    )
+
+                if isinstance(result, dict) and result.get("success") is not True:
+                    msg = result.get("msg", "Панель отклонила запрос")
+                    raise XUIError(f"Ошибка 3x-ui: <b>{escape(str(msg))}</b>")
+
+                return result.get("obj") if isinstance(result, dict) else result
+
+        except urllib.error.HTTPError as e:
+            err_text = e.read().decode("utf-8", errors="ignore")
+            logger.error("3x-ui HTTP %s: %s", e.code, err_text)
+            raise XUIError(
+                f"❌ 3x-ui вернула <b>HTTP {e.code}</b> на запрос <code>{path}</code>.\n\n"
+                f"Ответ сервера:\n<code>{escape(err_text[:300])}</code>"
+            )
+        except urllib.error.URLError as e:
+            raise XUIError(f"❌ Ошибка подключения к 3x-ui: <code>{escape(str(e.reason))}</code>")
+
+    def login(self):
+        """Авторизация в панели 3x-ui."""
+        login_url = f"{self.base_url}/login"
+        form_payload = urllib.parse.urlencode({
+            "username": XUI_USERNAME,
+            "password": XUI_PASSWORD,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            login_url,
+            data=form_payload,
+            headers={
+                **self.headers,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            method="POST",
+        )
+
+        try:
+            with self.opener.open(req, timeout=15) as response:
+                resp_text = response.read().decode("utf-8", errors="ignore")
+                try:
+                    res_json = json.loads(resp_text)
+                    if res_json.get("success") is False:
+                        raise XUIError(f"Неверный логин или пароль 3x-ui: {res_json.get('msg')}")
+                except json.JSONDecodeError:
+                    pass
+        except urllib.error.HTTPError as e:
+            err_text = e.read().decode("utf-8", errors="ignore")
+            raise XUIError(
+                f"❌ Ошибка входа в 3x-ui (<b>HTTP {e.code}</b>).\n\n"
+                f"Ответ панели:\n<code>{escape(err_text[:300])}</code>\n\n"
+                "💡 <i>Выполни <code>x-ui restart</code> на сервере, если сработал бан IP.</i>"
+            )
+
+    def get_inbounds(self):
+        self.login()
+        return self._request("/panel/api/inbounds/list", method="GET")
+
+    def get_inbound(self, inbound_id: int):
+        self.login()
+        return self._request(f"/panel/api/inbounds/get/{inbound_id}", method="GET")
+
+    def add_client(self, inbound_id: int, client: dict):
+        self.login()
+        return self._request(
+            "/panel/api/inbounds/addClient",
+            method="POST",
+            data={
+                "id": inbound_id,
+                "settings": json.dumps({"clients": [client]}),
+            },
+        )
 
 
 def get_reality_parameters(inbound: dict):
@@ -223,7 +259,7 @@ def get_reality_parameters(inbound: dict):
 
     if not public_key or not sni:
         raise XUIError(
-            "Не удалось получить ключи Reality.\n"
+            "Не удалось автоматически получить ключи Reality.\n"
             "Добавь в Railway Variables:\n"
             "<code>REALITY_PUBLIC_KEY</code> — Public Key\n"
             "<code>REALITY_SNI</code> — Server Name (например, google.com)\n"
@@ -269,69 +305,54 @@ def build_vless_link(client: dict, inbound: dict, reality: dict) -> str:
     return f"vless://{client['id']}@{host}:{port}?{query}#{label}"
 
 
-async def create_or_get_test_client(telegram_id: int):
-    """Поиск или создание клиента."""
+def sync_create_or_get_client(telegram_id: int):
+    """Синхронная логика создания/получения клиента."""
     if XUI_INBOUND_ID <= 0:
         raise XUIError("Сначала отправь /inbounds и укажи ID в XUI_INBOUND_ID в Railway.")
 
-    async with xui_session() as session:
-        inbound = await xui_request(
-            session,
-            "GET",
-            f"/panel/api/inbounds/get/{XUI_INBOUND_ID}",
-        )
+    client_api = XUIClient()
+    inbound = client_api.get_inbound(XUI_INBOUND_ID)
 
-        if not isinstance(inbound, dict):
-            raise XUIError("Inbound с таким ID не найден в панели.")
+    if not isinstance(inbound, dict):
+        raise XUIError("Inbound с таким ID не найден в панели.")
 
-        reality = get_reality_parameters(inbound)
-        settings = as_dict(inbound.get("settings"))
+    reality = get_reality_parameters(inbound)
+    settings = as_dict(inbound.get("settings"))
 
-        email = f"tg-{telegram_id}"
-        clients = settings.get("clients") or []
-        
-        client = next((c for c in clients if c.get("email") == email), None)
-        created = client is None
-        now_ms = int(time.time() * 1000)
+    email = f"tg-{telegram_id}"
+    clients = settings.get("clients") or []
 
-        if created:
-            client = {
-                "id": str(uuid.uuid4()),
-                "email": email,
-                "flow": "xtls-rprx-vision",
-                "enable": True,
-                "limitIp": 2,
-                "totalGB": TEST_TRAFFIC_BYTES,
-                "expiryTime": now_ms + TEST_HOURS * 60 * 60 * 1000,
-                "subId": secrets.token_hex(8),
-                "reset": 0,
-            }
+    client = next((c for c in clients if c.get("email") == email), None)
+    created = client is None
+    now_ms = int(time.time() * 1000)
 
-            await xui_request(
-                session,
-                "POST",
-                "/panel/api/inbounds/addClient",
-                json={
-                    "id": XUI_INBOUND_ID,
-                    "settings": json.dumps({"clients": [client]}),
-                },
-            )
-        else:
-            if not client.get("enable", True):
-                raise XUIError("Твой ключ отключен в панели.")
+    if created:
+        client = {
+            "id": str(uuid.uuid4()),
+            "email": email,
+            "flow": "xtls-rprx-vision",
+            "enable": True,
+            "limitIp": 2,
+            "totalGB": TEST_TRAFFIC_BYTES,
+            "expiryTime": now_ms + TEST_HOURS * 60 * 60 * 1000,
+            "subId": secrets.token_hex(8),
+            "reset": 0,
+        }
+        client_api.add_client(XUI_INBOUND_ID, client)
+    else:
+        if not client.get("enable", True):
+            raise XUIError("Твой ключ отключен в панели.")
 
-        link = build_vless_link(client, inbound, reality)
-        return link, created
+    link = build_vless_link(client, inbound, reality)
+    return link, created
 
 
 async def show_xui_error(message: Message, error: Exception):
     """Вывод ошибок пользователю."""
     if isinstance(error, XUIError):
         text = str(error)
-    elif isinstance(error, asyncio.TimeoutError):
-        text = "⏳ Панель 3x-ui не ответила вовремя (таймаут соединения)."
     else:
-        logger.exception("Ошибка интеграции:")
+        logger.exception("Ошибка 3x-ui:")
         text = f"Произошла ошибка: <b>{type(error).__name__}</b>\n<code>{escape(str(error))}</code>"
 
     await message.answer(text, parse_mode="HTML")
@@ -394,8 +415,8 @@ async def cmd_inbounds(message: Message):
         return
 
     try:
-        async with xui_session() as session:
-            items = await xui_request(session, "GET", "/panel/api/inbounds/list")
+        client_api = XUIClient()
+        items = await asyncio.to_thread(client_api.get_inbounds)
 
         if not items:
             await message.answer("В панели нет подключений (inbounds). Создай VLESS Inbound.")
@@ -425,7 +446,9 @@ async def cmd_test_vpn(message: Message):
 
     try:
         async with test_lock:
-            link, created = await create_or_get_test_client(message.from_user.id)
+            link, created = await asyncio.to_thread(
+                sync_create_or_get_client, message.from_user.id
+            )
 
         title = "✅ <b>Ключ успешно создан!</b>" if created else "🔐 <b>Твой тестовый ключ:</b>"
         await message.answer(
