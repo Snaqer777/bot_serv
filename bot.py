@@ -41,7 +41,13 @@ if not BOT_TOKEN:
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or "0")
 
-XUI_URL = os.getenv("XUI_URL", "").strip().rstrip("/")
+# Получаем и очищаем URL
+raw_xui_url = os.getenv("XUI_URL", "").strip().rstrip("/")
+# Если пользователь по ошибке указал https для обычного IP панели без SSL
+if raw_xui_url.startswith("https://138.124.110.74"):
+    raw_xui_url = raw_xui_url.replace("https://", "http://", 1)
+
+XUI_URL = raw_xui_url
 XUI_USERNAME = os.getenv("XUI_USERNAME", "").strip()
 XUI_PASSWORD = os.getenv("XUI_PASSWORD", "").strip()
 XUI_INBOUND_ID = int(os.getenv("XUI_INBOUND_ID", "0").strip() or "0")
@@ -143,7 +149,7 @@ async def xui_request(session: aiohttp.ClientSession, method: str, path: str, **
 
 @asynccontextmanager
 async def xui_session():
-    """Авторизация в 3x-ui с автоматическим перебором вариантов."""
+    """Авторизация в 3x-ui."""
     if not XUI_URL or not XUI_USERNAME or not XUI_PASSWORD:
         raise XUIError(
             "В Railway Variables не заполнены:\n"
@@ -154,8 +160,6 @@ async def xui_session():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "X-Requested-With": "XMLHttpRequest",
-        "Origin": XUI_URL,
-        "Referer": f"{XUI_URL}/",
     }
 
     async with aiohttp.ClientSession(
@@ -168,67 +172,20 @@ async def xui_session():
             "password": XUI_PASSWORD,
         }
 
-        login_success = False
-        last_error_text = ""
-        last_status = 0
+        # URL для логина
+        login_url = f"{XUI_URL}/login"
 
-        # Перебираем возможные точки входа панели
-        login_endpoints = ["/login", "/login/", "/api/login"]
+        async with session.post(login_url, data=login_payload, allow_redirects=True) as resp:
+            resp_text = await resp.text()
 
-        for endpoint in login_endpoints:
-            target_url = f"{XUI_URL}{endpoint}"
-            
-            # Вариант А: отправка form-urlencoded
-            try:
-                async with session.post(target_url, data=login_payload, allow_redirects=True) as resp:
-                    resp_text = await resp.text()
-                    last_status = resp.status
-                    last_error_text = resp_text
-
-                    if resp.status == 200:
-                        try:
-                            json_data = json.loads(resp_text)
-                            if json_data.get("success") is True:
-                                login_success = True
-                                break
-                        except Exception:
-                            # Если вернулся 200 OK без JSON, но установлена кука
-                            if len(session.cookie_jar) > 0:
-                                login_success = True
-                                break
-            except Exception as e:
-                logger.warning("Ошибка при попытке входа на %s: %s", target_url, e)
-
-            # Вариант Б: отправка JSON
-            try:
-                async with session.post(target_url, json=login_payload, allow_redirects=True) as resp:
-                    resp_text = await resp.text()
-                    last_status = resp.status
-                    last_error_text = resp_text
-
-                    if resp.status == 200:
-                        try:
-                            json_data = json.loads(resp_text)
-                            if json_data.get("success") is True:
-                                login_success = True
-                                break
-                        except Exception:
-                            if len(session.cookie_jar) > 0:
-                                login_success = True
-                                break
-            except Exception as e:
-                logger.warning("Ошибка при попытке JSON входа на %s: %s", target_url, e)
-
-        if not login_success:
-            raise XUIError(
-                f"❌ Не удалось войти в 3x-ui (<b>HTTP {last_status}</b>).\n\n"
-                f"<b>URL:</b> <code>{XUI_URL}/login</code>\n"
-                f"<b>Логин:</b> <code>{XUI_USERNAME}</code>\n"
-                f"<b>Ответ сервера:</b>\n<code>{escape(last_error_text[:300])}</code>\n\n"
-                "💡 <b>Как исправить:</b>\n"
-                "1. Проверь логин и пароль в Railway Variables (без пробелов).\n"
-                "2. Выполни <code>x-ui restart</code> в SSH сервера для сброса бана IP."
-            )
+            if resp.status >= 400:
+                raise XUIError(
+                    f"❌ Не удалось войти в 3x-ui (<b>HTTP {resp.status}</b>).\n\n"
+                    f"<b>URL:</b> <code>{login_url}</code>\n"
+                    f"<b>Логин:</b> <code>{XUI_USERNAME}</code>\n"
+                    f"<b>Ответ:</b> <code>{escape(resp_text[:300])}</code>\n\n"
+                    "💡 <i>Проверь логин/пароль и выполни <code>x-ui restart</code> на сервере.</i>"
+                )
 
         yield session
 
