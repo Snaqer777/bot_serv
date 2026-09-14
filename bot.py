@@ -31,7 +31,6 @@ from aiogram.types import (
 # ПАТЧ HTTP-ПАРСЕРА ДЛЯ СОВМЕСТИМОСТИ С 3X-UI (HTTP/0.0)
 # =========================================================
 
-# Устраняем ошибку UnknownProtocol: HTTP/0.0
 _MAXLINE = http.client._MAXLINE
 
 def _safe_read_status(self):
@@ -51,7 +50,7 @@ def _safe_read_status(self):
             status = "200"
             reason = ""
     
-    self.version = 11  # Обрабатываем как HTTP/1.1
+    self.version = 11  # HTTP/1.1
     try:
         status = int(status)
     except ValueError:
@@ -132,7 +131,7 @@ TARIFFS = {
 # =========================================================
 
 class XUIError(Exception):
-    """Кастомное исключение с понятным текстом."""
+    """Понятное исключение для пользователя."""
 
 
 def as_dict(value):
@@ -147,8 +146,6 @@ def as_dict(value):
 
 
 class XUIClient:
-    """Устойчивый клиент к нестандартным ответам 3x-ui."""
-
     def __init__(self):
         if not XUI_URL or not XUI_USERNAME or not XUI_PASSWORD:
             raise XUIError(
@@ -158,7 +155,6 @@ class XUIClient:
         self.base_url = XUI_URL
         self.cookie_jar = http.cookiejar.CookieJar()
         
-        # Отключаем строгую проверку SSL для самоподписанных сертификатов
         ssl_ctx = ssl.create_default_context()
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
@@ -265,7 +261,6 @@ class XUIClient:
 
 
 def get_reality_parameters(inbound: dict):
-    """Извлечение параметров Reality."""
     if inbound.get("protocol") != "vless":
         raise XUIError("Выбранный Inbound не является VLESS.")
 
@@ -313,7 +308,6 @@ def get_reality_parameters(inbound: dict):
 
 
 def build_vless_link(client: dict, inbound: dict, reality: dict) -> str:
-    """Сборка ссылки vless://..."""
     if not VPN_HOST:
         raise XUIError("Переменная VPN_HOST не заполнена в Railway Variables.")
 
@@ -344,7 +338,6 @@ def build_vless_link(client: dict, inbound: dict, reality: dict) -> str:
 
 
 def sync_create_or_get_client(telegram_id: int):
-    """Создание или получение существующего клиента."""
     if XUI_INBOUND_ID <= 0:
         raise XUIError("Сначала отправь /inbounds и укажи ID в XUI_INBOUND_ID в Railway.")
 
@@ -385,8 +378,83 @@ def sync_create_or_get_client(telegram_id: int):
     return link, created
 
 
+def sync_debug_raw() -> str:
+    """Функция пошаговой диагностики подключения."""
+    report = ["🔍 <b>Диагностика 3x-ui API</b>\n"]
+    report.append(f"🌐 <b>URL:</b> <code>{XUI_URL}</code>")
+    report.append(f"👤 <b>Логин:</b> <code>{XUI_USERNAME}</code>\n")
+
+    cookie_jar = http.cookiejar.CookieJar()
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(cookie_jar),
+        urllib.request.HTTPSHandler(context=ssl_ctx)
+    )
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36",
+    }
+
+    # Шаг 1: Проверка доступности базового URL
+    try:
+        req = urllib.request.Request(f"{XUI_URL}/", headers=headers)
+        with opener.open(req, timeout=10) as resp:
+            report.append(f"1️⃣ <b>GET /:</b> HTTP {resp.status} (ОК)")
+    except urllib.error.HTTPError as e:
+        report.append(f"1️⃣ <b>GET /:</b> HTTP {e.code}")
+    except Exception as e:
+        report.append(f"1️⃣ <b>GET /:</b> Ошибка ({escape(str(e))})")
+
+    # Шаг 2: Проверка логина
+    try:
+        login_payload = urllib.parse.urlencode({
+            "username": XUI_USERNAME,
+            "password": XUI_PASSWORD,
+        }).encode("utf-8")
+        
+        req = urllib.request.Request(
+            f"{XUI_URL}/login",
+            data=login_payload,
+            headers={**headers, "Content-Type": "application/x-www-form-urlencoded"},
+            method="POST"
+        )
+        with opener.open(req, timeout=10) as resp:
+            text = resp.read().decode("utf-8", errors="ignore")
+            cookies_count = len(cookie_jar)
+            report.append(f"2️⃣ <b>POST /login:</b> HTTP {resp.status} | Получено кук: {cookies_count}")
+            report.append(f"   Ответ: <code>{escape(text[:200])}</code>")
+    except urllib.error.HTTPError as e:
+        err_text = e.read().decode("utf-8", errors="ignore")
+        report.append(f"2️⃣ <b>POST /login:</b> HTTP {e.code}")
+        report.append(f"   Ответ: <code>{escape(err_text[:200])}</code>")
+    except Exception as e:
+        report.append(f"2️⃣ <b>POST /login:</b> Ошибка ({escape(str(e))})")
+
+    # Шаг 3: Получение Inbounds
+    try:
+        req = urllib.request.Request(f"{XUI_URL}/panel/api/inbounds/list", headers=headers)
+        with opener.open(req, timeout=10) as resp:
+            text = resp.read().decode("utf-8", errors="ignore")
+            report.append(f"3️⃣ <b>GET /inbounds/list:</b> HTTP {resp.status} (УСПЕХ 🎉)")
+            try:
+                data = json.loads(text)
+                inbounds_count = len(data.get("obj", [])) if isinstance(data.get("obj"), list) else "N/A"
+                report.append(f"   Найдено Inbounds: <b>{inbounds_count}</b>")
+            except Exception:
+                report.append(f"   Сырой ответ: <code>{escape(text[:150])}</code>")
+    except urllib.error.HTTPError as e:
+        err_text = e.read().decode("utf-8", errors="ignore")
+        report.append(f"3️⃣ <b>GET /inbounds/list:</b> HTTP {e.code}")
+        report.append(f"   Ответ: <code>{escape(err_text[:200])}</code>")
+    except Exception as e:
+        report.append(f"3️⃣ <b>GET /inbounds/list:</b> Ошибка ({escape(str(e))})")
+
+    return "\n".join(report)
+
+
 async def show_xui_error(message: Message, error: Exception):
-    """Вывод ошибок в чат."""
     if isinstance(error, XUIError):
         text = str(error)
     else:
@@ -396,9 +464,9 @@ async def show_xui_error(message: Message, error: Exception):
     await message.answer(text, parse_mode="HTML")
 
 
-# =========================================================
+# =========================
 # 3. КЛАВИАТУРЫ
-# =========================================================
+# =========================
 
 def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -433,9 +501,16 @@ def back_kb():
     ])
 
 
-# =========================================================
+# =========================
 # 4. ХЕНДЛЕРЫ КОМАНД
-# =========================================================
+# =========================
+
+@dp.message(Command("debug_raw", "debug"), F.chat.type == "private")
+async def cmd_debug_raw(message: Message):
+    wait_msg = await message.answer("🔄 Выполняю диагностику подключения к 3x-ui...")
+    result_text = await asyncio.to_thread(sync_debug_raw)
+    await wait_msg.edit_text(result_text, parse_mode="HTML")
+
 
 @dp.message(Command("myid", "myip", "id", "ip"), F.chat.type == "private")
 async def cmd_myid(message: Message):
@@ -619,13 +694,14 @@ async def fallback_text(message: Message):
         "/myid — узнать свой Telegram ID\n"
         "/inbounds — список подключений (для админа)\n"
         "/test_vpn — получить тестовый VPN-ключ\n"
+        "/debug_raw — диагностика подключения к 3x-ui\n"
         "/start — главное меню"
     )
 
 
-# =========================================================
+# =========================
 # 5. ТОЧКА ВХОДА
-# =========================================================
+# =========================
 
 async def main():
     logger.info("Бот успешно запущен и слушает команды.")
