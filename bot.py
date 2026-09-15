@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import ssl
 import time
@@ -113,31 +114,34 @@ def _browser_headers():
         ),
         "Origin": XUI_URL,
         "Referer": f"{XUI_URL}/panel/",
+        "Accept": "application/json, text/plain, */*",
     }
 
 
-async def xui_request(session, method, path, **kwargs):
+async def xui_request(session, method, path, csrf_token=None, **kwargs):
     url = f"{XUI_URL}{path}"
     headers = kwargs.pop("headers", {})
     headers.update(_browser_headers())
+    if csrf_token:
+        headers["X-CSRF-Token"] = csrf_token
 
     async with session.request(method, url, headers=headers, **kwargs) as response:
         if response.status >= 400:
             body = ""
             try:
-                body = (await response.text())[:300]
+                body = (await response.text())[:400]
             except Exception:
                 pass
             raise XUIError(
                 f"HTTP {response.status} для {path}\n"
-                f"URL: {url}\n"
                 f"Тело: {body}"
             )
 
         try:
             result = await response.json(content_type=None)
         except ValueError as exc:
-            raise XUIError(f"Не JSON в ответе на {path}.") from exc
+            text = await response.text()
+            raise XUIError(f"Не JSON в ответе на {path}.\n{ text[:200]}") from exc
 
     if not isinstance(result, dict):
         raise XUIError("Неожиданный ответ API.")
@@ -148,6 +152,22 @@ async def xui_request(session, method, path, **kwargs):
         )
 
     return result.get("obj")
+
+
+def extract_csrf_token(html: str) -> str | None:
+    # 1. <meta name="csrf-token" content="...">
+    m = re.search(r'<meta[^>]*name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)["\']', html)
+    if m:
+        return m.group(1)
+    # 2. window.csrfToken = "..."
+    m = re.search(r'csrfToken\s*[:=]\s*["\']([^"\']+)["\']', html)
+    if m:
+        return m.group(1)
+    # 3. token:"..."
+    m = re.search(r'token\s*:\s*["\']([^"\']+)["\']', html)
+    if m:
+        return m.group(1)
+    return None
 
 
 @asynccontextmanager
@@ -162,17 +182,27 @@ async def xui_session():
 
     async with aiohttp.ClientSession(
         cookie_jar=aiohttp.CookieJar(unsafe=True),
-        timeout=aiohttp.ClientTimeout(total=25),
+        timeout=aiohttp.ClientTimeout(total=30),
         connector=aiohttp.TCPConnector(ssl=ssl_context),
     ) as session:
-        # Обязательно получаем cookies перед логином
-        await session.get(
+        # 1. Получаем HTML панели и CSRF-токен
+        async with session.get(
             f"{XUI_URL}/panel/",
             headers=_browser_headers(),
-        )
-        # Логинимся через JSON (новая версия 3x-ui)
+        ) as resp:
+            html = await resp.text()
+
+        csrf_token = extract_csrf_token(html)
+        if not csrf_token:
+            raise XUIError(
+                "Не удалось получить CSRF-токен с панели 3x-ui.\n"
+                "Эта версия панели требует CSRF-защиту."
+            )
+
+        # 2. Логинимся через JSON с CSRF-токеном
         await xui_request(
             session, "POST", "/login",
+            csrf_token=csrf_token,
             json={"username": XUI_USERNAME, "password": XUI_PASSWORD},
         )
         yield session
@@ -347,19 +377,19 @@ async def list_inbounds(message: Message):
         if not items:
             await message.answer("Нет inbound'ов.")
             return
-        await message.answer("✅ Успешно авторизовались в 3x-ui!\n\nInbound'ы:")
+        await message.answer("✅ АВТОРИЗАЦИЯ ПРОШЛА УСПЕШНО!\n\nВходящие подключения 3x-ui:")
         for item in items:
             st = as_dict(item.get("streamSettings"))
             await message.answer(
-                f"ID: {item['id']}\n"
-                f"Название: {item.get('remark','')}\n"
-                f"Протокол: {item.get('protocol','?')}\n"
-                f"Транспорт: {st.get('network','?')}\n"
-                f"Защита: {st.get('security','?')}\n"
-                f"Порт: {item.get('port','?')}",
+                f"🆔 ID: {item['id']}\n"
+                f"📝 Название: {item.get('remark','')}\n"
+                f"⚙️ Протокол: {item.get('protocol','?')}\n"
+                f"🚀 Транспорт: {st.get('network','?')}\n"
+                f"🔒 Защита: {st.get('security','?')}\n"
+                f"🔌 Порт: {item.get('port','?')}",
                 parse_mode=None,
             )
-        await message.answer("🔥 Запиши ID нужного inbound'а в Railway → XUI_INBOUND_ID → перезапусти бота → отправь /test_vpn")
+        await message.answer("🎉 ВСЁ РАБОТАЕТ!\n\n1. Запиши нужный ID в Railway → XUI_INBOUND_ID\n2. Перезапусти бота\n3. Отправь /test_vpn")
     except Exception as error:
         await show_xui_error(message, error)
 
@@ -369,9 +399,9 @@ async def test_vpn(message: Message):
     try:
         async with test_lock:
             link, created = await create_or_get_test_client(message.from_user.id)
-        title = "✅ Тестовый клиент создан! Срок: 24 часа | Трафик: 1 ГиБ" if created else "🔐 Твой существующий тестовый ключ"
+        title = "✅ Тестовый клиент СОЗДАН!\n⏰ Срок: 24 часа\n📊 Трафик: 1 ГиБ" if created else "🔐 Твой существующий тестовый ключ"
         await message.answer(
-            f"{title}\n\n<code>{escape(link)}</code>\n\nИмпортируй ссылку в VPN-приложение.",
+            f"{title}\n\n<code>{escape(link)}</code>\n\n📱 Импортируй ссылку в VPN-приложение.\n\n✅ Если подключается — автогенерация ключей РАБОТАЕТ!",
             parse_mode="HTML", protect_content=True,
         )
     except Exception as error:
