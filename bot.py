@@ -68,7 +68,8 @@ TARIFFS = {
     },
     "family": {
         "name": "Семейный", "price": 399,
-        "traffic": "Безлимит", "ips": 5,
+        "traffic": "Безлимит",
+        "ips": 5,
         "locations": "3 локации",
     },
     "premium": {
@@ -141,7 +142,7 @@ async def xui_request(session, method, path, csrf_token=None, **kwargs):
             result = await response.json(content_type=None)
         except ValueError as exc:
             text = await response.text()
-            raise XUIError(f"Не JSON в ответе на {path}.\n{ text[:200]}") from exc
+            raise XUIError(f"Не JSON в ответе на {path}.\n{text[:200]}") from exc
 
     if not isinstance(result, dict):
         raise XUIError("Неожиданный ответ API.")
@@ -155,15 +156,12 @@ async def xui_request(session, method, path, csrf_token=None, **kwargs):
 
 
 def extract_csrf_token(html: str) -> str | None:
-    # 1. <meta name="csrf-token" content="...">
     m = re.search(r'<meta[^>]*name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)["\']', html)
     if m:
         return m.group(1)
-    # 2. window.csrfToken = "..."
     m = re.search(r'csrfToken\s*[:=]\s*["\']([^"\']+)["\']', html)
     if m:
         return m.group(1)
-    # 3. token:"..."
     m = re.search(r'token\s*:\s*["\']([^"\']+)["\']', html)
     if m:
         return m.group(1)
@@ -185,7 +183,6 @@ async def xui_session():
         timeout=aiohttp.ClientTimeout(total=30),
         connector=aiohttp.TCPConnector(ssl=ssl_context),
     ) as session:
-        # 1. Получаем HTML панели и CSRF-токен
         async with session.get(
             f"{XUI_URL}/panel/",
             headers=_browser_headers(),
@@ -195,11 +192,9 @@ async def xui_session():
         csrf_token = extract_csrf_token(html)
         if not csrf_token:
             raise XUIError(
-                "Не удалось получить CSRF-токен с панели 3x-ui.\n"
-                "Эта версия панели требует CSRF-защиту."
+                "Не удалось получить CSRF-токен с панели 3x-ui."
             )
 
-        # 2. Логинимся через JSON с CSRF-токеном
         await xui_request(
             session, "POST", "/login",
             csrf_token=csrf_token,
@@ -209,73 +204,65 @@ async def xui_session():
 
 
 def get_reality_parameters(inbound):
-    if inbound.get("protocol") != "vless":
-        raise XUIError("Inbound не VLESS.")
-    if not inbound.get("enable"):
-        raise XUIError("Inbound выключен.")
+    # БРО! В НОВОЙ 3X-UI API НЕ ОТДАЁТ REALITY ПАРАМЕТРЫ
+    # Поэтому ТОЛЬКО берём их из ENV переменных Railway
 
-    stream = as_dict(inbound.get("streamSettings"))
+    public_key = os.getenv("REALITY_PUBLIC_KEY", "").strip()
+    sni = os.getenv("REALITY_SNI", "").strip()
+    short_id = os.getenv("REALITY_SHORT_ID", "").strip()
 
-    if stream.get("network") not in ("tcp", "raw") or stream.get("security") != "reality":
-        raise XUIError("Нужен VLESS + TCP/RAW + Reality.")
-
-    tcp_settings = as_dict(stream.get("tcpSettings") or stream.get("rawSettings"))
-    header = as_dict(tcp_settings.get("header"))
-    if header.get("type", "none") != "none":
-        raise XUIError("Нужен TCP без HTTP-заголовка.")
-
-    reality = as_dict(stream.get("realitySettings"))
-    client_settings = as_dict(reality.get("settings"))
-
-    public_key = (
-        os.getenv("REALITY_PUBLIC_KEY")
-        or client_settings.get("publicKey")
-        or reality.get("publicKey")
-    )
-    server_names = reality.get("serverNames") or []
-    short_ids = reality.get("shortIds") or []
-
-    sni = os.getenv("REALITY_SNI") or (server_names[0] if server_names else "")
-    short_id = os.getenv("REALITY_SHORT_ID")
-    if short_id is None:
-        short_id = short_ids[0] if short_ids else None
-
-    if not public_key or not sni or short_id is None:
+    if not public_key:
         raise XUIError(
-            "Не хватает параметров Reality.\n"
-            "Добавь REALITY_PUBLIC_KEY, REALITY_SNI, REALITY_SHORT_ID."
+            "❌ НЕ ХВАТАЕТ REALITY_PUBLIC_KEY!\n\n"
+            "Ты НЕ добавил Public Key в Railway Variables."
         )
-    if "*" in sni:
-        raise XUIError("REALITY_SNI: без *.")
+    if not sni:
+        raise XUIError(
+            "❌ НЕ ХВАТАЕТ REALITY_SNI!\n\n"
+            "Ты НЕ добавил Server Names (SNI) в Railway Variables."
+        )
+    if not short_id:
+        raise XUIError(
+            "❌ НЕ ХВАТАЕТ REALITY_SHORT_ID!\n\n"
+            "Ты НЕ добавил Short ID в Railway Variables."
+        )
 
     return {
         "public_key": public_key,
         "sni": sni,
         "short_id": short_id,
-        "spider_x": client_settings.get("spiderX") or "/",
+        "spider_x": "/",
     }
 
 
 def build_vless_link(client, inbound, reality):
-    if not VPN_HOST:
-        raise XUIError("Укажи VPN_HOST в Railway.")
+    if not VPN_HOST or VPN_HOST == "":
+        raise XUIError(
+            "❌ НЕ ХВАТАЕТ VPN_HOST!\n\n"
+            "Добавь VPN_HOST в Railway Variables.\n"
+            "Значение: 138.124.110.74"
+        )
 
     try:
         port = int(os.getenv("VPN_PORT") or inbound["port"])
     except (ValueError, TypeError, KeyError) as exc:
-        raise XUIError("Не удалось определить порт.") from exc
+        raise XUIError("Не удалось определить порт VPN.") from exc
 
     if not 1 <= port <= 65535:
-        raise XUIError("Некорректный порт.")
+        raise XUIError("Некорректный порт VPN.")
 
     host = VPN_HOST
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
 
     params = {
-        "type": "tcp", "encryption": "none", "security": "reality",
-        "pbk": reality["public_key"], "fp": "chrome",
-        "sni": reality["sni"], "sid": reality["short_id"],
+        "type": "tcp",
+        "encryption": "none",
+        "security": "reality",
+        "pbk": reality["public_key"],
+        "fp": "chrome",
+        "sni": reality["sni"],
+        "sid": reality["short_id"],
         "spx": reality["spider_x"],
     }
     if client.get("flow"):
@@ -287,7 +274,10 @@ def build_vless_link(client, inbound, reality):
 
 async def create_or_get_test_client(telegram_id):
     if XUI_INBOUND_ID <= 0:
-        raise XUIError("Сначала /inbounds, потом XUI_INBOUND_ID.")
+        raise XUIError("Сначала отправь /inbounds, потом добавь XUI_INBOUND_ID в Railway")
+
+    if not VPN_HOST:
+        raise XUIError("❌ Добавь VPN_HOST=138.124.110.74 в Railway Variables!")
 
     async with xui_session() as session:
         inbound = await xui_request(
@@ -347,8 +337,7 @@ async def show_xui_error(message, error):
     elif isinstance(error, asyncio.TimeoutError):
         text = "Таймаут. Проверь доступность панели."
     else:
-        logger.error("Ошибка: %s: %s", type(error).__name__, error)
-        text = f"Ошибка: {type(error).__name__}: {error}"
+        text = f"❌ ОШИБКА: {type(error).__name__}\n\n{str(error)}"
     await message.answer(text, parse_mode=None)
 
 
@@ -358,15 +347,22 @@ async def show_xui_error(message, error):
 
 @dp.message(Command("myid"), F.chat.type == "private")
 async def my_id(message: Message):
-    await message.answer(f"ID: {message.from_user.id}")
+    await message.answer(f"Твой Telegram ID: {message.from_user.id}")
 
 
-@dp.message(Command("myip"), F.chat.type == "private")
-async def my_ip(message: Message):
-    async with aiohttp.ClientSession() as s:
-        async with s.get("https://api.ipify.org") as r:
-            ip = await r.text()
-    await message.answer(f"IP сервера: {ip}")
+@dp.message(Command("debug_inbound"), F.chat.type == "private", F.from_user.id == ADMIN_ID)
+async def debug_inbound(message: Message):
+    try:
+        async with xui_session() as session:
+            inbound = await xui_request(
+                session, "GET",
+                f"/panel/api/inbounds/get/{XUI_INBOUND_ID}",
+            )
+        text = json.dumps(inbound, indent=2, ensure_ascii=False)
+        for i in range(0, len(text), 4000):
+            await message.answer(f"<code>{escape(text[i:i+4000])}</code>", parse_mode="HTML")
+    except Exception as error:
+        await show_xui_error(message, error)
 
 
 @dp.message(Command("inbounds"), F.chat.type == "private", F.from_user.id == ADMIN_ID)
@@ -377,7 +373,7 @@ async def list_inbounds(message: Message):
         if not items:
             await message.answer("Нет inbound'ов.")
             return
-        await message.answer("✅ АВТОРИЗАЦИЯ ПРОШЛА УСПЕШНО!\n\nВходящие подключения 3x-ui:")
+        await message.answer("✅ АВТОРИЗАЦИЯ ПРОШЛА!\n\nВходящие подключения:")
         for item in items:
             st = as_dict(item.get("streamSettings"))
             await message.answer(
@@ -389,7 +385,7 @@ async def list_inbounds(message: Message):
                 f"🔌 Порт: {item.get('port','?')}",
                 parse_mode=None,
             )
-        await message.answer("🎉 ВСЁ РАБОТАЕТ!\n\n1. Запиши нужный ID в Railway → XUI_INBOUND_ID\n2. Перезапусти бота\n3. Отправь /test_vpn")
+        await message.answer("🎉 Запиши ID в Railway → XUI_INBOUND_ID → перезапусти → /test_vpn")
     except Exception as error:
         await show_xui_error(message, error)
 
@@ -399,9 +395,9 @@ async def test_vpn(message: Message):
     try:
         async with test_lock:
             link, created = await create_or_get_test_client(message.from_user.id)
-        title = "✅ Тестовый клиент СОЗДАН!\n⏰ Срок: 24 часа\n📊 Трафик: 1 ГиБ" if created else "🔐 Твой существующий тестовый ключ"
+        title = "✅ КЛИЕНТ СОЗДАН!\n⏰ 24 часа | 📊 1 ГиБ" if created else "🔐 Существующий тестовый ключ"
         await message.answer(
-            f"{title}\n\n<code>{escape(link)}</code>\n\n📱 Импортируй ссылку в VPN-приложение.\n\n✅ Если подключается — автогенерация ключей РАБОТАЕТ!",
+            f"{title}\n\n<code>{escape(link)}</code>\n\n📱 Импортируй в VPN-приложение!",
             parse_mode="HTML", protect_content=True,
         )
     except Exception as error:
@@ -442,10 +438,9 @@ async def cmd_start(message: Message):
     ])
     await message.answer(
         "📄 <b>Лицензионное соглашение</b>\n\n"
-        "1. Использование только для легальной деятельности.\n"
-        "2. Запрещена передача ключей третьим лицам.\n"
-        "3. Администрация не несёт ответственности за действия пользователей.\n\n"
-        "<i>Нажмите кнопку ниже для продолжения.</i>",
+        "1. Только легальное использование.\n"
+        "2. Запрещена передача ключей.\n"
+        "3. Админ не несёт ответственности.\n\n<i>Нажми ниже.</i>",
         reply_markup=kb, parse_mode="HTML",
     )
 
@@ -453,7 +448,7 @@ async def cmd_start(message: Message):
 @dp.callback_query(F.data == "accept_license")
 async def accept_license(cb: CallbackQuery):
     await cb.answer()
-    await cb.message.edit_text("✅ Условия приняты. Выберите действие:", reply_markup=main_menu_kb())
+    await cb.message.edit_text("✅ Принято. Выбери действие:", reply_markup=main_menu_kb())
 
 
 @dp.callback_query(F.data == "main_menu")
@@ -465,9 +460,9 @@ async def main_menu(cb: CallbackQuery):
 @dp.callback_query(F.data == "tariffs")
 async def tariffs(cb: CallbackQuery):
     await cb.answer()
-    text = "<b>Выберите тариф:</b>\n\n"
+    text = "<b>Тарифы:</b>\n\n"
     for d in TARIFFS.values():
-        text += f"• {d['name']} — {d['price']}₽ | {d['traffic']} | {d['ips']} устр. | {d['locations']}\n"
+        text += f"• {d['name']} — {d['price']}₽ | {d['traffic']} | {d['ips']} устр.\n"
     await cb.message.edit_text(text, reply_markup=tariffs_kb(), parse_mode="HTML")
 
 
@@ -483,38 +478,38 @@ async def buy(cb: CallbackQuery):
         [InlineKeyboardButton(text="◀️ Назад", callback_data="tariffs")],
     ])
     await cb.message.edit_text(
-        f"💳 <b>{t['name']}</b> — {t['price']}₽\n<i>Оплата пока не подключена.</i>",
+        f"💳 <b>{t['name']}</b> — {t['price']}₽\n<i>Оплата не подключена.</i>",
         reply_markup=kb, parse_mode="HTML",
     )
 
 
 @dp.callback_query(F.data == "fake_pay")
 async def fake_pay(cb: CallbackQuery):
-    await cb.answer("Это демонстрация. Деньги не списываются.", show_alert=True)
-    await cb.message.edit_text("🧪 Демо оплаты.", reply_markup=back_kb())
+    await cb.answer("Демо.", show_alert=True)
+    await cb.message.edit_text("🧪 Демо оплата.", reply_markup=back_kb())
 
 
 @dp.callback_query(F.data == "profile")
 async def profile(cb: CallbackQuery):
     await cb.answer()
-    await cb.message.edit_text("👤 Профиль:\n\nПлатные подписки пока не подключены.", reply_markup=back_kb())
+    await cb.message.edit_text("👤 Профиль\n\nПодписки не подключены.", reply_markup=back_kb())
 
 
 @dp.callback_query(F.data == "connect_vpn")
 async def connect(cb: CallbackQuery):
     await cb.answer()
-    await cb.message.edit_text("🔐 Для подключения выбери тариф:", reply_markup=tariffs_kb())
+    await cb.message.edit_text("🔐 Выбери тариф:", reply_markup=tariffs_kb())
 
 
 @dp.callback_query(F.data == "activation")
 async def activation(cb: CallbackQuery):
     await cb.answer()
     await cb.message.edit_text(
-        "📋 <b>Инструкция по активации</b>\n\n"
-        "1. Установи VPN-клиент с поддержкой <b>VLESS + Reality</b>.\n"
-        "2. Скопируй ссылку подключения.\n"
-        "3. Импортируй её в приложение.\n"
-        "4. Подключись к VPN.",
+        "📋 <b>Активация</b>\n\n"
+        "1. Установи клиент с поддержкой VLESS + Reality\n"
+        "2. Скопируй ссылку vless://...\n"
+        "3. Импортируй в приложение\n"
+        "4. Подключись",
         reply_markup=back_kb(), parse_mode="HTML",
     )
 
@@ -523,7 +518,7 @@ async def activation(cb: CallbackQuery):
 async def support(cb: CallbackQuery):
     await cb.answer()
     await cb.message.edit_text(
-        "💬 <b>Поддержка</b>\n\n👉 <a href='https://t.me/Suppr_XYZ'>@Suppr_XYZ</a>",
+        "💬 Поддержка:\n👉 <a href='https://t.me/Suppr_XYZ'>@Suppr_XYZ</a>",
         reply_markup=back_kb(), parse_mode="HTML",
     )
 
