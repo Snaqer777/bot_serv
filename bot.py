@@ -42,7 +42,7 @@ if not BOT_TOKEN:
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or "0")
 
-# Очищаем URL: убираем возможные лишние суффиксы /panel и слеши
+# Очищаем URL от лишних слешей и суффиксов
 raw_url = os.getenv("XUI_URL", "").strip().rstrip("/")
 if raw_url.endswith("/panel"):
     raw_url = raw_url[:-6].rstrip("/")
@@ -95,7 +95,7 @@ TARIFFS = {
 
 
 # =========================================================
-# 2. НИЗКОУРОВНЕВЫЙ HTTP-КЛИЕНТ ДЛЯ 3X-UI (RAW SOCKETS)
+# 2. НИЗКОУРОВНЕВЫЙ HTTP-КЛИЕНТ (RAW SOCKETS)
 # =========================================================
 
 class XUIError(Exception):
@@ -127,7 +127,7 @@ class RawResponse:
 
 
 class RawHttpClient:
-    """HTTP-клиент на чистых сокетах: устойчив к нестандартным ответам 3x-ui."""
+    """HTTP-клиент на чистых сокетах: обходит баги парсинга HTTP/0.0 и строгие проверки TLS."""
 
     def __init__(self):
         self.cookies = {}
@@ -391,7 +391,7 @@ def get_reality_parameters(inbound: dict):
 
     if not public_key or not sni:
         raise XUIError(
-            "Не удалось получить ключи Reality.\n"
+            "Не удалось автоматически получить ключи Reality.\n"
             "Добавь в Railway Variables:\n"
             "<code>REALITY_PUBLIC_KEY</code> — Public Key\n"
             "<code>REALITY_SNI</code> — Server Name (например, google.com)\n"
@@ -478,8 +478,8 @@ def sync_create_or_get_client(telegram_id: int):
 
 
 def sync_debug_raw() -> str:
-    """Диагностика с GET+POST авторизацией."""
-    report = ["🔍 <b>Диагностика 3x-ui</b>\n"]
+    """Пошаговая диагностика с подробным выводом."""
+    report = ["🔍 <b>Диагностика подключения 3x-ui</b>\n"]
     report.append(f"🌐 <b>URL:</b> <code>{XUI_URL}</code>")
     report.append(f"👤 <b>Логин:</b> <code>{XUI_USERNAME}</code>\n")
 
@@ -488,11 +488,11 @@ def sync_debug_raw() -> str:
     # Шаг 1: GET / (получение CSRF / session cookies)
     try:
         r1 = http.request("GET", f"{XUI_URL}/")
-        report.append(f"1️⃣ <b>GET /:</b> HTTP {r1.status_code} | Кук получено: {len(http.cookies)}")
+        report.append(f"1️⃣ <b>GET /:</b> HTTP {r1.status_code} | Кук: {len(http.cookies)}")
     except Exception as e:
         report.append(f"1️⃣ <b>GET /:</b> Ошибка ({escape(str(e))})")
 
-    # Шаг 2: POST /login с полученными куками
+    # Шаг 2: POST /login с куками
     try:
         login_data = {
             "username": XUI_USERNAME,
@@ -500,7 +500,7 @@ def sync_debug_raw() -> str:
             "loginSecret": "",
         }
         r2 = http.request("POST", f"{XUI_URL}/login", body_data=login_data, content_type="application/x-www-form-urlencoded")
-        report.append(f"2️⃣ <b>POST /login (Form):</b> HTTP {r2.status_code} | Кук в сессии: {len(http.cookies)}")
+        report.append(f"2️⃣ <b>POST /login:</b> HTTP {r2.status_code} | Кук в сессии: {len(http.cookies)}")
         report.append(f"   Ответ: <code>{escape(r2.text[:150]) or '(пусто)'}</code>")
     except Exception as e:
         report.append(f"2️⃣ <b>POST /login:</b> Ошибка ({escape(str(e))})")
@@ -575,7 +575,8 @@ def back_kb():
 # 4. ХЕНДЛЕРЫ КОМАНД
 # =========================================================
 
-@dp.message(Command("debug_raw", "debug"), F.chat.type == "private")
+# Добавлены все варианты: /debug, /debug_raw, /debug_login, /test_login
+@dp.message(Command("debug", "debug_raw", "debug_login", "test_login"), F.chat.type == "private")
 async def cmd_debug_raw(message: Message):
     wait_msg = await message.answer("🔄 Выполняю диагностику GET+POST...")
     result_text = await asyncio.to_thread(sync_debug_raw)
@@ -764,7 +765,7 @@ async def fallback_text(message: Message):
         "/myid — узнать свой Telegram ID\n"
         "/inbounds — список подключений (для админа)\n"
         "/test_vpn — получить тестовый VPN-ключ\n"
-        "/debug_raw — диагностика подключения к 3x-ui\n"
+        "/debug_login — диагностика подключения к 3x-ui\n"
         "/start — главное меню"
     )
 
