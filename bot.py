@@ -151,15 +151,26 @@ async def xui_request(session, method, path, csrf_token=None, **kwargs):
 
 
 def extract_csrf_token(html: str):
-    m = re.search(r'<meta[^>]*name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)["\']', html)
-    if m:
-        return m.group(1)
-    m = re.search(r'csrfToken\s*[:=]\s*["\']([^"\']+)["\']', html)
-    if m:
-        return m.group(1)
-    m = re.search(r'token\s*:\s*["\']([^"\']+)["\']', html)
-    if m:
-        return m.group(1)
+    patterns = [
+        r'<meta[^>]+csrf-token[^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+csrf-token',
+        r'csrfToken["\']?\s*[:=]\s*["\']([^"\']+)["\']',
+        r'"csrfToken"\s*:\s*"([^"]+)"',
+        r'"csrf-token"\s*:\s*"([^"]+)"',
+        r'window\.csrfToken\s*=\s*"([^"]+)"',
+        r'globalThis\.csrfToken\s*=\s*"([^"]+)"',
+        r'csrf[_-]?token["\']?\s*:\s*"([^"]+)"',
+        r'X-CSRF-Token["\']?\s*:\s*"([^"]+)"',
+        r'token["\']?\s*:\s*"([^"]+)"',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    m = re.findall(r'"([^"]{20,})"', html)
+    for cand in m:
+        if len(cand) > 30 and re.match(r'^[A-Za-z0-9_\-\.]+$', cand):
+            pass
     return None
 
 
@@ -175,7 +186,7 @@ async def xui_session():
 
     async with aiohttp.ClientSession(
         cookie_jar=aiohttp.CookieJar(unsafe=True),
-        timeout=aiohttp.ClientTimeout(total=30),
+        timeout=aiohttp.ClientTimeout(total=40),
         connector=aiohttp.TCPConnector(ssl=ssl_context),
     ) as session:
         async with session.get(
@@ -185,8 +196,11 @@ async def xui_session():
             html = await resp.text()
 
         csrf_token = extract_csrf_token(html)
+
         if not csrf_token:
-            raise XUIError("Не удалось получить CSRF-токен")
+            raise XUIError(
+                "CSRF-токен не найден. 3x-ui v2.6.x изменил структуру."
+            )
 
         await xui_request(
             session, "POST", "/login",
@@ -198,11 +212,11 @@ async def xui_session():
 
 def get_reality_parameters(inbound):
     if not REALITY_PUBLIC_KEY:
-        raise XUIError("Не найден REALITY_PUBLIC_KEY в Railway Variables")
+        raise XUIError("Не найден REALITY_PUBLIC_KEY")
     if not REALITY_SNI:
-        raise XUIError("Не найден REALITY_SNI в Railway Variables")
+        raise XUIError("Не найден REALITY_SNI")
     if not REALITY_SHORT_ID:
-        raise XUIError("Не найден REALITY_SHORT_ID в Railway Variables")
+        raise XUIError("Не найден REALITY_SHORT_ID")
 
     return {
         "public_key": REALITY_PUBLIC_KEY,
@@ -214,7 +228,7 @@ def get_reality_parameters(inbound):
 
 def build_vless_link(client, inbound, reality):
     if not VPN_HOST:
-        raise XUIError("Не найден VPN_HOST в Railway Variables")
+        raise XUIError("Не найден VPN_HOST")
 
     try:
         port = int(os.getenv("VPN_PORT") or inbound["port"])
@@ -281,7 +295,7 @@ async def create_or_get_test_client(telegram_id):
                 raise XUIError(f"Клиент {email} выключен.")
             exp = int(client.get("expiryTime") or 0)
             if 0 < exp <= now_ms:
-                raise XUIError("Срок теста истёк. Удали клиента в панели.")
+                raise XUIError("Срок теста истёк.")
 
         link = build_vless_link(client, inbound, reality)
 
@@ -298,7 +312,7 @@ async def show_xui_error(message, error):
     if isinstance(error, XUIError):
         text = str(error)
     elif isinstance(error, asyncio.TimeoutError):
-        text = "Таймаут соединения с панелью"
+        text = "Таймаут соединения"
     else:
         text = f"Ошибка: {type(error).__name__}: {error}"
     await message.answer(text, parse_mode=None)
@@ -309,6 +323,26 @@ async def my_id(message: Message):
     await message.answer(f"Твой Telegram ID: {message.from_user.id}")
 
 
+@dp.message(Command("debug_panel"), F.chat.type == "private", F.from_user.id == ADMIN_ID)
+async def debug_panel(message: Message):
+    try:
+        ssl_context = _ssl_ctx() if XUI_URL.startswith("https://") else None
+        async with aiohttp.ClientSession(
+            cookie_jar=aiohttp.CookieJar(unsafe=True),
+            timeout=aiohttp.ClientTimeout(total=30),
+            connector=aiohttp.TCPConnector(ssl=ssl_context),
+        ) as session:
+            async with session.get(f"{XUI_URL}/panel/", headers=_browser_headers()) as resp:
+                html = await resp.text()
+        token = extract_csrf_token(html)
+        await message.answer(f"HTML длина: {len(html)}\nНайден CSRF: {token is not None}\nТокен: {token}")
+        preview = html[:3500]
+        for i in range(0, len(preview), 4000):
+            await message.answer(f"<code>{escape(preview[i:i+4000])}</code>", parse_mode="HTML")
+    except Exception as error:
+        await show_xui_error(message, error)
+
+
 @dp.message(Command("inbounds"), F.chat.type == "private", F.from_user.id == ADMIN_ID)
 async def list_inbounds(message: Message):
     try:
@@ -317,7 +351,7 @@ async def list_inbounds(message: Message):
         if not items:
             await message.answer("Нет inbound'ов.")
             return
-        await message.answer("Авторизация прошла успешно!")
+        await message.answer("Авторизация прошла УСПЕШНО!")
         for item in items:
             st = as_dict(item.get("streamSettings"))
             await message.answer(
@@ -338,7 +372,7 @@ async def test_vpn(message: Message):
     try:
         async with test_lock:
             link, created = await create_or_get_test_client(message.from_user.id)
-        title = "КЛИЕНТ СОЗДАН! 24 часа | 1 ГиБ" if created else "Существующий тестовый ключ"
+        title = "КЛИЕНТ СОЗДАН! 24ч | 1ГБ" if created else "Существующий ключ"
         await message.answer(
             f"{title}\n\n<code>{escape(link)}</code>",
             parse_mode="HTML", protect_content=True,
@@ -353,10 +387,7 @@ async def cmd_start(message: Message):
         [InlineKeyboardButton(text="Принимаю условия", callback_data="accept_license")]
     ])
     await message.answer(
-        "Лицензионное соглашение\n\n"
-        "1. Только легальное использование.\n"
-        "2. Запрещена передача ключей.\n"
-        "3. Админ не несет ответственности.",
+        "Лицензионное соглашение",
         reply_markup=kb,
     )
 
@@ -364,13 +395,13 @@ async def cmd_start(message: Message):
 @dp.callback_query(F.data == "accept_license")
 async def accept_license(cb: CallbackQuery):
     await cb.answer()
-    await cb.message.edit_text("Условия приняты.", reply_markup=main_menu_kb())
+    await cb.message.edit_text("Принято.", reply_markup=main_menu_kb())
 
 
 @dp.callback_query(F.data == "main_menu")
 async def main_menu_cb(cb: CallbackQuery):
     await cb.answer()
-    await cb.message.edit_text("Главное меню", reply_markup=main_menu_kb())
+    await cb.message.edit_text("Меню", reply_markup=main_menu_kb())
 
 
 def main_menu_kb():
