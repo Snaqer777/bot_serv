@@ -70,6 +70,10 @@ XUI_INBOUND_ID = _int_env("XUI_INBOUND_ID")
 VPN_HOST = (os.getenv("VPN_HOST") or "").strip()
 VPN_PORT = _int_env("VPN_PORT")
 
+# Прокси ТОЛЬКО для запросов к панели (если хостер режет IP дата-центров,
+# а снять фильтр нельзя). Формат: http://user:pass@host:port
+XUI_PROXY = (os.getenv("XUI_PROXY") or "").strip() or None
+
 # Reality-параметры по умолчанию автоматически читаются из настроек inbound.
 # Эти переменные нужны ТОЛЬКО если хочешь переопределить их вручную.
 REALITY_PUBLIC_KEY = (os.getenv("REALITY_PUBLIC_KEY") or "").strip()
@@ -87,6 +91,32 @@ BROWSER_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/125.0.0.0 Safari/537.36"
 )
+
+
+def _snip(text, limit=160):
+    """Выжимка из HTML-ответа — по ней видно, КТО вернул ошибку."""
+    return " ".join((text or "").split())[:limit]
+
+
+def classify_body(text):
+    """Угадывает, кто ответил вместо API панели (по телу ответа)."""
+    low = (text or "").lower()
+    if "error code: 1020" in low or "cf-ray" in low or "cloudflare" in low:
+        return "Cloudflare/WAF блокирует запрос (error 1020 / challenge)"
+    if "ddos-guard" in low:
+        return "DDoS-Guard блокирует запрос"
+    if "qrator" in low:
+        return "Qrator (анти-DDoS) блокирует запрос"
+    if "stormwall" in low:
+        return "StormWall (анти-DDoS) блокирует запрос"
+    if "ddos" in low or "access denied" in low or "forbidden" in low:
+        return "какой-то WAF/файрвол вернул «Forbidden»"
+    if "nginx" in low:
+        return "на порту отвечает nginx-заглушка (не панель)"
+    if ("window.location" in low and "login" in low) or "x-ui" in low or "3x-ui" in low:
+        return "страница панели 3x-ui — панель жива"
+    return "неопознанный ответ"
+
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -181,6 +211,7 @@ async def xui_session():
                 f"{XUI_URL}/",
                 headers={"User-Agent": BROWSER_UA},
                 allow_redirects=True,
+                proxy=XUI_PROXY,
             )
         except Exception as exc:
             raise XUIError(
@@ -193,6 +224,7 @@ async def xui_session():
             ) from exc
 
         errors = []
+
         for login_path in ("/login/", "/login", "/panel/api/login"):
             try:
                 async with session.post(
@@ -205,17 +237,28 @@ async def xui_session():
                         "Referer": f"{XUI_URL}/",
                         "X-Requested-With": "XMLHttpRequest",
                     },
+                    proxy=XUI_PROXY,
                 ) as resp:
                     raw = await resp.text()
+                    server_hdr = resp.headers.get("Server", "")
+
+                srv = f" (Server: {server_hdr})" if server_hdr else ""
 
                 if resp.status in (404, 405):
-                    errors.append(f"{login_path} -> HTTP {resp.status}")
+                    errors.append(
+                        f"{login_path} -> HTTP {resp.status}{srv}: "
+                        f"«{_snip(raw)}»"
+                    )
                     continue
 
                 try:
                     data = json.loads(raw)
                 except ValueError:
-                    errors.append(f"{login_path} -> не JSON (HTTP {resp.status})")
+                    errors.append(
+                        f"{login_path} -> HTTP {resp.status}{srv}, не JSON\n"
+                        f"   кто ответил: {classify_body(raw)}\n"
+                        f"   тело: «{_snip(raw)}»"
+                    )
                     continue
 
                 if data.get("success"):
@@ -239,9 +282,14 @@ async def xui_session():
             raise XUIError(
                 "Не удалось авторизоваться в панели ни по одному адресу:\n"
                 + "\n".join(errors)
-                + "\n\nЧаще всего причина — в XUI_URL не указан секретный путь "
-                "(webBasePath). Скопируй адрес из браузера так, как ты "
-                "открываешь панель, напр. https://1.2.3.4:2053/abc123"
+                + "\n\nКак читать ответ выше:\n"
+                "• «error code 1020» / «Attention Required» / «Access Denied» — "
+                "перед панелью стоит защита хостера (WAF/анти-DDoS), блокирующая "
+                "IP дата-центров → попроси хостера отключить её для порта панели.\n"
+                "• «nginx» / «Apache» — на этом порту живёт другой сайт/прокси, "
+                "а не панель → проверь порт и XUI_URL.\n"
+                "• везде 404 — не совпал секретный путь в XUI_URL "
+                "(скопируй адрес из браузера целиком)."
             )
 
         yield session
@@ -259,7 +307,7 @@ async def xui_api(session, method, path, **kwargs):
     headers.update(kwargs.pop("headers", {}))
 
     async with session.request(
-        method, f"{XUI_URL}{path}", headers=headers, **kwargs
+        method, f"{XUI_URL}{path}", headers=headers, proxy=XUI_PROXY, **kwargs
     ) as resp:
         status = resp.status
         raw = await resp.text()
@@ -679,6 +727,80 @@ async def cmd_reset_vpn(message: Message):
 
     except Exception as error:
         await send_xui_error(message, error)
+
+
+@dp.message(
+    Command("panel_debug"),
+    F.chat.type == "private",
+    F.from_user.id == ADMIN_ID,
+    F.from_user.id != 0,
+)
+async def cmd_panel_debug(message: Message):
+    """Диагностика связи с панелью БЕЗ авторизации: кто отвечает на порту."""
+    if not XUI_URL:
+        await message.answer("XUI_URL не задан.")
+        return
+
+    lines = [f"Проверяю {XUI_URL}" + (f" через прокси" if XUI_PROXY else "")]
+    ssl_ctx = _ssl_context() if XUI_URL.startswith("https://") else None
+
+    async with aiohttp.ClientSession(
+        cookie_jar=aiohttp.CookieJar(unsafe=True),
+        timeout=aiohttp.ClientTimeout(total=25),
+        connector=aiohttp.TCPConnector(ssl=ssl_ctx),
+    ) as session:
+        # 1. Забираем главную страницу панели
+        try:
+            async with session.get(
+                f"{XUI_URL}/",
+                headers={"User-Agent": BROWSER_UA},
+                allow_redirects=True,
+                proxy=XUI_PROXY,
+            ) as resp:
+                body = await resp.text()
+                lines.append(
+                    f"GET / -> HTTP {resp.status} "
+                    f"(Server: {resp.headers.get('Server', '-')})"
+                )
+                lines.append(f"Кто ответил: {classify_body(body)}")
+                lines.append(f"Тело: «{_snip(body, 150)}»")
+        except Exception as exc:
+            lines.append(f"GET / -> недоступно: {type(exc).__name__}: {exc}")
+
+        # 2. POST заведомо неверного логина
+        try:
+            async with session.post(
+                f"{XUI_URL}/login/",
+                json={"username": "___debug___", "password": "___debug___"},
+                headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+                proxy=XUI_PROXY,
+            ) as resp:
+                body = await resp.text()
+                lines.append(
+                    f"POST /login/ -> HTTP {resp.status} "
+                    f"(Server: {resp.headers.get('Server', '-')})"
+                )
+                try:
+                    data = json.loads(body)
+                    lines.append(
+                        f"✅ Это ответила ПАНЕЛЬ (JSON): {str(data)[:150]}"
+                    )
+                    lines.append(
+                        "Значит API живо — если бот всё равно не входит, "
+                        "проверяй XUI_USERNAME/XUI_PASSWORD."
+                    )
+                except ValueError:
+                    lines.append("⚠️ Это НЕ панель (не JSON).")
+                    lines.append(f"Кто ответил: {classify_body(body)}")
+                    lines.append(f"Тело: «{_snip(body, 200)}»")
+                    lines.append(
+                        "→ Перед панелью стоит фильтр/прокси. Отключи его "
+                        "или напиши хостеру; как временный обход — XUI_PROXY."
+                    )
+        except Exception as exc:
+            lines.append(f"POST /login/ -> {type(exc).__name__}: {exc}")
+
+    await message.answer("\n".join(lines)[:3900], parse_mode=None)
 
 
 # =========================
