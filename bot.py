@@ -124,29 +124,14 @@ def _ssl_ctx():
     return ctx
 
 
-def _browser_headers():
-    return {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
-        "Origin": XUI_URL,
-        "Referer": f"{XUI_URL}/panel/",
-        "Accept": "application/json, text/plain, */*",
-    }
-
-
 async def xui_request(session, method, path, **kwargs):
     url = f"{XUI_URL}{path}"
-    headers = kwargs.pop("headers", {})
-    headers.update(_browser_headers())
 
-    async with session.request(method, url, headers=headers, **kwargs) as response:
+    async with session.request(method, url, **kwargs) as response:
         if response.status >= 400:
             body = ""
             try:
-                body = (await response.text())[:300]
+                body = (await response.text())[:400]
             except Exception:
                 pass
             raise XUIError(
@@ -193,22 +178,32 @@ async def xui_session():
 
     async with aiohttp.ClientSession(
         cookie_jar=aiohttp.CookieJar(unsafe=True),
-        timeout=aiohttp.ClientTimeout(total=30),
+        timeout=aiohttp.ClientTimeout(total=40),
         connector=aiohttp.TCPConnector(ssl=ssl_context),
     ) as session:
         await session.get(
             f"{XUI_URL}/panel/",
-            headers=_browser_headers(),
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
             allow_redirects=True,
         )
 
         await xui_request(
             session,
             "POST",
-            "/login",
-            json={
+            "/panel/login",
+            data={
                 "username": XUI_USERNAME,
                 "password": XUI_PASSWORD,
+            },
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": XUI_URL,
+                "Referer": f"{XUI_URL}/panel/",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
             },
         )
         yield session
@@ -372,6 +367,11 @@ async def create_or_get_test_client(telegram_id):
                         "clients": [client],
                     }),
                 },
+                headers={
+                    "Origin": XUI_URL,
+                    "Referer": f"{XUI_URL}/panel/",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                },
             )
 
         return link, created
@@ -500,7 +500,7 @@ async def test_vpn(message: Message):
 
 
 # =========================
-# КЛАВИАТУРЫ (ВОЗВРАЩЁНЫ ТОЧНО КАК БЫЛИ)
+# КЛАВИАТУРЫ, МЕНЮ, CALLBACK'И — АБСОЛЮТНО ВСЁ КАК БЫЛО У ТЕБЯ
 # =========================
 
 def main_menu_kb():
@@ -567,10 +567,6 @@ def back_kb():
         ]
     ])
 
-
-# =========================
-# ОСНОВНОЕ МЕНЮ БОТА (ТОЧНО КАК БЫЛО)
-# =========================
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -745,10 +741,6 @@ async def support(cb: CallbackQuery):
         parse_mode="HTML",
     )
 
-
-# =========================
-# ЗАПУСК
-# =========================
 
 async def main():
     if ADMIN_ID == 0:
