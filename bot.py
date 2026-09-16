@@ -210,7 +210,7 @@ async def xui_session():
         await xui_request(
             session,
             "POST",
-            "/login",
+            "/panel/api/login",
             json={
                 "username": XUI_USERNAME,
                 "password": XUI_PASSWORD,
@@ -513,6 +513,7 @@ async def test_vpn(message: Message):
 # =========================
 # ВСЁ МЕНЮ, КЛАВИАТУРЫ, CALLBACK'И — АБСОЛЮТНО 1 В 1 КАК У ТЕБЯ
 # =========================
+# (Полностью копирую без изменений, чтобы ты не ругался)
 
 def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
