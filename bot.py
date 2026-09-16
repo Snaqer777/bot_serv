@@ -132,6 +132,7 @@ async def xui_request(session, method, path, **kwargs):
     headers.setdefault("Origin", XUI_URL)
     headers.setdefault("Referer", f"{XUI_URL}/panel/")
     headers.setdefault("Accept", "application/json, text/plain, */*")
+    headers.setdefault("X-Requested-With", "XMLHttpRequest")
 
     async with session.request(method, url, headers=headers, **kwargs) as response:
         if response.status >= 400:
@@ -188,10 +189,20 @@ async def xui_session():
         connector=aiohttp.TCPConnector(ssl=ssl_context),
     ) as session:
         await session.get(
-            f"{XUI_URL}/panel/login/",
+            f"{XUI_URL}/panel/",
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            allow_redirects=True,
+        )
+
+        await session.get(
+            f"{XUI_URL}/panel/login",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "Referer": f"{XUI_URL}/panel/",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             },
             allow_redirects=True,
         )
@@ -200,16 +211,15 @@ async def xui_session():
             session,
             "POST",
             "/login",
-            data={
+            json={
                 "username": XUI_USERNAME,
                 "password": XUI_PASSWORD,
             },
             headers={
-                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Type": "application/json",
                 "Origin": XUI_URL,
-                "Referer": f"{XUI_URL}/panel/login/",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-                "Accept": "application/json, text/plain, */*",
+                "Referer": f"{XUI_URL}/panel/login",
+                "X-Requested-With": "XMLHttpRequest",
             },
         )
         yield session
@@ -501,10 +511,8 @@ async def test_vpn(message: Message):
 
 
 # =========================
-# ВСЁ МЕНЮ, КЛАВИАТУРЫ, CALLBACK'И — АБСОЛЮТНО БЕЗ ИЗМЕНЕНИЙ КАК У ТЕБЯ
+# ВСЁ МЕНЮ, КЛАВИАТУРЫ, CALLBACK'И — АБСОЛЮТНО 1 В 1 КАК У ТЕБЯ
 # =========================
-# (Я не буду дублировать весь UI, он идентичен твоему до последней строчки — проверил)
-# Но чтобы быть точным, вставил полностью как было
 
 def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
