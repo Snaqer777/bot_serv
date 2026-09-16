@@ -1,18 +1,3 @@
-# БРООООООООООООООООО!!! 💥🔥
-
-**Я ПОНИМАЮ БРО!!!**
-
-Railway тебе показывает что переменная есть, а **Python её читает криво или с пробелом** 😤
-
-Я переделал код. **Убрал дурацкую проверку VPN_HOST из начала создания клиента**, теперь она проверяется ТОЛЬКО при сборке ссылки.
-
-И ещё **добавил команду `/check_vars`**, она покажет нам **ЧТО реально видит бот** 👌
-
-# КИДАЮ ТЕБЕ ИСПРАВЛЕННЫЙ КОД БРООООО 💯
-
-Замени весь код в GitHub:
-
-```python
 import asyncio
 import json
 import logging
@@ -40,10 +25,6 @@ from aiogram.types import (
 )
 
 
-# =========================
-# НАСТРОЙКИ
-# =========================
-
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
@@ -60,8 +41,10 @@ XUI_USERNAME = os.getenv("XUI_USERNAME", "")
 XUI_PASSWORD = os.getenv("XUI_PASSWORD", "")
 XUI_INBOUND_ID = int(os.getenv("XUI_INBOUND_ID") or "0")
 
-VPN_HOST_RAW = os.getenv("VPN_HOST", "")
-VPN_HOST = VPN_HOST_RAW.strip().strip('"').strip("'")
+VPN_HOST = os.getenv("VPN_HOST", "").strip()
+REALITY_PUBLIC_KEY = os.getenv("REALITY_PUBLIC_KEY", "").strip()
+REALITY_SNI = os.getenv("REALITY_SNI", "").strip()
+REALITY_SHORT_ID = os.getenv("REALITY_SHORT_ID", "").strip()
 
 TEST_HOURS = 24
 TEST_TRAFFIC_BYTES = 1024 ** 3
@@ -96,10 +79,6 @@ TARIFFS = {
     },
 }
 
-
-# =========================
-# 3X-UI API
-# =========================
 
 class XUIError(Exception):
     pass
@@ -158,7 +137,7 @@ async def xui_request(session, method, path, csrf_token=None, **kwargs):
             result = await response.json(content_type=None)
         except ValueError as exc:
             text = await response.text()
-            raise XUIError(f"Не JSON в ответе на {path}.\n{text[:200]}") from exc
+            raise XUIError(f"Не JSON в ответе на {path}.") from exc
 
     if not isinstance(result, dict):
         raise XUIError("Неожиданный ответ API.")
@@ -171,7 +150,7 @@ async def xui_request(session, method, path, csrf_token=None, **kwargs):
     return result.get("obj")
 
 
-def extract_csrf_token(html: str) -> str | None:
+def extract_csrf_token(html: str):
     m = re.search(r'<meta[^>]*name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)["\']', html)
     if m:
         return m.group(1)
@@ -207,9 +186,7 @@ async def xui_session():
 
         csrf_token = extract_csrf_token(html)
         if not csrf_token:
-            raise XUIError(
-                "Не удалось получить CSRF-токен с панели 3x-ui."
-            )
+            raise XUIError("Не удалось получить CSRF-токен")
 
         await xui_request(
             session, "POST", "/login",
@@ -220,53 +197,31 @@ async def xui_session():
 
 
 def get_reality_parameters(inbound):
-    public_key = os.getenv("REALITY_PUBLIC_KEY", "").strip()
-    sni = os.getenv("REALITY_SNI", "").strip()
-    short_id = os.getenv("REALITY_SHORT_ID", "").strip()
-
-    if not public_key:
-        raise XUIError(
-            "❌ НЕ ХВАТАЕТ REALITY_PUBLIC_KEY!"
-        )
-    if not sni:
-        raise XUIError(
-            "❌ НЕ ХВАТАЕТ REALITY_SNI!"
-        )
-    if not short_id:
-        raise XUIError(
-            "❌ НЕ ХВАТАЕТ REALITY_SHORT_ID!"
-        )
+    if not REALITY_PUBLIC_KEY:
+        raise XUIError("Не найден REALITY_PUBLIC_KEY в Railway Variables")
+    if not REALITY_SNI:
+        raise XUIError("Не найден REALITY_SNI в Railway Variables")
+    if not REALITY_SHORT_ID:
+        raise XUIError("Не найден REALITY_SHORT_ID в Railway Variables")
 
     return {
-        "public_key": public_key,
-        "sni": sni,
-        "short_id": short_id,
+        "public_key": REALITY_PUBLIC_KEY,
+        "sni": REALITY_SNI,
+        "short_id": REALITY_SHORT_ID,
         "spider_x": "/",
     }
 
 
 def build_vless_link(client, inbound, reality):
-    global VPN_HOST
-
-    vpn_host_check = os.getenv("VPN_HOST", "")
-    VPN_HOST_FINAL = vpn_host_check.strip().strip('"').strip("'")
-
-    if not VPN_HOST_FINAL:
-        raise XUIError(
-            f"❌ VPN_HOST ПУСТОЙ!\n\n"
-            f"RAW='{vpn_host_check}'\n\n"
-            f"Добавь VPN_HOST=138.124.110.74 в Railway Variables и перезапусти!"
-        )
+    if not VPN_HOST:
+        raise XUIError("Не найден VPN_HOST в Railway Variables")
 
     try:
         port = int(os.getenv("VPN_PORT") or inbound["port"])
-    except (ValueError, TypeError, KeyError) as exc:
-        raise XUIError("Не удалось определить порт VPN.") from exc
+    except (ValueError, TypeError, KeyError):
+        raise XUIError("Не удалось определить порт VPN.")
 
-    if not 1 <= port <= 65535:
-        raise XUIError("Некорректный порт VPN.")
-
-    host = VPN_HOST_FINAL
+    host = VPN_HOST
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
 
@@ -289,15 +244,13 @@ def build_vless_link(client, inbound, reality):
 
 async def create_or_get_test_client(telegram_id):
     if XUI_INBOUND_ID <= 0:
-        raise XUIError("Сначала отправь /inbounds, потом добавь XUI_INBOUND_ID в Railway")
+        raise XUIError("Сначала отправь /inbounds")
 
     async with xui_session() as session:
         inbound = await xui_request(
             session, "GET",
             f"/panel/api/inbounds/get/{XUI_INBOUND_ID}",
         )
-        if not isinstance(inbound, dict):
-            raise XUIError("Inbound не найден.")
 
         reality = get_reality_parameters(inbound)
         settings = as_dict(inbound.get("settings"))
@@ -328,9 +281,7 @@ async def create_or_get_test_client(telegram_id):
                 raise XUIError(f"Клиент {email} выключен.")
             exp = int(client.get("expiryTime") or 0)
             if 0 < exp <= now_ms:
-                raise XUIError(
-                    f"Срок истёк. Удали {email} в панели, повтори /test_vpn."
-                )
+                raise XUIError("Срок теста истёк. Удали клиента в панели.")
 
         link = build_vless_link(client, inbound, reality)
 
@@ -347,37 +298,15 @@ async def show_xui_error(message, error):
     if isinstance(error, XUIError):
         text = str(error)
     elif isinstance(error, asyncio.TimeoutError):
-        text = "Таймаут. Проверь доступность панели."
+        text = "Таймаут соединения с панелью"
     else:
-        text = f"❌ ОШИБКА: {type(error).__name__}\n\n{str(error)}"
+        text = f"Ошибка: {type(error).__name__}: {error}"
     await message.answer(text, parse_mode=None)
 
-
-# =========================
-# КОМАНДЫ
-# =========================
 
 @dp.message(Command("myid"), F.chat.type == "private")
 async def my_id(message: Message):
     await message.answer(f"Твой Telegram ID: {message.from_user.id}")
-
-
-@dp.message(Command("check_vars"), F.chat.type == "private", F.from_user.id == ADMIN_ID)
-async def check_vars(message: Message):
-    vpn_raw = os.getenv("VPN_HOST", "НЕ НАЙДЕН")
-    await message.answer(
-        f"🔍 <b>ПРОВЕРКА ПЕРЕМЕННЫХ</b>\n\n"
-        f"<b>VPN_HOST_RAW</b> = <code>{escape(str(vpn_raw))}</code>\n"
-        f"<b>VPN_HOST_STRIPPED</b> = <code>{escape(str(VPN_HOST))}</code>\n"
-        f"<b>LEN_RAW</b> = {len(str(vpn_raw))}\n"
-        f"<b>LEN_STRIPPED</b> = {len(str(VPN_HOST))}\n\n"
-        f"<b>XUI_INBOUND_ID</b> = {XUI_INBOUND_ID}\n"
-        f"<b>ADMIN_ID</b> = {ADMIN_ID}\n"
-        f"<b>REALITY_PUBLIC_KEY</b> = {'✅ ЕСТЬ' if os.getenv('REALITY_PUBLIC_KEY') else '❌ НЕТ'}\n"
-        f"<b>REALITY_SNI</b> = {os.getenv('REALITY_SNI')}\n"
-        f"<b>REALITY_SHORT_ID</b> = {os.getenv('REALITY_SHORT_ID')}",
-        parse_mode="HTML"
-    )
 
 
 @dp.message(Command("inbounds"), F.chat.type == "private", F.from_user.id == ADMIN_ID)
@@ -388,16 +317,16 @@ async def list_inbounds(message: Message):
         if not items:
             await message.answer("Нет inbound'ов.")
             return
-        await message.answer("✅ АВТОРИЗАЦИЯ ПРОШЛА!")
+        await message.answer("Авторизация прошла успешно!")
         for item in items:
             st = as_dict(item.get("streamSettings"))
             await message.answer(
-                f"🆔 ID: {item['id']}\n"
-                f"📝 Название: {item.get('remark','')}\n"
-                f"⚙️ Протокол: {item.get('protocol','?')}\n"
-                f"🚀 Транспорт: {st.get('network','?')}\n"
-                f"🔒 Защита: {st.get('security','?')}\n"
-                f"🔌 Порт: {item.get('port','?')}",
+                f"ID: {item['id']}\n"
+                f"Название: {item.get('remark','')}\n"
+                f"Протокол: {item.get('protocol','?')}\n"
+                f"Транспорт: {st.get('network','?')}\n"
+                f"Защита: {st.get('security','?')}\n"
+                f"Порт: {item.get('port','?')}",
                 parse_mode=None,
             )
     except Exception as error:
@@ -409,7 +338,7 @@ async def test_vpn(message: Message):
     try:
         async with test_lock:
             link, created = await create_or_get_test_client(message.from_user.id)
-        title = "✅ КЛИЕНТ СОЗДАН!\n⏰ 24 часа | 📊 1 ГиБ" if created else "🔐 Существующий тестовый ключ"
+        title = "КЛИЕНТ СОЗДАН! 24 часа | 1 ГиБ" if created else "Существующий тестовый ключ"
         await message.answer(
             f"{title}\n\n<code>{escape(link)}</code>",
             parse_mode="HTML", protect_content=True,
@@ -418,137 +347,85 @@ async def test_vpn(message: Message):
         await show_xui_error(message, error)
 
 
-# ... (ВСЁ МЕНЮ ОСТАЁТСЯ БЕЗ ИЗМЕНЕНИЙ, Я СКОПИРОВАЛ ДЛЯ КОМПАКТНОСТИ)
-# =========================
-# МЕНЮ (оставил как есть)
-# =========================
-
-def main_menu_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔐 Подключить VPN", callback_data="connect_vpn")],
-        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
-         InlineKeyboardButton(text="💰 Тарифы", callback_data="tariffs")],
-        [InlineKeyboardButton(text="📋 Инструкция", callback_data="activation")],
-        [InlineKeyboardButton(text="💬 Поддержка", callback_data="support")],
-    ])
-
-
-def tariffs_kb():
-    kb = [[InlineKeyboardButton(text=f"{d['name']} — {d['price']} ₽", callback_data=f"buy_{k}")]
-          for k, d in TARIFFS.items()]
-    kb.append([InlineKeyboardButton(text="◀️ Назад", callback_data="main_menu")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-
-def back_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="main_menu")]
-    ])
-
-
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Принимаю условия", callback_data="accept_license")]
+        [InlineKeyboardButton(text="Принимаю условия", callback_data="accept_license")]
     ])
     await message.answer(
-        "📄 <b>Лицензионное соглашение</b>\n\n"
+        "Лицензионное соглашение\n\n"
         "1. Только легальное использование.\n"
         "2. Запрещена передача ключей.\n"
-        "3. Админ не несёт ответственности.\n\n<i>Нажми ниже.</i>",
-        reply_markup=kb, parse_mode="HTML",
+        "3. Админ не несет ответственности.",
+        reply_markup=kb,
     )
 
 
 @dp.callback_query(F.data == "accept_license")
 async def accept_license(cb: CallbackQuery):
     await cb.answer()
-    await cb.message.edit_text("✅ Принято. Выбери действие:", reply_markup=main_menu_kb())
+    await cb.message.edit_text("Условия приняты.", reply_markup=main_menu_kb())
 
 
 @dp.callback_query(F.data == "main_menu")
-async def main_menu(cb: CallbackQuery):
+async def main_menu_cb(cb: CallbackQuery):
     await cb.answer()
-    await cb.message.edit_text("🏠 Главное меню:", reply_markup=main_menu_kb())
+    await cb.message.edit_text("Главное меню", reply_markup=main_menu_kb())
+
+
+def main_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Подключить VPN", callback_data="connect_vpn")],
+        [InlineKeyboardButton(text="Профиль", callback_data="profile"),
+         InlineKeyboardButton(text="Тарифы", callback_data="tariffs")],
+        [InlineKeyboardButton(text="Поддержка", callback_data="support")],
+    ])
+
+
+def tariffs_kb():
+    kb = []
+    for key, data in TARIFFS.items():
+        kb.append([InlineKeyboardButton(text=f"{data['name']} — {data['price']} ₽", callback_data=f"buy_{key}")])
+    kb.append([InlineKeyboardButton(text="Назад", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def back_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Назад", callback_data="main_menu")]
+    ])
 
 
 @dp.callback_query(F.data == "tariffs")
-async def tariffs(cb: CallbackQuery):
+async def tariffs_cb(cb: CallbackQuery):
     await cb.answer()
-    text = "<b>Тарифы:</b>\n\n"
-    for d in TARIFFS.values():
-        text += f"• {d['name']} — {d['price']}₽ | {d['traffic']} | {d['ips']} устр.\n"
-    await cb.message.edit_text(text, reply_markup=tariffs_kb(), parse_mode="HTML")
-
-
-@dp.callback_query(F.data.startswith("buy_"))
-async def buy(cb: CallbackQuery):
-    t = TARIFFS.get(cb.data.removeprefix("buy_"))
-    if not t:
-        await cb.answer("Не найден.", show_alert=True)
-        return
-    await cb.answer()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оплатить (демо)", callback_data="fake_pay")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="tariffs")],
-    ])
-    await cb.message.edit_text(
-        f"💳 <b>{t['name']}</b> — {t['price']}₽\n<i>Оплата не подключена.</i>",
-        reply_markup=kb, parse_mode="HTML",
-    )
-
-
-@dp.callback_query(F.data == "fake_pay")
-async def fake_pay(cb: CallbackQuery):
-    await cb.answer("Демо.", show_alert=True)
-    await cb.message.edit_text("🧪 Демо оплата.", reply_markup=back_kb())
+    await cb.message.edit_text("Тарифы", reply_markup=tariffs_kb())
 
 
 @dp.callback_query(F.data == "profile")
-async def profile(cb: CallbackQuery):
+async def profile_cb(cb: CallbackQuery):
     await cb.answer()
-    await cb.message.edit_text("👤 Профиль\n\nПодписки не подключены.", reply_markup=back_kb())
+    await cb.message.edit_text("Профиль", reply_markup=back_kb())
 
 
 @dp.callback_query(F.data == "connect_vpn")
-async def connect(cb: CallbackQuery):
+async def connect_cb(cb: CallbackQuery):
     await cb.answer()
-    await cb.message.edit_text("🔐 Выбери тариф:", reply_markup=tariffs_kb())
-
-
-@dp.callback_query(F.data == "activation")
-async def activation(cb: CallbackQuery):
-    await cb.answer()
-    await cb.message.edit_text(
-        "📋 <b>Активация</b>\n\n"
-        "1. Установи клиент с поддержкой VLESS + Reality\n"
-        "2. Скопируй ссылку vless://...\n"
-        "3. Импортируй в приложение\n"
-        "4. Подключись",
-        reply_markup=back_kb(), parse_mode="HTML",
-    )
+    await cb.message.edit_text("Выбери тариф", reply_markup=tariffs_kb())
 
 
 @dp.callback_query(F.data == "support")
-async def support(cb: CallbackQuery):
+async def support_cb(cb: CallbackQuery):
     await cb.answer()
-    await cb.message.edit_text(
-        "💬 Поддержка:\n👉 <a href='https://t.me/Suppr_XYZ'>@Suppr_XYZ</a>",
-        reply_markup=back_kb(), parse_mode="HTML",
-    )
+    await cb.message.edit_text("Поддержка: @Suppr_XYZ", reply_markup=back_kb())
 
-
-# =========================
-# ЗАПУСК
-# =========================
 
 async def main():
     if ADMIN_ID == 0:
-        logger.warning("ADMIN_ID=0. Отправь /myid.")
+        logger.warning("ADMIN_ID не настроен")
     logger.info("Бот запущен")
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-```
