@@ -268,6 +268,14 @@ CRYPTOBOT_TESTNET = "testnet" in CRYPTOBOT_API_URL.lower()
 # Валюта счёта: USDT (по умолчанию), TON, BTC, USDC, BUSD.
 CRYPTOBOT_ASSET = (os.getenv("CRYPTOBOT_ASSET") or "USDT").strip().upper()
 
+# Проверка выдачи ключа БЕЗ реальной оплаты (только для админа): /test_pay.
+# Бот прогоняет тот же путь, что и после настоящей оплаты — создаёт заказ, клиента
+# в 3x-ui и отправляет сообщение с ключом, — но денег не списывает. Такой заказ
+# помечается тестовым и не попадает в выручку. В тестовой сети Crypto Pay
+# проверка включается автоматически, в боевом режиме — переменной
+# PAYMENTS_ALLOW_TEST_PAY=1 (после проверки её лучше убрать).
+PAYMENTS_ALLOW_TEST_PAY = (os.getenv("PAYMENTS_ALLOW_TEST_PAY") or "").strip().lower() in ("1", "true", "yes", "on")
+
 # Сколько рублей в одной единице валюты (курс фиксируется вручную).
 # Если не задан — бот берёт курс у Crypto Pay (getExchangeRates).
 CRYPTOBOT_RUB_RATE = float((os.getenv("CRYPTOBOT_RUB_RATE") or "0").replace(",", "."))
@@ -344,6 +352,14 @@ if PAYMENTS_MODE == "yookassa" and not (YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY
     logger.warning(
         "PAYMENTS_MODE=yookassa, но не заданы YOOKASSA_SHOP_ID / YOOKASSA_SECRET_KEY — платежи не создадутся."
     )
+if CRYPTOBOT_TESTNET:
+    PAYMENTS_ALLOW_TEST_PAY = True
+
+if PAYMENTS_ALLOW_TEST_PAY:
+    logger.info(
+        "Проверка выдачи ключа без оплаты включена: команда /test_pay (только для администратора)."
+    )
+
 if PAYMENTS_MODE == "crypto" and not CRYPTOBOT_TOKEN:
     logger.warning(
         "PAYMENTS_MODE=crypto, но CRYPTOBOT_TOKEN не задан — счета не будут создаваться. "
@@ -1662,7 +1678,8 @@ class PaymentStore:
     def stats(self) -> dict:
         """Сводка: сколько оплат, выручка в рублях и звёздах, разбивка по тарифам."""
         self.load()
-        paid = [o for o in self.orders.values() if o.get("status") == "paid"]
+        # Тестовые заказы (/test_pay) не считаем оплатами: денег по ним не приходило.
+        paid = [o for o in self.orders.values() if o.get("status") == "paid" and not o.get("simulated")]
         by_tariff: dict[str, int] = {}
         for order in paid:
             by_tariff[order.get("tariff", "?")] = by_tariff.get(order.get("tariff", "?"), 0) + 1
@@ -1701,6 +1718,16 @@ payment_store = PaymentStore(PAYMENT_STORE_FILE)
 def payments_enabled() -> bool:
     """Включён ли приём оплаты (режим off выключает кнопки покупки)."""
     return PAYMENTS_MODE != "off"
+
+
+def is_admin(user_id: int) -> bool:
+    """Админ ли пользователь. Если ADMIN_ID не задан — админ-команд нет вообще."""
+    return ADMIN_ID > 0 and user_id == ADMIN_ID
+
+
+def test_pay_enabled() -> bool:
+    """Разрешена ли проверка выдачи ключа без оплаты (см. PAYMENTS_ALLOW_TEST_PAY)."""
+    return PAYMENTS_ALLOW_TEST_PAY and ADMIN_ID > 0
 
 
 def payments_mode_title() -> str:
@@ -2118,6 +2145,10 @@ class CryptoPayClient:
         items = result.get("items") or []
         return as_dict(items[0]) if items else None
 
+    async def delete_invoice(self, invoice_id) -> bool:
+        """Удаляет счёт (например, созданный для проверки связки — платить не нужно)."""
+        return bool(await self._call("deleteInvoice", invoice_id=invoice_id))
+
     async def get_paid_invoices(self, count: int = 100) -> list:
         result = as_dict(await self._call("getInvoices", status="paid", count=count))
         items = result.get("items")
@@ -2410,6 +2441,8 @@ def order_paid_message(order: dict, info: dict) -> str:
     )
     if info.get("already"):
         title = "✅ <b>Этот платёж уже учтён — подписка активна.</b>"
+    if order.get("simulated"):
+        title = "🧪 <b>Проверка выдачи: подписка создана без оплаты.</b>"
 
     return (
         f"{title}\n\n"
@@ -2454,10 +2487,14 @@ async def notify_payment_success(order: dict, info: dict) -> bool:
             amount = (
                 f"{order['amount_stars']} ⭐️" if order["currency"] == "XTR" else f"{order['amount_rub']} ₽"
             )
+            header = (
+                "🧪 <b>Тестовая выдача (оплата не производилась)</b>\n"
+                if order.get("simulated") else f"💰 <b>Новая оплата:</b> {amount}\n"
+            )
             await bot.send_message(
                 ADMIN_ID,
-                f"💰 <b>Новая оплата:</b> {amount}\n"
-                f"• Тариф: {order['tariff_name']}\n"
+                header
+                + f"• Тариф: {order['tariff_name']}\n"
                 f"• Пользователь: <code>{order['tg_id']}</code>\n"
                 f"• Заказ: <code>{order['id']}</code>\n"
                 f"• Действует до: <code>{format_date(info['expiry_ms'])}</code>",
@@ -2572,6 +2609,164 @@ async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str 
                 order["id"],
             )
     return {"order": order, "info": info}
+
+
+def new_test_order(tg_id: int, tariff_key: str) -> dict:
+    """
+    Заказ для проверки выдачи ключа без оплаты.
+
+    Всё как у обычного заказа (тариф, срок, лимиты), но помечен тестовым: в выручку
+    не попадает, вебхуки и опрос его не трогают (они ищут только mode=crypto).
+    """
+    order = new_order(tg_id, tariff_key)
+    order["mode"] = "test"
+    order["currency"] = "TEST"
+    order["simulated"] = True
+    return order
+
+
+async def simulate_successful_payment(chat_id: int, tg_id: int, tariff_key: str) -> dict:
+    """
+    Прогоняет путь выдачи ключа, как после реальной оплаты, — но без денег.
+
+    Создаёт заказ и вызывает тот же fulfill_order, что и вебхук/вебхук-обработчики
+    оплаты: клиент появляется в 3x-ui, пользователю уходит настоящее сообщение
+    с ключом. Отличие только в пометке «тест» и кнопке удаления.
+    """
+    # Проверочная выдача не должна перезаписывать метку настоящей подписки:
+    # у такого клиента в комментарии стоит реальный платёж, и «тестовое» удаление
+    # потом снесло бы весь ключ. Поэтому сначала убеждаемся, что подписки нет.
+    existing = await get_paid_subscription(tg_id)
+    if existing:
+        raise PaymentError(
+            f"🧪 <b>У этого аккаунта уже есть платная подписка</b> (<code>tg-paid-{tg_id}</code>).\n\n"
+            "Проверять выдачу на нём нельзя: тест продлил бы настоящий ключ, а кнопка удаления "
+            "убрала бы его целиком.\n\n"
+            "<b>Варианты:</b>\n"
+            f"1. Сначала удали подписку: <code>/revoke {tg_id}</code> — и повтори /test_pay.\n"
+            "2. Проверь выдачу на другом аккаунте: там эта команда создаст ключ тем же путём."
+        )
+
+    order = await payment_store.create(new_test_order(tg_id, tariff_key))
+    charge_id = f"test-{order['id']}"
+    logger.info(
+        "Проверка выдачи без оплаты: заказ %s, тариф %s, пользователь %s", order["id"], tariff_key, tg_id
+    )
+    result = await fulfill_order(order, charge_id=charge_id)
+    info = result.get("info") or {}
+    if not result.get("info"):
+        # fulfil_order вернул already_provisioned/duplicate — ключ уже был выдан ранее
+        logger.warning("Проверка выдачи: заказ %s не потребовал новой выдачи (%s)", order["id"], result.keys())
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Удалить тестовую подписку", callback_data=f"testpay_del_{order['id']}")],
+            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
+        ]
+    )
+    expiry = format_date(int(info.get("expiry_ms") or 0)) if info.get("expiry_ms") else "—"
+    await bot.send_message(
+        chat_id,
+        "🧪 <b>Проверка выдачи ключа (оплата не производилась).</b>\n\n"
+        f"• Заказ: <code>{order['id']}</code>\n"
+        f"• Тариф: {TARIFFS[tariff_key]['name']}\n"
+        f"• Клиент в панели: <code>tg-paid-{tg_id}</code>\n"
+        f"• Действует до: <b>{expiry}</b>\n\n"
+        "Бот прошёл ровно тот же путь, что и после настоящей оплаты: создал клиента в 3x-ui "
+        "и отправил ключ. Денег при этом не потрачено, в выручку заказ не попал.\n"
+        "Если у аккаунта <b>уже была</b> платная подписка — тест её продлил: кнопка ниже удалит ключ целиком.",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    return result
+
+
+async def crypto_self_check() -> str:
+    """
+    Проверяет связку с Crypto Pay без денег: токен, сеть, курс и создание счёта.
+
+    Счёт создаётся на минимальную цену и сразу удаляется через deleteInvoice —
+    платить по нему не нужно. Возвращает готовый HTML-текст для сообщения.
+    """
+    lines = [f"🔍 <b>Проверка Crypto Pay — {cryptobot_network_note()}</b>", ""]
+    if not CRYPTOBOT_TOKEN:
+        return (
+            "❌ <b>CRYPTOBOT_TOKEN не задан.</b>\n\n"
+            "Возьми API Token: @CryptoBot → /pay → My Apps → Create App "
+            "(для тестов — @CryptoTestnetBot), затем добавь его в Railway → Variables."
+        )
+
+    client = CryptoPayClient()
+    try:
+        me = await client.get_me()
+    except PaymentError as exc:
+        return "❌ " + str(exc)
+
+    lines.append(
+        f"• Приложение: <b>{escape(str(me.get('name') or '—'))}</b> "
+        f"(app_id <code>{me.get('app_id') or '—'}</code>)"
+    )
+    bot_username = str(me.get("payment_processing_bot_username") or "")
+    if bot_username:
+        lines.append(f"• Обрабатывающий бот: @{escape(bot_username)}")
+
+    try:
+        rate = await cryptobot_rate(client=client)
+    except PaymentError as exc:
+        lines.append(f"• Курс: ❌ {exc}")
+        return "\n".join(lines)
+    rate_note = "задан вручную" if CRYPTOBOT_RUB_RATE > 0 else "из Crypto Pay"
+    lines.append(f"• Курс: 1 {CRYPTOBOT_ASSET} = <b>{rate:.4g} ₽</b> ({rate_note})")
+
+    price = crypto_check_price()
+    try:
+        check_amount = crypto_amount_for_rub(price, rate, CRYPTOBOT_ASSET)
+    except PaymentError as exc:
+        lines.append(f"• Сумма счёта: ❌ {exc}")
+        return "\n".join(lines)
+
+    probe = {
+        "id": f"selfcheck-{int(time.time())}",
+        "asset": CRYPTOBOT_ASSET,
+        "amount_asset": check_amount,
+        "tariff_name": "Проверка Crypto Pay",
+        "days": 1,
+    }
+    try:
+        invoice = await client.create_invoice(probe)
+    except PaymentError as exc:
+        lines.append(f"• Создание счёта: ❌ {exc}")
+        return "\n".join(lines)
+
+    invoice_id = invoice.get("invoice_id")
+    lines.append(
+        f"• Создание счёта: ✅ <code>{invoice_id}</code> на <b>{check_amount} {CRYPTOBOT_ASSET}</b> "
+        f"(≈ {price} ₽)"
+    )
+    try:
+        deleted = await client.delete_invoice(invoice_id)
+    except PaymentError as exc:
+        lines.append(
+            f"• Удаление счёта: ⚠️ не удалось ({escape(_snip(str(exc), 120))}) — "
+            "удали счёт вручную: @CryptoBot → /pay → My Apps → Invoices."
+        )
+        return "\n".join(lines)
+
+    lines.append("• Удаление счёта: ✅ счёт удалён, платить по нему не нужно")
+    lines += [
+        "",
+        "Связка работает: токен принят, валюта поддерживается, курс считается, счёт создаётся. "
+        "Денег для этой проверки не нужно.",
+        "",
+        "Следующий шаг — проверить саму выдачу ключа: /test_pay (только для администратора).",
+    ]
+    return "\n".join(lines)
+
+
+def crypto_check_price() -> int:
+    """Цена для проверочного счёта: самый дешёвый платный тариф."""
+    prices = [t["price"] for t in TARIFFS.values() if t["price"] > 0]
+    return min(prices) if prices else 100
 
 
 async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
@@ -2990,7 +3185,7 @@ async def run_webhook_server() -> web.AppRunner | None:
 
 async def send_error_message(message: Message, error: Exception):
     """Понятное человеческое описание ошибок."""
-    if isinstance(error, XUIError):
+    if isinstance(error, (XUIError, PaymentError)):
         await message.answer(str(error), parse_mode="HTML")
     elif isinstance(error, asyncio.TimeoutError):
         await message.answer(
@@ -3616,6 +3811,11 @@ async def cmd_panel_debug(message: Message):
             lines.append(f"   Вебхук: <code>{escape(webhook_url or 'PUBLIC_BASE_URL не задан')}</code>")
             lines.append("   Настройка: @CryptoBot → /pay → My Apps → Webhooks (необязательно)")
             lines.append(f"   Опрос API: каждые {max(15, CRYPTOBOT_POLL_INTERVAL)} сек (работает и без вебхука)")
+            lines.append(
+                "   Проверка без оплаты: /test_pay "
+                + ("✅ включена" if test_pay_enabled() else "выключена (PAYMENTS_ALLOW_TEST_PAY=1)")
+                + ", связка с Crypto Pay: /crypto_check"
+            )
             try:
                 me = await CryptoPayClient().get_me()
                 lines.append(
@@ -3927,6 +4127,11 @@ async def cmd_payments(message: Message):
 
     if PAYMENTS_MODE == "stars":
         lines.append(f"• Курс пересчёта: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (меняется через STARS_RUB_RATE)")
+    lines.append(
+        "• Проверка без оплаты: /test_pay "
+        + ("✅ (ключ выдаётся тем же путём, что после оплаты)" if test_pay_enabled()
+           else "— включи PAYMENTS_ALLOW_TEST_PAY=1, если нужно проверить выдачу бесплатно")
+    )
 
     lines += [
         "",
@@ -3957,7 +4162,226 @@ async def cmd_payments(message: Message):
             "(проще всего), provider либо yookassa — инструкция в README."
         )
 
-    await message.answer("\n".join(lines)[:4000], parse_mode="HTML")
+    keyboard = []
+    if test_pay_enabled():
+        keyboard.append([InlineKeyboardButton(text="🧪 Проверить выдачу ключа без оплаты", callback_data="testpay_menu")])
+    if PAYMENTS_MODE == "crypto":
+        keyboard.append([InlineKeyboardButton(text="🔍 Проверить Crypto Pay (счёт без денег)", callback_data="crypto_check")])
+    else:
+        lines.append(
+            "\n💡 Проверить выдачу ключа, не платя: включи <b>PAYMENTS_ALLOW_TEST_PAY=1</b> "
+            "и отправь /test_pay — бот выдаст ключ тем же путём, что после оплаты."
+        )
+
+    await message.answer(
+        "\n".join(lines)[:4000],
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard) if keyboard else None,
+    )
+
+
+# =========================
+# ПРОВЕРКА ВЫДАЧИ КЛЮЧА БЕЗ ОПЛАТЫ (только для админа)
+# =========================
+
+def test_pay_kb() -> InlineKeyboardMarkup:
+    """Кнопки выбора тарифа для проверочной выдачи."""
+    buttons = [
+        [InlineKeyboardButton(text=f"{data['name']} — {data['days']} дн.", callback_data=f"testpay_run_{key}")]
+        for key, data in TARIFFS.items() if data["price"] > 0
+    ]
+    buttons.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def test_pay_intro() -> str:
+    return (
+        "🧪 <b>Проверка выдачи ключа без оплаты</b>\n\n"
+        "Выбери тариф — бот прогонит ровно тот путь, что и после настоящей оплаты: "
+        "создаст клиента в 3x-ui и пришлёт сообщение с ключом. Деньги не списываются, "
+        "в выручку заказ не попадёт, счёт в платёжной системе не создаётся.\n\n"
+        "<i>Инструкция: команда /test_pay &lt;тариф&gt;, тарифы — "
+        + ", ".join(f"<code>{key}</code>" for key, data in TARIFFS.items() if data["price"] > 0)
+        + ".</i>"
+    )
+
+
+@dp.message(Command("test_pay"))
+async def cmd_test_pay(message: Message):
+    """Проверяет выдачу ключа без реальной оплаты (только админ)."""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔️ Команда доступна только администратору.")
+        return
+    if not test_pay_enabled():
+        await message.answer(
+            "🧪 Проверка без оплаты выключена.\n\n"
+            "Включи переменную <b>PAYMENTS_ALLOW_TEST_PAY=1</b> в Railway → Variables "
+            "(в тестовой сети Crypto Pay она включается сама). После проверки переменную "
+            "можно убрать.",
+            parse_mode="HTML",
+        )
+        return
+
+    args = (message.text or "").split()
+    if len(args) < 2:
+        await message.answer(test_pay_intro(), reply_markup=test_pay_kb(), parse_mode="HTML")
+        return
+
+    tariff_key = args[1].strip().lower()
+    if tariff_key not in TARIFFS or TARIFFS[tariff_key]["price"] <= 0:
+        await message.answer(
+            f"❓ Неизвестный тариф: <code>{escape(tariff_key)}</code>\n"
+            "Доступные: " + ", ".join(f"<code>{key}</code>" for key in TARIFFS if TARIFFS[key]["price"] > 0),
+            parse_mode="HTML",
+        )
+        return
+
+    wait_msg = await message.answer("🧪 Выдаю тестовый ключ (оплата не требуется)...")
+    try:
+        await simulate_successful_payment(message.chat.id, message.from_user.id, tariff_key)
+    except Exception as exc:
+        logger.error("Проверка выдачи без оплаты не удалась: %s", exc)
+        await send_error_message(message, exc)
+    finally:
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data == "testpay_menu")
+async def cb_testpay_menu(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Только для администратора.", show_alert=True)
+        return
+    if not test_pay_enabled():
+        await cb.answer("Проверка без оплаты выключена (PAYMENTS_ALLOW_TEST_PAY=1).", show_alert=True)
+        return
+    await cb.answer()
+    await cb.message.answer(test_pay_intro(), reply_markup=test_pay_kb(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("testpay_run_"))
+async def cb_testpay_run(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Только для администратора.", show_alert=True)
+        return
+    if not test_pay_enabled():
+        await cb.answer("Проверка без оплаты выключена (PAYMENTS_ALLOW_TEST_PAY=1).", show_alert=True)
+        return
+    tariff_key = cb.data.removeprefix("testpay_run_")
+    if tariff_key not in TARIFFS or TARIFFS[tariff_key]["price"] <= 0:
+        await cb.answer("Такого тарифа нет.", show_alert=True)
+        return
+    await cb.answer("Выдаю тестовый ключ...")
+    try:
+        await simulate_successful_payment(cb.message.chat.id, cb.from_user.id, tariff_key)
+    except Exception as exc:
+        logger.error("Проверка выдачи без оплаты не удалась: %s", exc)
+        await cb.message.answer(f"❌ Не получилось: <code>{escape(_snip(str(exc), 300))}</code>", parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("testpay_del_"))
+async def cb_testpay_del(cb: CallbackQuery):
+    """Удаляет подписку, созданную проверочной выдачей."""
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Только для администратора.", show_alert=True)
+        return
+    order_id = cb.data.removeprefix("testpay_del_")
+    order = await payment_store.get(order_id)
+    if not order or not order.get("simulated"):
+        await cb.answer("Тестовый заказ не найден.", show_alert=True)
+        return
+
+    await cb.answer("Удаляю тестовую подписку...")
+    email = f"tg-paid-{order['tg_id']}"
+    reference = f"test-{order_id}"
+
+    try:
+        async with XUIClient() as client:
+            inbounds = await client.get_inbounds()
+            removed = False
+            foreign = False
+            for inbound in inbounds:
+                settings = as_dict(inbound.get("settings"))
+                for candidate in settings.get("clients") or []:
+                    if not isinstance(candidate, dict) or str(candidate.get("email")) != email:
+                        continue
+                    if comment_has_payment_ref(candidate.get("comment"), reference):
+                        await client.delete_client(inbound.get("id"), email, candidate.get("id"))
+                        removed = True
+                    else:
+                        # По этому клиенту выдана не тестовая подписка — чужое не удаляем.
+                        foreign = True
+                    break
+                if removed or foreign:
+                    break
+    except Exception as exc:
+        logger.error("Не удалось удалить тестовую подписку %s: %s", order_id, exc)
+        await cb.message.answer(f"❌ Не получилось удалить: <code>{escape(_snip(str(exc), 300))}</code>", parse_mode="HTML")
+        return
+
+    await payment_store.update(order_id, status="canceled")
+    if removed:
+        await cb.message.answer(
+            f"🗑 Тестовая подписка <code>{email}</code> удалена из панели. "
+            "Выдача ключа проверена — теперь можно принимать настоящие оплаты.",
+            parse_mode="HTML",
+        )
+    elif foreign:
+        await cb.message.answer(
+            f"ℹ️ У клиента <code>{email}</code> подписка выдана не тестовым заказом — удалять не стал. "
+            "Если нужно снять ключ, используй /revoke.",
+            parse_mode="HTML",
+        )
+    else:
+        await cb.message.answer(
+            f"ℹ️ Подписки <code>{email}</code> в панели уже нет — заказ помечен отменённым.",
+            parse_mode="HTML",
+        )
+
+
+@dp.message(Command("crypto_check"))
+async def cmd_crypto_check(message: Message):
+    """Проверяет связку с Crypto Pay без денег: счёт создаётся и сразу удаляется."""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔️ Команда доступна только администратору.")
+        return
+    if PAYMENTS_MODE != "crypto":
+        await message.answer(
+            "ℹ️ Команда нужна только для режима крипты. Сейчас режим оплаты: "
+            f"<b>{escape(payments_mode_title())}</b>.",
+            parse_mode="HTML",
+        )
+        return
+
+    wait_msg = await message.answer("🔍 Проверяю связку с Crypto Pay (без оплаты)...")
+    try:
+        text = await crypto_self_check()
+    except Exception as exc:
+        logger.error("Проверка Crypto Pay не удалась: %s", exc)
+        await send_error_message(message, exc)
+        return
+    finally:
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "crypto_check")
+async def cb_crypto_check(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Только для администратора.", show_alert=True)
+        return
+    await cb.answer("Проверяю связку с Crypto Pay...")
+    try:
+        text = await crypto_self_check()
+    except Exception as exc:
+        logger.error("Проверка Crypto Pay не удалась: %s", exc)
+        text = f"❌ Не получилось: <code>{escape(_snip(str(exc), 300))}</code>"
+    await cb.message.answer(text, parse_mode="HTML")
 
 
 @dp.message(Command("revoke"))
@@ -4116,6 +4540,8 @@ async def on_startup():
             BotCommand(command="groups", description="🏷 Группы клиентов в 3x-ui"),
             BotCommand(command="profile", description="👤 Моя подписка и ключ"),
             BotCommand(command="payments", description="💳 Оплаты (для администратора)"),
+            BotCommand(command="test_pay", description="🧪 Проверить выдачу ключа без оплаты"),
+            BotCommand(command="crypto_check", description="🔍 Проверить Crypto Pay без денег"),
             BotCommand(command="myid", description="👤 Узнать свой Telegram ID"),
         ]
         await bot.set_my_commands(commands)

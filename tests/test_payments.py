@@ -203,7 +203,8 @@ def yk_succeed(payment_id, amount=None, metadata=None):
 
 # ---------------- фейковый Crypto Pay API (@CryptoBot) ----------------
 
-CRYPTO = {"invoices": {}, "calls": [], "token": CRYPTO_TOKEN, "rates": {"USDT": "95.5"}, "token_broken": False}
+CRYPTO = {"invoices": {}, "calls": [], "token": CRYPTO_TOKEN, "rates": {"USDT": "95.5"},
+          "token_broken": False, "deleted": []}
 
 
 def make_crypto_app():
@@ -250,6 +251,14 @@ def make_crypto_app():
             }
             CRYPTO["invoices"][str(invoice_id)] = invoice
             return web.json_response({"ok": True, "result": invoice})
+
+        if method == "deleteInvoice":
+            invoice_id = str(params.get("invoice_id"))
+            removed = CRYPTO["invoices"].pop(invoice_id, None)
+            if removed is None:
+                return web.json_response({"ok": False, "error": {"code": 400, "name": "INVOICE_NOT_FOUND"}}, status=400)
+            CRYPTO["deleted"].append(invoice_id)
+            return web.json_response({"ok": True, "result": True})
 
         if method == "getInvoices":
             ids = str(params.get("invoice_ids") or "")
@@ -329,6 +338,7 @@ def new_bot(env, store_file, admins=None):
         "CRYPTOBOT_INVOICE_TTL": env.get("crypto_ttl", "3600"),
         "CRYPTOBOT_POLL_INTERVAL": env.get("crypto_poll", "60"),
         "PUBLIC_BASE_URL": f"http://127.0.0.1:{WEBHOOK_PORT}",
+        "PAYMENTS_ALLOW_TEST_PAY": env.get("allow_test_pay"),
         "PAYMENT_STORE_FILE": store_file,
         "PORT": str(WEBHOOK_PORT),
         "STARS_RUB_RATE": "1.6",
@@ -402,6 +412,7 @@ def reset_all():
     CRYPTO["calls"].clear()
     CRYPTO["rates"] = {"USDT": "95.5"}
     CRYPTO["token_broken"] = False
+    CRYPTO["deleted"].clear()
 
 
 def crypto_calls(method):
@@ -1294,6 +1305,191 @@ async def test_diagnostics(store_file):
           bool((await bot5.payment_store.get(order_id)).get("notified")))
 
 
+async def test_simulated_payment(store_file):
+    print("\n▶ 13. Проверка выдачи ключа БЕЗ оплаты (/test_pay)")
+    reset_all()
+    email = f"tg-paid-{TG_TG_ID}"
+
+    # По умолчанию (боевой режим) проверка выключена
+    bot = new_bot({"mode": "crypto", "allow_test_pay": None}, store_file)
+    check("в боевом режиме проверка без оплаты по умолчанию выключена", bot.test_pay_enabled() is False)
+    msg = make_message(bot, text="/test_pay basic")
+    await bot.cmd_test_pay(msg)
+    check("выключенная проверка подсказывает переменную",
+          "PAYMENTS_ALLOW_TEST_PAY=1" in _last_api_text() and panel_client(email) is None)
+
+    # В тестовой сети Crypto Pay включается автоматически
+    reset_all()
+    bot = new_bot({"mode": "crypto", "crypto_testnet": "1",
+                   "crypto_api_url": f"http://127.0.0.1:{CRYPTO_PORT}/testnet/api"}, store_file)
+    check("в тестовой сети Crypto Pay проверка включается сама", bot.test_pay_enabled() is True)
+
+    # Включённая проверка: полный путь выдачи без денег
+    reset_all()
+    bot = new_bot({"mode": "crypto", "allow_test_pay": "1"}, store_file)
+    check("проверка включена переменной PAYMENTS_ALLOW_TEST_PAY", bot.test_pay_enabled() is True)
+
+    msg = make_message(bot, text="/test_pay")
+    await bot.cmd_test_pay(msg)
+    markup = json.dumps(tg_calls("sendMessage")[-1]["params"].get("reply_markup", {}), ensure_ascii=False)
+    check("без аргумента показаны тарифы кнопками", "testpay_run_basic" in markup and "testpay_run_premium" in markup)
+
+    msg = make_message(bot, text="/test_pay basic")
+    await bot.cmd_test_pay(msg)
+    client = panel_client(email)
+    check("ключ выдан без оплаты (клиент создан в панели)", client is not None)
+    check("срок взят из тарифа: 30 дней", client and 29 <= days_left(client) <= 30,
+          f"{days_left(client) if client else '—'} дн.")
+    check("лимиты взяты из тарифа (2 устройства, безлимитный трафик)",
+          client and client.get("limitIp") == 2 and client.get("totalGB") == 0)
+    check("в панели сохранился id тарифа и дата", client and client["comment"].startswith("basic до "))
+
+    texts = [m["params"].get("text", "") for m in tg_calls("sendMessage")]
+    key_text = [t for t in texts if "🧪" in t and "vless://" in t]
+    check("пользователю отправлено сообщение с ключом и пометкой «без оплаты»", bool(key_text))
+    check("в тестовом сообщении нет слова «Оплата получена»",
+          not any("Оплата получена" in t for t in key_text))
+    check("есть кнопка удаления тестовой подписки",
+          "testpay_del_" in json.dumps(tg_calls("sendMessage")[-1]["params"].get("reply_markup", {}),
+                                       ensure_ascii=False))
+
+    orders = [o for o in bot.payment_store.orders.values() if o.get("simulated")]
+    check("заказ помечен тестовым", len(orders) == 1 and orders[0]["mode"] == "test")
+    stats = bot.payment_store.stats()
+    check("тестовая выдача НЕ попала в выручку",
+          stats["paid_count"] == 0 and stats["rub"] == 0 and stats["stars"] == 0 and stats["crypto"] == {},
+          f"paid_count={stats['paid_count']}")
+
+    check("счёт в Crypto Pay не создавался (денег не нужно)",
+          not crypto_calls("createInvoice") and not crypto_calls("getInvoices"))
+
+    issued = await bot.crypto_poll_once()
+    check("опрос оплат не трогает тестовый заказ", issued == 0)
+
+    # Кнопка выбора тарифа: пока тестовый ключ на месте — проверка отказывается его портить
+    cb = _FakeCallback(bot, "testpay_run_standard")
+    await bot.cb_testpay_run(cb)
+    check("повторная проверка при живом ключе отклоняется с понятным текстом",
+          any("уже есть платная подписка" in t for t in cb.message.sent))
+    check("срок ключа при отказе не изменился", 29 <= days_left(panel_client(email)) <= 30,
+          f"{days_left(panel_client(email))} дн.")
+
+    # Удаление тестовой подписки
+    order_id = [o["id"] for o in bot.payment_store.orders.values() if o.get("simulated")][-1]
+    cb = _FakeCallback(bot, f"testpay_del_{order_id}")
+    await bot.cb_testpay_del(cb)
+    check("кнопка удаления убрала тестового клиента из панели", panel_client(email) is None)
+    check("заказ помечен отменённым", (await bot.payment_store.get(order_id))["status"] == "canceled")
+    check("в ответе сказано, что подписка удалена",
+          "удалена из панели" in json.dumps(cb.message.sent, ensure_ascii=False))
+
+    # После удаления кнопкой можно проверить другой тариф — срок уже 90 дней
+    cb = _FakeCallback(bot, "testpay_run_standard")
+    await bot.cb_testpay_run(cb)
+    check("после удаления проверка другого тарифа выдаёт ключ на 90 дней",
+          89 <= days_left(panel_client(email)) <= 90, f"{days_left(panel_client(email))} дн.")
+
+    # Защита: обычный пользователь не может ни выдать, ни удалить
+    reset_all()
+    bot = new_bot({"mode": "crypto", "allow_test_pay": "1"}, store_file)
+    other = make_message(bot, uid=777, text="/test_pay basic")
+    await bot.cmd_test_pay(other)
+    check("обычному пользователю /test_pay недоступна",
+          "только администратору" in _last_api_text() and panel_client(f"tg-paid-777") is None)
+
+    cb = _FakeCallback(bot, "testpay_run_basic", uid=777)
+    await bot.cb_testpay_run(cb)
+    check("обычному пользователю кнопка выдачи недоступна",
+          cb.answers and "Только для администратора" in cb.answers[0])
+
+    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+    order_real = crypto_calls("createInvoice")[-1][2]["payload"]
+    cb = _FakeCallback(bot, f"testpay_del_{order_real}")
+    await bot.cb_testpay_del(cb)
+    check("кнопка удаления не трогает настоящие (не тестовые) заказы",
+          any("не найден" in t for t in cb.answers))
+
+    # Настоящую подписку проверочная выдача не трогает
+    reset_all()
+    bot = new_bot({"mode": "crypto", "allow_test_pay": "1"}, store_file)
+    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+    real_order = crypto_calls("createInvoice")[-1][2]["payload"]
+    real_invoice = (await bot.payment_store.get(real_order))["invoice_id"]
+    crypto_pay(real_invoice)
+    await bot.crypto_poll_once()
+    check("для проверки защиты настоящая оплата прошла", panel_client(email) is not None)
+    real_expiry = int(panel_client(email)["expiryTime"])
+
+    simulated_before = len([o for o in bot.payment_store.orders.values() if o.get("simulated")])
+    msg = make_message(bot, text="/test_pay standard")
+    await bot.cmd_test_pay(msg)
+    check("при живой подписке проверка отказывается её портить",
+          "уже есть платная подписка" in _last_api_text(), "")
+    check("подписка не продлена тестом", int(panel_client(email)["expiryTime"]) == real_expiry)
+    check("в ответе подсказана команда /revoke", "/revoke" in _last_api_text())
+    check("тестовый заказ при отказе не создан",
+          len([o for o in bot.payment_store.orders.values() if o.get("simulated")]) == simulated_before)
+
+    # После снятия подписки проверка снова доступна
+    rvk = make_message(bot, text=f"/revoke {TG_TG_ID}")
+    await bot.cmd_revoke(rvk)
+    msg = make_message(bot, text="/test_pay premium")
+    await bot.cmd_test_pay(msg)
+    check("после /revoke проверочная выдача снова работает", panel_client(email) is not None)
+
+
+async def test_crypto_self_check(store_file):
+    print("\n▶ 14. Проверка связки с Crypto Pay без денег (/crypto_check)")
+    reset_all()
+    bot = new_bot({"mode": "crypto"}, store_file)
+
+    text = await bot.crypto_self_check()
+    check("в отчёте есть название приложения", "VPN Shop" in text)
+    check("в отчёте есть обрабатывающий бот", "CryptoBot" in text)
+    check("в отчёте есть курс", "95.5" in text, "курс из фейкового API")
+    check("счёт создан и сразу удалён", len(crypto_calls("createInvoice")) == 1 and bool(crypto_calls("deleteInvoice")))
+    created_id = str(CRYPTO["invoices"] and "" or "") or "1"
+    check("счёт проверки удалён именно тот, что создан", CRYPTO["deleted"] == [created_id],
+          f"удалено: {CRYPTO['deleted']}")
+    check("отчёт объясняет, что платить не нужно", "платить" in text.lower())
+    check("отчёт подсказывает /test_pay", "/test_pay" in text)
+    params = crypto_calls("createInvoice")[-1][2]
+    check("проверочный счёт — на минимальный платный тариф", params.get("amount") == "1.57",
+          f"amount={params.get('amount')}")
+
+    msg = make_message(bot, text="/crypto_check")
+    await bot.cmd_crypto_check(msg)
+    check("команда /crypto_check присылает отчёт", "Проверка Crypto Pay" in _last_api_text())
+
+    other = make_message(bot, uid=777, text="/crypto_check")
+    await bot.cmd_crypto_check(other)
+    check("обычному пользователю /crypto_check недоступна", "только администратору" in _last_api_text())
+
+    reset_all()
+    CRYPTO["token_broken"] = True
+    bot = new_bot({"mode": "crypto"}, store_file)
+    text = await bot.crypto_self_check()
+    check("неверный токен: понятная ошибка с подсказкой", "UNAUTHORIZED" in text and "CRYPTOBOT_TOKEN" in text)
+    CRYPTO["token_broken"] = False
+
+    reset_all()
+    bot = new_bot({"mode": "crypto", "crypto_token": None}, store_file)
+    text = await bot.crypto_self_check()
+    check("без токена отчёт объясняет, где его взять", "/pay" in text and "CRYPTOBOT_TOKEN" in text)
+
+    reset_all()
+    bot = new_bot({"mode": "crypto", "crypto_asset": "TON", "crypto_rate": "300"}, store_file)
+    text = await bot.crypto_self_check()
+    check("проверка работает для другой валюты (TON)", "TON" in text and "0.50" in text)
+
+    reset_all()
+    bot = new_bot({"mode": "stars"}, store_file)
+    msg = make_message(bot, text="/crypto_check")
+    await bot.cmd_crypto_check(msg)
+    check("в другом режиме команда честно говорит, что не нужна",
+          "только для режима крипты" in _last_api_text())
+
+
 async def test_panel_debug(store_file):
     print("\n▶ 12. /panel_debug показывает состояние оплаты")
     reset_all()
@@ -1401,6 +1597,8 @@ async def main():
         await test_persistence_and_off(store_for("persist"))
         await test_diagnostics(store_for("diag"))
         await test_panel_debug(store_for("debug"))
+        await test_simulated_payment(store_for("simulate"))
+        await test_crypto_self_check(store_for("selfcheck"))
     finally:
         for runner in runners:
             await runner.cleanup()
