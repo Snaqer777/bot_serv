@@ -50,6 +50,31 @@ logging.basicConfig(
 logger = logging.getLogger("vpn-bot")
 
 
+def _parse_id_list(raw: str) -> list[int]:
+    """
+    Разбирает ADMIN_ID как список Telegram ID.
+
+    Поддерживаются «123», «123,456», «123 456», «+123». Нечисловые куски
+    (например, @username) пропускаются с предупреждением в лог.
+    """
+    ids: list[int] = []
+    for chunk in re.split(r"[,\s;]+", (raw or "").strip()):
+        candidate = chunk.strip().lstrip("+")
+        if not candidate:
+            continue
+        if candidate.isdigit():
+            value = int(candidate)
+            if value not in ids:
+                ids.append(value)
+        else:
+            logger.warning(
+                "ADMIN_ID: «%s» не похоже на Telegram ID — пропускаю. "
+                "Свой ID можно узнать командой /myid у бота.",
+                chunk,
+            )
+    return ids
+
+
 def _int_env(name: str, default: int = 0) -> int:
     """Безопасно считывает целое число из переменной окружения."""
     val = (os.getenv(name) or "").strip()
@@ -178,7 +203,12 @@ if not BOT_TOKEN:
         "BOT_TOKEN не задан! Добавь его в Railway -> Variables и перезапусти сервис."
     )
 
-ADMIN_ID = _int_env("ADMIN_ID")
+# Администраторы бота. Можно указать несколько ID через запятую: «123,456».
+# Ведущий «+», лишние пробелы и точки с запятой не мешают; нечисловые куски
+# пропускаются с предупреждением в лог (частая ошибка — вставить @username).
+ADMIN_ID_RAW = (os.getenv("ADMIN_ID") or "").strip()
+ADMIN_IDS = _parse_id_list(ADMIN_ID_RAW)
+ADMIN_ID = ADMIN_IDS[0] if ADMIN_IDS else 0   # основной админ — первый в списке
 
 # --- Панель 3x-ui ---
 # XUI_URL копируй из браузера ровно так, как открываешь:
@@ -1721,13 +1751,39 @@ def payments_enabled() -> bool:
 
 
 def is_admin(user_id: int) -> bool:
-    """Админ ли пользователь. Если ADMIN_ID не задан — админ-команд нет вообще."""
-    return ADMIN_ID > 0 and user_id == ADMIN_ID
+    """
+    Админ ли пользователь.
+
+    Если в ADMIN_ID перечислено несколько ID — достаточно любого из них. Когда
+    переменная не задана (или заполнена не числом), админ-команды открыты: так
+    владелец не блокирует сам себя на первой настройке (бот предупреждает об этом
+    при старте). Ровно так же ведут себя и остальные команды бота.
+    """
+    if not ADMIN_IDS:
+        return True
+    return user_id in ADMIN_IDS
+
+
+def admin_denied_text(user_id: int) -> str:
+    """Понятный отказ для админ-команды: свой ID и что поправить в Railway."""
+    lines = [
+        "⛔️ <b>Команда доступна только администратору.</b>",
+        "",
+        f"• Твой Telegram ID: <code>{user_id}</code>",
+    ]
+    admins = ", ".join(f"<code>{value}</code>" for value in ADMIN_IDS)
+    lines.append(f"• В <b>ADMIN_ID</b> сейчас: {admins}")
+    lines.append(
+        "\nЕсли бот твой — поставь в <b>ADMIN_ID</b> свой ID "
+        "(несколько админов можно перечислить через запятую: <code>111,222</code>) "
+        "и дождись перезапуска сервиса."
+    )
+    return "\n".join(lines)
 
 
 def test_pay_enabled() -> bool:
     """Разрешена ли проверка выдачи ключа без оплаты (см. PAYMENTS_ALLOW_TEST_PAY)."""
-    return PAYMENTS_ALLOW_TEST_PAY and ADMIN_ID > 0
+    return PAYMENTS_ALLOW_TEST_PAY
 
 
 def payments_mode_title() -> str:
@@ -2459,6 +2515,17 @@ def order_paid_message(order: dict, info: dict) -> str:
     )
 
 
+async def notify_admins(text: str) -> None:
+    """Отправляет сообщение всем администраторам (ADMIN_ID может содержать список)."""
+    for admin_id in ADMIN_IDS:
+        if admin_id == 0:
+            continue
+        try:
+            await bot.send_message(admin_id, text, parse_mode="HTML")
+        except Exception as exc:
+            logger.warning("Не удалось уведомить админа %s: %s", admin_id, exc)
+
+
 async def notify_payment_success(order: dict, info: dict) -> bool:
     """
     Отправляет покупателю ключ, а админу — уведомление о продаже.
@@ -2482,26 +2549,22 @@ async def notify_payment_success(order: dict, info: dict) -> bool:
             order["tg_id"], order["id"], exc,
         )
 
-    if ADMIN_ID > 0 and ADMIN_ID != order["tg_id"]:
-        try:
-            amount = (
-                f"{order['amount_stars']} ⭐️" if order["currency"] == "XTR" else f"{order['amount_rub']} ₽"
-            )
-            header = (
-                "🧪 <b>Тестовая выдача (оплата не производилась)</b>\n"
-                if order.get("simulated") else f"💰 <b>Новая оплата:</b> {amount}\n"
-            )
-            await bot.send_message(
-                ADMIN_ID,
-                header
-                + f"• Тариф: {order['tariff_name']}\n"
-                f"• Пользователь: <code>{order['tg_id']}</code>\n"
-                f"• Заказ: <code>{order['id']}</code>\n"
-                f"• Действует до: <code>{format_date(info['expiry_ms'])}</code>",
-                parse_mode="HTML",
-            )
-        except Exception as exc:
-            logger.warning("Не удалось уведомить админа об оплате: %s", exc)
+    recipients = [admin_id for admin_id in ADMIN_IDS if admin_id != order["tg_id"]]
+    if recipients:
+        amount = (
+            f"{order['amount_stars']} ⭐️" if order["currency"] == "XTR" else f"{order['amount_rub']} ₽"
+        )
+        header = (
+            "🧪 <b>Тестовая выдача (оплата не производилась)</b>\n"
+            if order.get("simulated") else f"💰 <b>Новая оплата:</b> {amount}\n"
+        )
+        await notify_admins(
+            header
+            + f"• Тариф: {order['tariff_name']}\n"
+            f"• Пользователь: <code>{order['tg_id']}</code>\n"
+            f"• Заказ: <code>{order['id']}</code>\n"
+            f"• Действует до: <code>{format_date(info['expiry_ms'])}</code>"
+        )
 
     return delivered
 
@@ -2578,15 +2641,13 @@ async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str 
             )
         except Exception:
             pass
-        if ADMIN_ID > 0:
+        if ADMIN_IDS:
             try:
-                await bot.send_message(
-                    ADMIN_ID,
+                await notify_admins(
                     f"⚠️ <b>Оплата есть, ключ не выдан!</b>\n"
                     f"• Заказ: <code>{order['id']}</code>\n"
                     f"• Пользователь: <code>{order['tg_id']}</code>\n"
-                    f"• Ошибка: <code>{escape(str(exc)[:300])}</code>",
-                    parse_mode="HTML",
+                    f"• Ошибка: <code>{escape(str(exc)[:300])}</code>"
                 )
             except Exception:
                 pass
@@ -3345,13 +3406,35 @@ async def cmd_start(message: Message):
 @dp.message(Command("myid"))
 async def cmd_myid(message: Message):
     user_id = message.from_user.id
-    is_admin = (user_id == ADMIN_ID)
-    status_text = "✅ Ты уже администратор" if is_admin else "ℹ️ Укажи его в Railway -> Variables -> <b>ADMIN_ID</b>"
+    admins = ", ".join(f"<code>{value}</code>" for value in ADMIN_IDS) or "не заданы"
+
+    if not ADMIN_IDS:
+        reason = (
+            f"заполнена некорректно (<code>{escape(ADMIN_ID_RAW)}</code> — нужен числовой ID, "
+            "а не @username)"
+            if ADMIN_ID_RAW else "не задана"
+        )
+        status_text = (
+            f"⚠️ Переменная <b>ADMIN_ID</b> {reason}, поэтому админ-команды сейчас открыты для всех.\n"
+            "Отправь в Railway → Variables → <b>ADMIN_ID</b> свой ID ниже "
+            "(несколько админов — через запятую: <code>111,222</code>)."
+        )
+    elif user_id in ADMIN_IDS:
+        extra = f" (в списке {len(ADMIN_IDS)} админ(ов))" if len(ADMIN_IDS) > 1 else ""
+        status_text = f"✅ Ты администратор{extra} — все админ-команды доступны: /panel_debug, /groups, /test_pay."
+    else:
+        status_text = (
+            f"ℹ️ Ты не в списке администраторов. Сейчас там: {admins}.\n"
+            "Если бот твой — поставь в <b>ADMIN_ID</b> свой ID (несколько админов — через запятую: "
+            "<code>111,222</code>).\n"
+            "<i>Частая причина отказа: в переменной указан @username вместо числового ID.</i>"
+        )
 
     await message.answer(
         f"👤 <b>Твой Telegram ID:</b> <code>{user_id}</code>\n\n"
+        f"<b>Админы бота (ADMIN_ID):</b> {admins}\n"
         f"<b>Статус:</b> {status_text}\n\n"
-        "<i>После добавления ADMIN_ID в Railway подожди 1-2 минуты для перезапуска бота.</i>",
+        "<i>После изменения переменной в Railway подожди 1-2 минуты — сервис перезапустится сам.</i>",
         parse_mode="HTML",
     )
 
@@ -3360,10 +3443,10 @@ async def cmd_myid(message: Message):
 async def cmd_inbounds(message: Message):
     """Показывает список подключений в панели (только для админа)."""
     # Если ADMIN_ID не настроен, разрешаем вызов, чтобы владелец мог увидеть inbounds
-    if ADMIN_ID > 0 and message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         await message.answer(
-            f"⛔️ Команда /inbounds доступна только администратору.\n\n"
-            f"Твой ID: <code>{message.from_user.id}</code> (добавь в Railway в ADMIN_ID).",
+            "⛔️ <b>Команда /inbounds доступна только администратору.</b>\n\n"
+            + admin_denied_text(message.from_user.id),
             parse_mode="HTML",
         )
         return
@@ -3415,13 +3498,8 @@ async def cmd_inbounds(message: Message):
 async def cmd_test_vpn(message: Message):
     """Выдаёт тестовый VPN-ключ."""
     # Если ADMIN_ID задан и пользователь не админ
-    if ADMIN_ID > 0 and message.from_user.id != ADMIN_ID:
-        await message.answer(
-            f"⛔️ Команда /test_vpn доступна только администратору.\n\n"
-            f"Твой Telegram ID: <code>{message.from_user.id}</code>\n"
-            "Укажи этот ID в Railway -> Variables -> <b>ADMIN_ID</b> и дождись перезапуска сервиса.",
-            parse_mode="HTML",
-        )
+    if not is_admin(message.from_user.id):
+        await message.answer(admin_denied_text(message.from_user.id), parse_mode="HTML")
         return
 
     wait_msg = await message.answer("⏳ Подключаюсь к 3x-ui и генерирую ключ...")
@@ -3500,8 +3578,8 @@ async def cmd_test_vpn(message: Message):
 @dp.message(Command("reset_vpn"))
 async def cmd_reset_vpn(message: Message):
     """Удаляет тестового клиента из 3x-ui (для пересоздания)."""
-    if ADMIN_ID > 0 and message.from_user.id != ADMIN_ID:
-        await message.answer("⛔️ Команда доступна только администратору.")
+    if not is_admin(message.from_user.id):
+        await message.answer(admin_denied_text(message.from_user.id), parse_mode="HTML")
         return
 
     wait_msg = await message.answer("⏳ Удаляю клиента из панели 3x-ui...")
@@ -3532,8 +3610,8 @@ async def cmd_reset_vpn(message: Message):
 @dp.message(Command("groups"))
 async def cmd_groups(message: Message):
     """Показывает группы клиентов в панели 3x-ui (только для админа)."""
-    if ADMIN_ID > 0 and message.from_user.id != ADMIN_ID:
-        await message.answer("⛔️ Команда доступна только администратору.")
+    if not is_admin(message.from_user.id):
+        await message.answer(admin_denied_text(message.from_user.id), parse_mode="HTML")
         return
 
     wait_msg = await message.answer("⏳ Запрашиваю группы в панели 3x-ui...")
@@ -3616,8 +3694,8 @@ async def cmd_groups(message: Message):
 @dp.message(Command("panel_debug"))
 async def cmd_panel_debug(message: Message):
     """Сетевая диагностика связи между Railway и 3x-ui."""
-    if ADMIN_ID > 0 and message.from_user.id != ADMIN_ID:
-        await message.answer("⛔️ Команда доступна только администратору.")
+    if not is_admin(message.from_user.id):
+        await message.answer(admin_denied_text(message.from_user.id), parse_mode="HTML")
         return
 
     if not XUI_URL:
@@ -3632,8 +3710,13 @@ async def cmd_panel_debug(message: Message):
         two_factor_state = "задан ✅"
     secret_tail = f"…{XUI_2FA_SECRET[-4:]}" if len(XUI_2FA_SECRET) > 4 else "—"
 
+    admins_note = (
+        ", ".join(str(value) for value in ADMIN_IDS) if ADMIN_IDS
+        else "⚠️ не задан (админ-команды открыты всем — укажи свой ID)"
+    )
     lines = [
         "🔍 <b>Диагностика подключения к 3x-ui:</b>\n",
+        f"• <b>Админы (ADMIN_ID):</b> <code>{escape(admins_note)}</code> — твой ID <code>{message.from_user.id}</code>",
         f"• <b>URL:</b> <code>{escape(XUI_URL)}</code>",
         f"• <b>Прокси:</b> <code>{escape(str(XUI_PROXY or 'нет'))}</code>",
         f"• <b>Логин:</b> <code>{escape(XUI_USERNAME or 'не задан')}</code>",
@@ -3842,8 +3925,8 @@ async def cmd_panel_debug(message: Message):
 @dp.message(Command("totp"))
 async def cmd_totp(message: Message):
     """Показывает текущий код Google Authenticator для входа в панель (только админ)."""
-    if ADMIN_ID > 0 and message.from_user.id != ADMIN_ID:
-        await message.answer("⛔️ Команда доступна только администратору.")
+    if not is_admin(message.from_user.id):
+        await message.answer(admin_denied_text(message.from_user.id), parse_mode="HTML")
         return
 
     if not XUI_2FA_SECRET:
@@ -4007,7 +4090,7 @@ async def on_successful_payment(message: Message):
         )
         return
 
-    if order["tg_id"] != message.from_user.id and ADMIN_ID > 0:
+    if order["tg_id"] != message.from_user.id and not is_admin(message.from_user.id):
         logger.warning(
             "Платёж по заказу %s пришёл от %s, а заказ создан для %s",
             order["id"], message.from_user.id, order["tg_id"],
@@ -4091,8 +4174,8 @@ async def cb_check_payment(cb: CallbackQuery):
 @dp.message(Command("payments"))
 async def cmd_payments(message: Message):
     """Статистика оплат и диагностика платёжного режима (только админ)."""
-    if ADMIN_ID > 0 and message.from_user.id != ADMIN_ID:
-        await message.answer("⛔️ Команда доступна только администратору.")
+    if not is_admin(message.from_user.id):
+        await message.answer(admin_denied_text(message.from_user.id), parse_mode="HTML")
         return
 
     stats = payment_store.stats()
@@ -4210,7 +4293,7 @@ def test_pay_intro() -> str:
 async def cmd_test_pay(message: Message):
     """Проверяет выдачу ключа без реальной оплаты (только админ)."""
     if not is_admin(message.from_user.id):
-        await message.answer("⛔️ Команда доступна только администратору.")
+        await message.answer(admin_denied_text(message.from_user.id), parse_mode="HTML")
         return
     if not test_pay_enabled():
         await message.answer(
@@ -4252,7 +4335,7 @@ async def cmd_test_pay(message: Message):
 @dp.callback_query(F.data == "testpay_menu")
 async def cb_testpay_menu(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
-        await cb.answer("Только для администратора.", show_alert=True)
+        await cb.answer("Только для администратора — /myid покажет твой ID.", show_alert=True)
         return
     if not test_pay_enabled():
         await cb.answer("Проверка без оплаты выключена (PAYMENTS_ALLOW_TEST_PAY=1).", show_alert=True)
@@ -4264,7 +4347,7 @@ async def cb_testpay_menu(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("testpay_run_"))
 async def cb_testpay_run(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
-        await cb.answer("Только для администратора.", show_alert=True)
+        await cb.answer("Только для администратора — /myid покажет твой ID.", show_alert=True)
         return
     if not test_pay_enabled():
         await cb.answer("Проверка без оплаты выключена (PAYMENTS_ALLOW_TEST_PAY=1).", show_alert=True)
@@ -4285,7 +4368,7 @@ async def cb_testpay_run(cb: CallbackQuery):
 async def cb_testpay_del(cb: CallbackQuery):
     """Удаляет подписку, созданную проверочной выдачей."""
     if not is_admin(cb.from_user.id):
-        await cb.answer("Только для администратора.", show_alert=True)
+        await cb.answer("Только для администратора — /myid покажет твой ID.", show_alert=True)
         return
     order_id = cb.data.removeprefix("testpay_del_")
     order = await payment_store.get(order_id)
@@ -4345,7 +4428,7 @@ async def cb_testpay_del(cb: CallbackQuery):
 async def cmd_crypto_check(message: Message):
     """Проверяет связку с Crypto Pay без денег: счёт создаётся и сразу удаляется."""
     if not is_admin(message.from_user.id):
-        await message.answer("⛔️ Команда доступна только администратору.")
+        await message.answer(admin_denied_text(message.from_user.id), parse_mode="HTML")
         return
     if PAYMENTS_MODE != "crypto":
         await message.answer(
@@ -4373,7 +4456,7 @@ async def cmd_crypto_check(message: Message):
 @dp.callback_query(F.data == "crypto_check")
 async def cb_crypto_check(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
-        await cb.answer("Только для администратора.", show_alert=True)
+        await cb.answer("Только для администратора — /myid покажет твой ID.", show_alert=True)
         return
     await cb.answer("Проверяю связку с Crypto Pay...")
     try:
@@ -4387,8 +4470,8 @@ async def cb_crypto_check(cb: CallbackQuery):
 @dp.message(Command("revoke"))
 async def cmd_revoke(message: Message):
     """Удаляет платную подписку (для возвратов и блокировок)."""
-    if ADMIN_ID > 0 and message.from_user.id != ADMIN_ID:
-        await message.answer("⛔️ Команда доступна только администратору.")
+    if not is_admin(message.from_user.id):
+        await message.answer(admin_denied_text(message.from_user.id), parse_mode="HTML")
         return
 
     args = (message.text or "").split()
@@ -4552,7 +4635,12 @@ async def on_startup():
 async def main():
     if ADMIN_ID == 0:
         logger.warning(
-            "⚠️ ADMIN_ID не задан. Отправь боту /myid и укажи свой ID в Railway -> Variables."
+            "⚠️ ADMIN_ID не задан. Отправь боту /myid и укажи свой ID в Railway -> Variables. "
+            "Пока переменная пуста, админ-команды (/panel_debug, /groups, /test_pay) открыты для всех."
+            if not ADMIN_ID_RAW else
+            f"⚠️ ADMIN_ID='{ADMIN_ID_RAW}' не содержит числового Telegram ID "
+            "(например, указан @username или лишний текст). Админ-команды пока открыты всем — "
+            "отправь боту /myid и укажи полученный ID в Railway -> Variables."
         )
 
     payment_store.load()

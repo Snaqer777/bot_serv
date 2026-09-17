@@ -344,7 +344,7 @@ def new_bot(env, store_file, admins=None):
         "STARS_RUB_RATE": "1.6",
         "STARS_BASIC": env.get("stars_basic"),
     }
-    bot = load_bot(PANEL_PORT, admins=str(admins or TG_TG_ID), env=full_env)
+    bot = load_bot(PANEL_PORT, admins=env.get("admin_id") if "admin_id" in env else str(admins or TG_TG_ID), env=full_env)
     session = AiohttpSession()
     session.api = TelegramAPIServer.from_base(f"http://127.0.0.1:{TG_PORT}")
     bot.bot.session = session
@@ -1438,6 +1438,94 @@ async def test_simulated_payment(store_file):
     check("после /revoke проверочная выдача снова работает", panel_client(email) is not None)
 
 
+async def test_admin_access(store_file):
+    print("\n▶ 15. Доступ администратора (ADMIN_ID: один, список, мусор, пусто)")
+    reset_all()
+
+    # Один админ
+    bot = new_bot({"mode": "crypto", "allow_test_pay": "1", "admin_id": str(TG_TG_ID)}, store_file)
+    check("один ID: владелец — админ", bot.is_admin(TG_TG_ID) is True)
+    check("один ID: чужой — не админ", bot.is_admin(777) is False)
+
+    # Несколько админов через запятую
+    reset_all()
+    bot = new_bot({"mode": "crypto", "allow_test_pay": "1", "admin_id": f"{TG_TG_ID}, 777"}, store_file)
+    check("список ID: первый админ", bot.is_admin(TG_TG_ID) is True)
+    check("список ID: второй админ", bot.is_admin(777) is True)
+    check("список ID: посторонний не админ", bot.is_admin(999) is False)
+    check("список разобран во все ID", bot.ADMIN_IDS == [TG_TG_ID, 777], str(bot.ADMIN_IDS))
+
+    # Странности формата
+    reset_all()
+    bot = new_bot({"mode": "crypto", "admin_id": f" +{TG_TG_ID} ; 777 ", "allow_test_pay": "1"}, store_file)
+    check("плюс, точка с запятой и пробелы не мешают", bot.ADMIN_IDS == [TG_TG_ID, 777], str(bot.ADMIN_IDS))
+
+    reset_all()
+    bot = new_bot({"mode": "crypto", "admin_id": "@username", "allow_test_pay": "1"}, store_file)
+    check("мусорный ADMIN_ID: не блокирует владельца (команды открыты), как и у старых команд",
+          bot.is_admin(TG_TG_ID) is True and bot.ADMIN_IDS == [])
+
+    reset_all()
+    bot = new_bot({"mode": "crypto", "admin_id": "", "allow_test_pay": "1"}, store_file)
+    check("пустой ADMIN_ID: команды открыты всем (бот предупредит при старте)", bot.is_admin(777) is True)
+
+    # Второй админ из списка может работать с командой
+    reset_all()
+    bot = new_bot({"mode": "crypto", "allow_test_pay": "1", "admin_id": f"{TG_TG_ID},777"}, store_file)
+    msg = make_message(bot, uid=777, text="/test_pay basic")
+    await bot.cmd_test_pay(msg)
+    check("второй админ из списка получил ключ через /test_pay", panel_client("tg-paid-777") is not None)
+
+    # Отказ содержит диагностику
+    reset_all()
+    bot = new_bot({"mode": "crypto", "allow_test_pay": "1", "admin_id": str(TG_TG_ID)}, store_file)
+    msg = make_message(bot, uid=555, text="/test_pay basic")
+    await bot.cmd_test_pay(msg)
+    text = _last_api_text()
+    check("отказ показывает ID пользователя", "555" in text)
+    check("отказ показывает, какой ADMIN_ID сейчас задан", str(TG_TG_ID) in text)
+    check("отказ подсказывает про запятую для нескольких админов", "запятую" in text)
+    check("отказ не выдал ключ", panel_client("tg-paid-555") is None)
+
+    # Некорректный ADMIN_ID (@username вместо ID): владельца не блокируем,
+    # но честно говорим об этом в /myid — иначе легко решить, что «бот меня не признал»
+    reset_all()
+    bot = new_bot({"mode": "crypto", "allow_test_pay": "1", "admin_id": "@username"}, store_file)
+    check("мусорный ADMIN_ID не блокирует админ-команды (нельзя запереть себя вне бота)",
+          bot.is_admin(555) is True)
+    msg = make_message(bot, uid=555, text="/myid")
+    await bot.cmd_myid(msg)
+    text = _last_api_text()
+    check("/myid предупреждает, что ADMIN_ID заполнен нечисловым значением",
+          "@username" in text and "некорректно" in text)
+    check("/myid подсказывает формат списка админов", "111,222" in text)
+
+    reset_all()
+    bot = new_bot({"mode": "crypto", "allow_test_pay": "1", "admin_id": ""}, store_file)
+    msg = make_message(bot, uid=555, text="/myid")
+    await bot.cmd_myid(msg)
+    check("/myid отдельно сообщает, что ADMIN_ID не задана", "не задана" in _last_api_text())
+
+    # /myid отвечает всем и объясняет статус
+    reset_all()
+    bot = new_bot({"mode": "crypto", "admin_id": str(TG_TG_ID)}, store_file)
+    msg = make_message(bot, uid=555, text="/myid")
+    await bot.cmd_myid(msg)
+    text = _last_api_text()
+    check("/myid для не-админа показывает список админов и что делать",
+          str(TG_TG_ID) in text and "ADMIN_ID" in text and "не в списке" in text)
+
+    msg = make_message(bot, uid=TG_TG_ID, text="/myid")
+    await bot.cmd_myid(msg)
+    check("/myid для админа подтверждает статус", "Ты администратор" in _last_api_text())
+
+    # /panel_debug показывает админов
+    msg = make_message(bot, text="/panel_debug")
+    await bot.cmd_panel_debug(msg)
+    check("/panel_debug показывает список админов и свой ID",
+          "ADMIN_ID" in _last_api_text() and str(TG_TG_ID) in _last_api_text())
+
+
 async def test_crypto_self_check(store_file):
     print("\n▶ 14. Проверка связки с Crypto Pay без денег (/crypto_check)")
     reset_all()
@@ -1599,6 +1687,7 @@ async def main():
         await test_panel_debug(store_for("debug"))
         await test_simulated_payment(store_for("simulate"))
         await test_crypto_self_check(store_for("selfcheck"))
+        await test_admin_access(store_for("admin"))
     finally:
         for runner in runners:
             await runner.cleanup()
