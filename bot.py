@@ -207,6 +207,14 @@ if XUI_2FA_SECRET:
 # ID входящего подключения (VLESS). Если 0 — бот подберёт подходящее автоматически.
 XUI_INBOUND_ID = _int_env("XUI_INBOUND_ID")
 
+# --- Группа клиентов в 3x-ui ---
+# Если задано, все создаваемые ботом клиенты помечаются этой группой (раздел
+# "Группы"/Groups в панели 3x-ui, версия 3.2+): в панели их можно отфильтровать,
+# видеть общий расход трафика группы и т.д. Группа создаётся автоматически.
+XUI_CLIENT_GROUP = (os.getenv("XUI_CLIENT_GROUP") or "").strip()
+if XUI_CLIENT_GROUP:
+    logger.info("Клиенты бота будут добавляться в группу 3x-ui «%s».", XUI_CLIENT_GROUP)
+
 # --- Необязательные переопределения ---
 # По умолчанию адрес сервера в ключе = хост из XUI_URL, порт = порт inbound.
 VPN_HOST = (os.getenv("VPN_HOST") or "").strip()
@@ -245,6 +253,20 @@ vpn_lock = asyncio.Lock()
 def _snip(text: str, limit: int = 160) -> str:
     """Выжимка из HTML-ответа для компактного отображения ошибки."""
     return " ".join((text or "").split())[:limit]
+
+
+def _human_bytes(value) -> str:
+    """Переводит байты в читаемый вид (1.5 ГиБ, 780 МиБ и т.д.)."""
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return "—"
+
+    for unit in ("Б", "КиБ", "МиБ", "ГиБ", "ТиБ"):
+        if size < 1024:
+            return f"{size:.1f} {unit}".replace(".0 ", " ")
+        size /= 1024
+    return f"{size:.1f} ПиБ"
 
 
 def classify_body(text: str) -> str:
@@ -749,6 +771,86 @@ class XUIClient:
             return data
         return []
 
+    # --- Группы клиентов (3x-ui v3.2+) ---
+    # В панели группа хранится в поле group каждого клиента; список групп панель
+    # ведёт отдельно (таблица client_groups) и создаёт запись автоматически,
+    # когда клиенту проставляют новую группу.
+
+    GROUPS_PATH = "/panel/api/clients/groups"
+    GROUP_BULK_ADD_PATH = "/panel/api/clients/groups/bulkAdd"
+
+    @staticmethod
+    def _route_missing(exc: Exception) -> bool:
+        """Похоже ли, что панель просто не знает такой ручки (старая версия)."""
+        text = str(exc).lower()
+        return "404" in text or "not found" in text
+
+    async def list_groups(self) -> list | None:
+        """Список групп панели. None — если версия 3x-ui ещё не умеет группы."""
+        try:
+            data = await self.request("GET", self.GROUPS_PATH)
+        except XUIError as exc:
+            if self._route_missing(exc):
+                return None
+            raise
+        if isinstance(data, list):
+            return [g for g in data if isinstance(g, dict)]
+        return []
+
+    async def client_group(self, email: str) -> str | None:
+        """Название группы клиента (или None, если группы нет либо панель старая)."""
+        try:
+            data = await self.request("GET", f"/panel/api/clients/get/{quote(email, safe='')}")
+        except XUIError:
+            return None
+        group = as_dict(data).get("group")
+        return str(group) if group else None
+
+    async def add_clients_to_group(self, emails: list[str]) -> str:
+        """
+        Помечает клиентов группой из переменной XUI_CLIENT_GROUP.
+
+        Панель сама создаёт группу, если её ещё нет. Возвращает статус:
+          • 'assigned'    — клиент в нужной группе (проверено);
+          • 'unsupported' — версия панели не умеет группы (нужна 3x-ui 3.2+);
+          • 'not_assigned'— панель приняла запрос, но группа не подтвердилась;
+          • 'skipped'     — XUI_CLIENT_GROUP не задана.
+        Ошибки не пробрасываем: клиент уже создан, группа — дополнительный штрих.
+        """
+        emails = [e for e in emails if e]
+        if not XUI_CLIENT_GROUP or not emails:
+            return "skipped"
+
+        payload = {"emails": emails, "group": XUI_CLIENT_GROUP}
+        for attempt in range(2):
+            try:
+                result = as_dict(await self.request("POST", self.GROUP_BULK_ADD_PATH, json=payload))
+            except XUIError as exc:
+                if self._route_missing(exc):
+                    logger.info(
+                        "Панель 3x-ui не поддерживает группы клиентов (нужна версия 3.2+): %s",
+                        _snip(str(exc), 120),
+                    )
+                    return "unsupported"
+                logger.warning("Не удалось добавить клиента в группу «%s»: %s", XUI_CLIENT_GROUP, exc)
+                return "not_assigned"
+
+            if int(result.get("affected") or 0) > 0:
+                logger.info("Клиент %s добавлен в группу 3x-ui «%s».", emails[0], XUI_CLIENT_GROUP)
+                return "assigned"
+
+            # Панель могла сохранить группу сразу из payload клиента (affected=0)
+            # либо ещё не синхронизировать нового клиента в свою базу — проверяем.
+            if await self.client_group(emails[0]) == XUI_CLIENT_GROUP:
+                logger.info("Клиент %s уже состоит в группе 3x-ui «%s».", emails[0], XUI_CLIENT_GROUP)
+                return "assigned"
+
+            if attempt == 0:
+                await asyncio.sleep(1.0)
+
+        logger.warning("Клиент %s создан, но остался без группы «%s».", emails[0], XUI_CLIENT_GROUP)
+        return "not_assigned"
+
     async def get_inbound(self, inbound_id: int) -> dict:
         """Получает данные конкретного подключения."""
         data = await self.request("GET", f"/panel/api/inbounds/get/{inbound_id}")
@@ -1080,7 +1182,7 @@ def _test_client_payload(telegram_id: int, client_uuid: str, now_ms: int, inboun
     # xtls-rprx-vision используется для VLESS + TCP + Reality / TLS
     flow = "xtls-rprx-vision" if (network == "tcp" and security in ("reality", "tls")) else ""
 
-    return {
+    payload = {
         "id": client_uuid,
         "email": f"tg-test-{telegram_id}",
         "flow": flow,
@@ -1093,11 +1195,37 @@ def _test_client_payload(telegram_id: int, client_uuid: str, now_ms: int, inboun
         "reset": 0,
     }
 
+    # Группа клиента (3x-ui 3.2+; на старых сборках поле просто игнорируется)
+    if XUI_CLIENT_GROUP:
+        payload["group"] = XUI_CLIENT_GROUP
 
-async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool, str | None]:
+    return payload
+
+
+def _group_note(status: str) -> str:
+    """Пояснение к статусу добавления клиента в группу 3x-ui."""
+    if not XUI_CLIENT_GROUP:
+        return ""
+
+    group = f"<code>{escape(XUI_CLIENT_GROUP)}</code>"
+    if status == "assigned":
+        return f"\n🏷 <b>Группа:</b> клиент в группе {group} в панели 3x-ui."
+    if status == "unsupported":
+        return (
+            "\n⚠️ <b>Группы недоступны:</b> эта версия панели 3x-ui не поддерживает группы "
+            "(нужна 3.2 или новее), поэтому клиент создан без группы.\n"
+            "<i>Обнови панель или убери переменную XUI_CLIENT_GROUP.</i>"
+        )
+    return (
+        f"\n⚠️ <b>Группа:</b> клиент создан, но панель не подтвердила добавление в группу {group}.\n"
+        "<i>Проверь название группы и логи сервиса — команда /groups покажет группы панели.</i>"
+    )
+
+
+async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool, str | None, str]:
     """
     Создаёт клиента в 3x-ui (или продлевает/возвращает существующего).
-    Возвращает: (vless_link, status, inbound_dict, auto_picked: bool, sub_link).
+    Возвращает: (vless_link, status, inbound_dict, auto_picked: bool, sub_link, group_note).
     Статусы: 'created', 'updated', 'exists'.
     """
     async with XUIClient() as client:
@@ -1129,7 +1257,9 @@ async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool
                 link = build_vless_link(existing, inbound, params)
                 sub_id = existing.get("subId")
                 sub_link = f"{XUI_URL}/sub/{sub_id}" if sub_id else None
-                return link, "exists", inbound, auto_picked, sub_link
+                # Клиент мог быть создан до настройки группы — досылаем его в группу
+                group_note = _group_note(await client.add_clients_to_group([target_email]))
+                return link, "exists", inbound, auto_picked, sub_link, group_note
 
             # Если ключ истёк или выключен — продлеваем на 24 часа
             payload = _test_client_payload(
@@ -1142,7 +1272,8 @@ async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool
             link = build_vless_link(payload, inbound, params)
             sub_id = payload.get("subId")
             sub_link = f"{XUI_URL}/sub/{sub_id}" if sub_id else None
-            return link, "updated", inbound, auto_picked, sub_link
+            group_note = _group_note(await client.add_clients_to_group([target_email]))
+            return link, "updated", inbound, auto_picked, sub_link, group_note
 
         # Клиента ещё нет — регистрируем нового
         new_uuid = str(uuid.uuid4())
@@ -1152,7 +1283,8 @@ async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool
         link = build_vless_link(payload, inbound, params)
         sub_id = payload.get("subId")
         sub_link = f"{XUI_URL}/sub/{sub_id}" if sub_id else None
-        return link, "created", inbound, auto_picked, sub_link
+        group_note = _group_note(await client.add_clients_to_group([target_email]))
+        return link, "created", inbound, auto_picked, sub_link, group_note
 
 
 async def delete_test_key(telegram_id: int) -> bool:
@@ -1383,7 +1515,9 @@ async def cmd_test_vpn(message: Message):
 
     try:
         async with vpn_lock:
-            link, status, inbound, auto_picked, sub_link = await get_or_create_test_key(message.from_user.id)
+            link, status, inbound, auto_picked, sub_link, group_note = await get_or_create_test_key(
+                message.from_user.id
+            )
 
         try:
             await wait_msg.delete()
@@ -1435,6 +1569,7 @@ async def cmd_test_vpn(message: Message):
             "   • <b>Windows/Mac:</b> Happ, v2rayN, V2Box\n"
             "3. Открой приложение → нажми <b>«+»</b> → <b>«Импорт из буфера обмена»</b>.\n"
             "4. Нажми <b>Подключить</b>."
+            f"{group_note}"
             f"{auto_note}"
             f"{admin_note}"
         )
@@ -1473,6 +1608,72 @@ async def cmd_reset_vpn(message: Message):
                 "ℹ️ Тестового клиента в 3x-ui не обнаружено — можно сразу отправлять /test_vpn.",
                 parse_mode="HTML",
             )
+    except Exception as exc:
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+        await send_error_message(message, exc)
+
+
+@dp.message(Command("groups"))
+async def cmd_groups(message: Message):
+    """Показывает группы клиентов в панели 3x-ui (только для админа)."""
+    if ADMIN_ID > 0 and message.from_user.id != ADMIN_ID:
+        await message.answer("⛔️ Команда доступна только администратору.")
+        return
+
+    wait_msg = await message.answer("⏳ Запрашиваю группы в панели 3x-ui...")
+    try:
+        async with XUIClient() as client:
+            groups = await client.list_groups()
+
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+
+        if groups is None:
+            await message.answer(
+                "⚠️ <b>Эта версия панели 3x-ui не поддерживает группы клиентов.</b>\n\n"
+                "Группы появились в 3x-ui 3.2 — обнови панель, и бот сможет складывать своих клиентов "
+                "в отдельную группу (переменная <b>XUI_CLIENT_GROUP</b>).",
+                parse_mode="HTML",
+            )
+            return
+
+        if not groups:
+            await message.answer(
+                "ℹ️ В панели 3x-ui пока нет ни одной группы клиентов.\n\n"
+                "Задай имя группы в Railway → Variables → <b>XUI_CLIENT_GROUP</b> — бот создаст её "
+                "автоматически при выдаче следующего ключа.",
+                parse_mode="HTML",
+            )
+            return
+
+        lines = ["🏷 <b>Группы клиентов в панели 3x-ui:</b>\n"]
+        for group in groups:
+            name = str(group.get("name") or "")
+            count = group.get("clientCount")
+            mark = " ⬅️ <i>использует бот</i>" if XUI_CLIENT_GROUP and name == XUI_CLIENT_GROUP else ""
+            used = _human_bytes(group.get("trafficUsed")) if group.get("trafficUsed") else None
+            details = f"{count} клиент(ов)" if count is not None else "—"
+            if used:
+                details += f", трафик: {used}"
+            lines.append(f"• <code>{escape(name)}</code> — {details}{mark}")
+
+        if XUI_CLIENT_GROUP:
+            lines.append(
+                f"\n✅ Новые клиенты бота добавляются в группу <code>{escape(XUI_CLIENT_GROUP)}</code>."
+            )
+        else:
+            lines.append(
+                "\n💡 Задай <b>XUI_CLIENT_GROUP</b> в Railway → Variables, чтобы клиенты бота "
+                "складывались в отдельную группу (например <code>bot-test</code>)."
+            )
+
+        await message.answer("\n".join(lines), parse_mode="HTML")
+
     except Exception as exc:
         try:
             await wait_msg.delete()
@@ -1597,6 +1798,30 @@ async def cmd_panel_debug(message: Message):
             lines.append(f"5. <b>XUI_2FA_SECRET:</b> ⚠️ {escape(str(totp_secret_problem(XUI_2FA_SECRET)))}")
         else:
             lines.append("5. <b>XUI_2FA_SECRET:</b> не задан — вход только по логину/паролю или XUI_TOKEN.")
+
+        # Проверяем, поддерживает ли панель группы клиентов и попадёт ли туда клиент бота
+        try:
+            async with XUIClient() as client:
+                groups = await client.list_groups()
+        except Exception as exc:
+            groups = None
+            lines.append(f"6. <b>Группы клиентов</b> -> ❌ {escape(str(exc))}")
+        else:
+            if groups is None:
+                lines.append(
+                    "6. <b>Группы клиентов</b> -> ⚠️ панель не поддерживает группы (нужна 3x-ui 3.2+)"
+                )
+            elif not XUI_CLIENT_GROUP:
+                lines.append(
+                    f"6. <b>Группы клиентов</b> -> доступны ({len(groups)} шт.), но <b>XUI_CLIENT_GROUP</b> не задана"
+                )
+            else:
+                names = [str(g.get("name") or "") for g in groups]
+                found = XUI_CLIENT_GROUP in names
+                lines.append(
+                    f"6. <b>Группа бота:</b> <code>{escape(XUI_CLIENT_GROUP)}</code> -> "
+                    + ("✅ есть в панели" if found else "ℹ️ пока не создана (появится при выдаче ключа)")
+                )
 
     await message.answer("\n".join(lines)[:4000], parse_mode="HTML")
 
@@ -1779,6 +2004,7 @@ async def on_startup():
             BotCommand(command="reset_vpn", description="🔄 Сбросить тестовый ключ"),
             BotCommand(command="panel_debug", description="🔍 Диагностика панели"),
             BotCommand(command="totp", description="🔐 Код 2FA для входа в панель"),
+            BotCommand(command="groups", description="🏷 Группы клиентов в 3x-ui"),
             BotCommand(command="myid", description="👤 Узнать свой Telegram ID"),
         ]
         await bot.set_my_commands(commands)
