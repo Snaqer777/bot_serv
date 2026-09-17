@@ -50,7 +50,8 @@ Telegram-бот на **aiogram 3**, работающий на **Railway**.
 | `XUI_2FA_SECRET` | `JBSWY3DPEHPK3PXP...` | Секрет Google Authenticator, если в панели включена двухфакторка. Бот сам считает 6-значный код при входе в панель (см. ниже) |
 | `XUI_CLIENT_GROUP` | `bot-test` | Название уже созданной группы в 3x-ui — бот складывает клиентов в неё (раздел «Группы», панель 3.2+, регистр не важен) |
 | `PAYMENTS_MODE` | `stars` | Как принимать оплату: `stars` (Telegram Stars), `provider` (карта через BotFather), `yookassa` (ЮKassa напрямую), `off` (выключено). По умолчанию `stars` |
-| `PAYMENT_PROVIDER_TOKEN` | `x:TEST:123...` | Платёжный токен из @BotFather → Bot Settings → Payments. Нужен только для режима `provider` |
+| `PAYMENT_PROVIDER_TOKEN` | `381764678:TEST:100037` | Платёжный токен из @BotFather → Bot Settings → Payments (ЮKassa). Тестовый — с `:TEST:`, боевой — `x:LIVE:...`. Нужен только для режима `provider` |
+| `TELEGRAM_SEND_RECEIPT` / `TELEGRAM_RECEIPT_VAT_CODE` | `1` / `1` | Чек 54-ФЗ для режима `provider`: передавать ли чек в `provider_data` и ставка НДС (по умолчанию чек не передаётся) |
 | `YOOKASSA_SHOP_ID` / `YOOKASSA_SECRET_KEY` | `123456` / `test_...` | shopId и секретный ключ ЮKassa (Интеграция → Ключи API). Нужны только для режима `yookassa` |
 | `YOOKASSA_OAUTH_TOKEN` | `token_...` | Необязательно: OAuth-токен ЮKassa — бот сам зарегистрирует вебхук через API (без него вебхук добавляется в кабинете) |
 | `PUBLIC_BASE_URL` | `https://xxx.up.railway.app` | Публичный адрес сервиса — нужен ЮKassa для вебхука. На Railway подставляется автоматически |
@@ -96,11 +97,18 @@ Telegram-бот на **aiogram 3**, работающий на **Railway**.
 
 ### Вариант B. Карта в чате через BotFather (⚠️ не для цифровых товаров)
 
-1. @BotFather → ваш бот → **Bot Settings → Payments** → выбрать провайдера → для
-   теста указать данные тестового магазина.
-2. Скопировать полученный токен (`x:TEST:...` для теста, `x:LIVE:...` для боевого).
-3. Railway → Variables → `PAYMENTS_MODE=provider`, `PAYMENT_PROVIDER_TOKEN=x:TEST:...`.
-4. Проверить: `/panel_debug` → пункт «Оплата» → токен должен быть задан.
+Пошаговая инструкция: [TELEGRAM_PAYMENTS.md](TELEGRAM_PAYMENTS.md). Кратко:
+
+1. @BotFather → `/mybots` → ваш бот → **Bot Settings → Payments → ЮKassa**:
+   - **Connect ЮKassa Test** — сразу выдаёт тестовый токен (`381764678:TEST:…`);
+   - **Connect ЮKassa Live** — спросит `shopId` и `shopArticleId` (отправьте `0`) и выдаст
+     боевой токен `x:LIVE:…`. Для боевого режима попросите ЮKassa
+     (`ecommerce@yoomoney.ru`) перевести магазин на email-протокол.
+2. Railway → Variables: `PAYMENTS_MODE=provider`, `PAYMENT_PROVIDER_TOKEN=…`.
+3. Проверить: `/panel_debug` → пункт «Оплата» — режим, тип токена (тест/бой) и чек.
+4. Тестовая оплата: выберите тариф в «Тарифах» и оплатите картой
+   `5555 5555 5555 4477` (бот сам подскажет её, если токен тестовый).
+5. Чек 54-ФЗ: `TELEGRAM_SEND_RECEIPT=1` — только если фискализация подключена.
 
 ### Вариант C. ЮKassa напрямую (карта/СБП, чеки 54-ФЗ)
 
@@ -308,7 +316,14 @@ Telegram-бот на **aiogram 3**, работающий на **Railway**.
 
 ## ❓ Решение частых проблем
 
-- **Ключ не пришёл после оплаты (ЮKassa)**
+- **Ключ не пришёл после оплаты картой в Telegram (режим `provider`)**
+  - Проверьте `/payments` и логи Railway: заказ должен быть «✅ оплачен».
+  - Если заказ «⏳ pending» — Telegram не доставил `successful_payment`; платёж видно в
+    кабинете ЮKassa, а номер заказа — в `/payments`. Напишите в поддержку с этим номером.
+  - Если у вас боевой токен, но платежи не проходят — магазин не переведён на
+    email-протокол: напишите на `ecommerce@yoomoney.ru` (подробнее — `TELEGRAM_PAYMENTS.md`).
+
+- **Ключ не пришёл после оплаты (ЮKassa по ссылке)**
   - Проверьте `/panel_debug` → пункт «Оплата»: там указан адрес вебхука.
   - Адрес должен быть добавлен в ЮKassa → **Интеграция → HTTP-уведомления** с включённым
     событием `payment.succeeded` (по Basic-авторизации только через кабинет; автонастройка

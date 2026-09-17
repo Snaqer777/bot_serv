@@ -241,7 +241,15 @@ VPN_PORT = _int_env("VPN_PORT")
 PAYMENTS_MODE = (os.getenv("PAYMENTS_MODE") or "").strip().lower()
 
 # Токен платёжного провайдера из @BotFather (Bot Settings -> Payments).
+# Для ЮKassa тестовый токен выглядит как 381764678:TEST:..., боевой — x:LIVE:...
 PAYMENT_PROVIDER_TOKEN = (os.getenv("PAYMENT_PROVIDER_TOKEN") or "").strip()
+PROVIDER_TEST_MODE = ":TEST:" in PAYMENT_PROVIDER_TOKEN.upper()
+
+# Чек 54-ФЗ для оплаты картой внутри Telegram: 1 — бот передаёт данные чека в
+# provider_data (формат ЮKassa) и просит у покупателя email для отправки чека,
+# 0 (по умолчанию) — чек не передаём (безопасно, если фискализация не подключена).
+TELEGRAM_SEND_RECEIPT = (os.getenv("TELEGRAM_SEND_RECEIPT") or "").strip().lower() in ("1", "true", "yes", "on")
+TELEGRAM_RECEIPT_VAT_CODE = _int_env("TELEGRAM_RECEIPT_VAT_CODE", 1)
 
 # ЮKassa: Shop ID и секретный ключ (Интеграция -> Ключи API). test_* ключи = тестовый магазин.
 YOOKASSA_SHOP_ID = (os.getenv("YOOKASSA_SHOP_ID") or "").strip()
@@ -1833,6 +1841,37 @@ class YooKassaClient:
             return False
 
 
+def provider_mode_title() -> str:
+    """Описание платёжного токена BotFather: тестовый он или боевой."""
+    if not PAYMENT_PROVIDER_TOKEN:
+        return "токен не задан"
+    return "тестовый токен 🧪" if PROVIDER_TEST_MODE else "боевой токен"
+
+
+def telegram_receipt_provider_data(order: dict) -> str | None:
+    """
+    Данные чека 54-ФЗ для provider_data (формат ЮKassa).
+
+    Telegram передаёт их платёжному провайдеру вместе со счётом. Включается
+    переменной TELEGRAM_SEND_RECEIPT=1 — только если у магазина есть фискализация.
+    """
+    if not TELEGRAM_SEND_RECEIPT:
+        return None
+    receipt = {
+        "receipt": {
+            "items": [{
+                "description": f"VPN {order['tariff_name']} ({order['days']} дн.)"[:128],
+                "quantity": "1.00",
+                "amount": {"value": f"{order['amount_rub']:.2f}", "currency": "RUB"},
+                "vat_code": TELEGRAM_RECEIPT_VAT_CODE,
+                "payment_subject": "service",
+                "payment_mode": "full_payment",
+            }],
+        }
+    }
+    return json.dumps(receipt, ensure_ascii=False)
+
+
 def make_yookassa_client() -> YooKassaClient:
     return YooKassaClient(
         YOOKASSA_SHOP_ID,
@@ -2235,6 +2274,23 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
             label=f"{tariff['name']}"[:32],
             amount=order_amount(order),
         )
+
+        # Данные чека 54-ФЗ — только если включено (фискализация подключена)
+        provider_data = telegram_receipt_provider_data(order) if PAYMENTS_MODE == "provider" else None
+        if PAYMENTS_MODE == "provider" and PROVIDER_TEST_MODE:
+            # Тестовый токен: подсказываем тестовую карту, чтобы владелец проверил оплату
+            try:
+                await bot.send_message(
+                    chat_id,
+                    "🧪 <b>Тестовый платёжный режим.</b>\n"
+                    "Для оплаты используй тестовую карту <code>5555 5555 5555 4477</code> "
+                    "(срок — любой в будущем, CVC — любые 3 цифры). "
+                    "Реальные деньги не спишутся.",
+                    parse_mode="HTML",
+                )
+            except Exception as exc:
+                logger.warning("Не удалось отправить подсказку тестового режима: %s", exc)
+
         await bot.send_invoice(
             chat_id=chat_id,
             title=tariff["name"][:32],
@@ -2246,8 +2302,15 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
             currency=order["currency"],
             prices=[price],
             provider_token=provider_token,
+            provider_data=provider_data,
+            need_email=bool(provider_data),
+            send_email_to_provider=bool(provider_data),
         )
-        logger.info("Счёт выставлен: заказ %s (%s) для %s", order["id"], order["currency"], tg_id)
+        logger.info(
+            "Счёт выставлен: заказ %s (%s) для %s%s",
+            order["id"], order["currency"], tg_id,
+            " с чеком 54-ФЗ" if provider_data else "",
+        )
         return
 
     # ЮKassa: создаём платёж и отдаём ссылку на оплату
@@ -2981,7 +3044,8 @@ async def cmd_panel_debug(message: Message):
         lines.append("")
         lines.append(f"7. <b>Оплата:</b> {escape(payments_mode_title())} (<code>{PAYMENTS_MODE}</code>)")
         if PAYMENTS_MODE == "provider":
-            lines.append(f"   Provider token: {'задан ✅' if PAYMENT_PROVIDER_TOKEN else 'НЕ задан ❌'}")
+            lines.append(f"   Provider token: {'задан ✅' if PAYMENT_PROVIDER_TOKEN else 'НЕ задан ❌'} — {provider_mode_title()}")
+            lines.append("   Чек 54-ФЗ: " + ("передаётся в provider_data" if TELEGRAM_SEND_RECEIPT else "не передаётся (TELEGRAM_SEND_RECEIPT=0)"))
         elif PAYMENTS_MODE == "yookassa":
             lines.append(
                 f"   ЮKassa: shop <code>{escape(YOOKASSA_SHOP_ID or '—')}</code>, "
@@ -3106,7 +3170,8 @@ async def cb_tariffs(cb: CallbackQuery):
         text += ("💳 <i>Оплата картой или через СБП на защищённой странице ЮKassa. "
                  "Ключ придёт автоматически после оплаты.</i>")
     else:
-        text += "💳 <i>Оплата картой прямо в Telegram. Ключ придёт сразу после оплаты.</i>"
+        text += ("💳 <i>Оплата картой прямо в Telegram — без перехода на другие сайты. "
+                 "Ключ придёт сразу после оплаты.</i>")
 
     await cb.message.edit_text(text, reply_markup=tariffs_kb(), parse_mode="HTML")
 
@@ -3282,7 +3347,9 @@ async def cmd_payments(message: Message):
     ]
 
     if PAYMENTS_MODE == "provider":
-        lines.append(f"• Provider token: {'задан ✅' if PAYMENT_PROVIDER_TOKEN else 'НЕ задан ❌'}")
+        lines.append(f"• Provider token: {'задан ✅' if PAYMENT_PROVIDER_TOKEN else 'НЕ задан ❌'} "
+                     f"({provider_mode_title()})")
+        lines.append(f"• Чек 54-ФЗ: {'передаётся' if TELEGRAM_SEND_RECEIPT else 'не передаётся'}")
     if PAYMENTS_MODE == "yookassa":
         lines.append(f"• Shop ID: <code>{escape(YOOKASSA_SHOP_ID or 'не задан')}</code>"
                      f" {'(тестовый магазин 🧪)' if YOOKASSA_TEST else ''}")
