@@ -15,12 +15,13 @@ import time
 import uuid
 
 from contextlib import asynccontextmanager
-from datetime import timezone
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html import escape
 from urllib.parse import quote, urlencode, urlsplit
 
 import aiohttp
+from aiohttp import web
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
@@ -30,7 +31,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
 )
 
 # =========================
@@ -220,6 +223,89 @@ if XUI_CLIENT_GROUP:
 # По умолчанию адрес сервера в ключе = хост из XUI_URL, порт = порт inbound.
 VPN_HOST = (os.getenv("VPN_HOST") or "").strip()
 VPN_PORT = _int_env("VPN_PORT")
+
+# =========================
+# ОПЛАТА ПОДПИСОК
+# =========================
+# Режимы (PAYMENTS_MODE):
+#   • stars     — Telegram Stars (XTR). Штатный способ оплаты цифровых товаров
+#                 внутри Telegram: не нужны ни юрлицо, ни платёжный шлюз.
+#   • provider  — Telegram Payments через платёжный токен BotFather (ЮKassa и др.),
+#                 оплата картой в рублях прямо в чате.
+#   • yookassa  — прямая интеграция с API ЮKassa: бот создаёт платёж и присылает
+#                 ссылку на оплату (карта, СБП), результат приходит вебхуком.
+#   • off       — приём оплаты выключен (кнопки тарифов показывают заглушку).
+# Если PAYMENTS_MODE не задан: provider → при наличии PAYMENT_PROVIDER_TOKEN,
+# иначе yookassa → при наличии ключей ЮKassa, иначе stars.
+
+PAYMENTS_MODE = (os.getenv("PAYMENTS_MODE") or "").strip().lower()
+
+# Токен платёжного провайдера из @BotFather (Bot Settings -> Payments).
+PAYMENT_PROVIDER_TOKEN = (os.getenv("PAYMENT_PROVIDER_TOKEN") or "").strip()
+
+# ЮKassa: Shop ID и секретный ключ (Интеграция -> Ключи API). test_* ключи = тестовый магазин.
+YOOKASSA_SHOP_ID = (os.getenv("YOOKASSA_SHOP_ID") or "").strip()
+YOOKASSA_SECRET_KEY = (os.getenv("YOOKASSA_SECRET_KEY") or "").strip()
+YOOKASSA_API_URL = (os.getenv("YOOKASSA_API_URL") or "https://api.yookassa.ru/v3").strip().rstrip("/")
+YOOKASSA_TEST = (os.getenv("YOOKASSA_TEST") or "").strip().lower() in ("1", "true", "yes", "on") or \
+    YOOKASSA_SECRET_KEY.startswith("test_")
+
+# Публичный адрес сервиса (нужен для вебхука ЮKassa). Railway подставляет его сам.
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+if not PUBLIC_BASE_URL:
+    _railway_domain = (os.getenv("RAILWAY_PUBLIC_DOMAIN") or "").strip()
+    if _railway_domain:
+        PUBLIC_BASE_URL = f"https://{_railway_domain}"
+
+# Порт веб-сервера (вебхуки ЮKassa). Railway передаёт PORT автоматически.
+WEB_PORT = _int_env("PORT", 8080)
+
+# Часовой пояс для дат в сообщениях бота (срок в панели хранится в UTC-миллисекундах).
+BOT_TIMEZONE = (os.getenv("BOT_TIMEZONE") or "Europe/Moscow").strip()
+try:
+    from zoneinfo import ZoneInfo
+
+    LOCAL_TZ = ZoneInfo(BOT_TIMEZONE)
+except Exception:   # нет базы часовых поясов — работаем в UTC
+    LOCAL_TZ = timezone.utc
+
+# Файл с журналом заказов (идемпотентность, статистика).
+# На Railway без volume файл живёт до передеплоя: заказы также пишутся в 3x-ui.
+PAYMENT_STORE_FILE = (os.getenv("PAYMENT_STORE_FILE") or "data/payments.json").strip()
+
+# Сколько рублей в одной звезде при пересчёте цены тарифа в Stars (можно переопределить
+# цену в звёздах для каждого тарифа: STARS_BASIC, STARS_STANDARD, STARS_PREMIUM).
+STARS_RUB_RATE = float((os.getenv("STARS_RUB_RATE") or "1.6").replace(",", "."))
+
+# Ставка НДС для чеков ЮKassa (54-ФЗ): 1..6 или "none" — без НДС.
+YOOKASSA_VAT_CODE = _int_env("YOOKASSA_VAT_CODE", 1)
+
+if not PAYMENTS_MODE:
+    if PAYMENT_PROVIDER_TOKEN:
+        PAYMENTS_MODE = "provider"
+    elif YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
+        PAYMENTS_MODE = "yookassa"
+    else:
+        PAYMENTS_MODE = "stars"
+
+if PAYMENTS_MODE not in ("stars", "provider", "yookassa", "off"):
+    logger.warning("Неизвестный PAYMENTS_MODE=%r — платежи выключены.", PAYMENTS_MODE)
+    PAYMENTS_MODE = "off"
+
+if PAYMENTS_MODE == "provider" and not PAYMENT_PROVIDER_TOKEN:
+    logger.warning(
+        "PAYMENTS_MODE=provider, но PAYMENT_PROVIDER_TOKEN не задан — оплата картой работать не будет. "
+        "Возьмите токен в @BotFather -> Bot Settings -> Payments."
+    )
+if PAYMENTS_MODE == "yookassa" and not (YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY):
+    logger.warning(
+        "PAYMENTS_MODE=yookassa, но не заданы YOOKASSA_SHOP_ID / YOOKASSA_SECRET_KEY — платежи не создадутся."
+    )
+if PAYMENTS_MODE == "yookassa" and not PUBLIC_BASE_URL:
+    logger.warning(
+        "Не задан PUBLIC_BASE_URL (публичный адрес сервиса) — вебхук ЮKassa не будет зарегистрирован, "
+        "оплата будет подтверждаться только кнопкой «Проверить оплату»."
+    )
 
 # Прокси для запросов к панели (если хостер блокирует IP Railway).
 # Формат: http://user:pass@host:port
@@ -1432,6 +1518,781 @@ async def delete_test_key(telegram_id: int) -> bool:
         return await client.delete_client(inbound_id, target_email, existing.get("id"))
 
 
+# =========================
+# ОПЛАТА: ЖУРНАЛ ЗАКАЗОВ, ЮKASSA, ВЫДАЧА ПОДПИСКИ
+# =========================
+
+class PaymentError(Exception):
+    """Ошибка оплаты, текст которой можно показать пользователю."""
+
+
+class PaymentStore:
+    """
+    Журнал заказов: идемпотентность (повторный вебхук/платёж не выдаёт ключ дважды)
+    и статистика для админа.
+
+    Пишется в JSON-файл (PAYMENT_STORE_FILE) атомарно; если файл недоступен
+    (например, эфемерная файловая система Railway) — работаем в памяти и
+    дополнительно помечаем факт оплаты в комментарии клиента в панели.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.orders: dict[str, dict] = {}
+        self._lock = asyncio.Lock()
+        self._loaded = False
+
+    # --- файл ---
+
+    def load(self) -> None:
+        """Читает журнал с диска (один раз при старте)."""
+        if self._loaded:
+            return
+        self._loaded = True
+        if not self.path:
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            orders = data.get("orders") if isinstance(data, dict) else None
+            if isinstance(orders, dict):
+                self.orders = {str(k): v for k, v in orders.items() if isinstance(v, dict)}
+                logger.info("Журнал оплат загружен: %s заказов из %s", len(self.orders), self.path)
+        except FileNotFoundError:
+            logger.info("Журнал оплат пуст — создам %s при первой оплате.", self.path)
+        except Exception as exc:
+            logger.warning("Не удалось прочитать журнал оплат (%s): %s", self.path, exc)
+
+    def _write(self) -> None:
+        if not self.path:
+            return
+        try:
+            directory = os.path.dirname(self.path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            tmp = f"{self.path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "orders": self.orders}, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)   # атомарная замена: файл не побьётся при падении
+        except Exception as exc:
+            logger.warning("Не удалось сохранить журнал оплат (%s): %s", self.path, exc)
+
+    # --- заказы ---
+
+    async def create(self, order: dict) -> dict:
+        async with self._lock:
+            self.load()
+            self.orders[order["id"]] = order
+            self._write()
+        return order
+
+    async def get(self, order_id: str) -> dict | None:
+        self.load()
+        return self.orders.get(order_id)
+
+    async def update(self, order_id: str, **fields) -> dict | None:
+        async with self._lock:
+            self.load()
+            order = self.orders.get(order_id)
+            if order is None:
+                return None
+            order.update(fields)
+            self._write()
+            return order
+
+    async def find_by_charge(self, charge_id: str) -> dict | None:
+        """Заказ, который уже был активирован этим платежом (защита от дублей)."""
+        self.load()
+        if not charge_id:
+            return None
+        for order in self.orders.values():
+            if order.get("charge_id") == charge_id and order.get("status") == "paid":
+                return order
+        return None
+
+    def stats(self) -> dict:
+        """Сводка: сколько оплат, выручка в рублях и звёздах, разбивка по тарифам."""
+        self.load()
+        paid = [o for o in self.orders.values() if o.get("status") == "paid"]
+        by_tariff: dict[str, int] = {}
+        for order in paid:
+            by_tariff[order.get("tariff", "?")] = by_tariff.get(order.get("tariff", "?"), 0) + 1
+        return {
+            "orders_total": len(self.orders),
+            "paid_count": len(paid),
+            "rub": sum(int(o.get("amount_rub") or 0) for o in paid if o.get("currency") == "RUB"),
+            "stars": sum(int(o.get("amount_stars") or 0) for o in paid if o.get("currency") == "XTR"),
+            "by_tariff": by_tariff,
+        }
+
+    def recent(self, limit: int = 10) -> list[dict]:
+        self.load()
+        orders = sorted(
+            self.orders.values(),
+            key=lambda o: o.get("paid_at") or o.get("created_at") or 0,
+            reverse=True,
+        )
+        return orders[:limit]
+
+
+payment_store = PaymentStore(PAYMENT_STORE_FILE)
+
+
+def payments_enabled() -> bool:
+    """Включён ли приём оплаты (режим off выключает кнопки покупки)."""
+    return PAYMENTS_MODE != "off"
+
+
+def payments_mode_title() -> str:
+    return {
+        "stars": "Telegram Stars ⭐️",
+        "provider": "оплата картой в Telegram (BotFather provider token)",
+        "yookassa": "ЮKassa (карта / СБП по ссылке)",
+        "off": "выключена",
+    }.get(PAYMENTS_MODE, PAYMENTS_MODE)
+
+
+def format_date(timestamp_ms: int) -> str:
+    """Дата окончания подписки в часовом поясе бота."""
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=LOCAL_TZ).strftime("%d.%m.%Y")
+
+
+def tariff_price_label(tariff: dict) -> str:
+    """Цена тарифа в валюте текущего режима оплаты."""
+    if tariff["price"] <= 0:
+        return "Бесплатно"
+    if PAYMENTS_MODE in ("stars",):
+        return f"{tariff.get('stars', 0)} ⭐️"
+    return f"{tariff['price']} ₽"
+
+
+def new_order(tg_id: int, tariff_key: str) -> dict:
+    """Создаёт заказ со статусом pending."""
+    tariff = TARIFFS[tariff_key]
+    now = int(time.time())
+    order = {
+        "id": f"{tariff_key}-{tg_id}-{now}-{secrets.token_hex(3)}",
+        "tg_id": tg_id,
+        "tariff": tariff_key,
+        "tariff_name": tariff["name"],
+        "days": tariff["days"],
+        "traffic_gb": tariff["traffic_gb"],
+        "ip_limit": tariff["ip_limit"],
+        "amount_rub": tariff["price"],
+        "amount_stars": tariff.get("stars", 0),
+        "currency": "XTR" if PAYMENTS_MODE == "stars" else "RUB",
+        "mode": PAYMENTS_MODE,
+        "status": "pending",
+        "created_at": now,
+    }
+    return order
+
+
+def order_amount(order: dict) -> int:
+    """Сумма заказа в минимальных единицах: копейки для RUB, звёзды для XTR."""
+    if order["currency"] == "XTR":
+        return int(order["amount_stars"])
+    return int(order["amount_rub"]) * 100
+
+
+# --- клиент ЮKassa ---
+
+class YooKassaClient:
+    """Минимальный клиент API ЮKassa (https://yookassa.ru/developers/api)."""
+
+    def __init__(self, shop_id: str, secret_key: str, api_url: str = YOOKASSA_API_URL):
+        self.shop_id = shop_id
+        self.secret_key = secret_key
+        self.api_url = api_url.rstrip("/")
+
+    def _auth(self) -> aiohttp.BasicAuth:
+        return aiohttp.BasicAuth(self.shop_id, self.secret_key)
+
+    async def _request(self, method: str, path: str, **kwargs) -> dict:
+        headers = {"Content-Type": "application/json", **(kwargs.pop("headers", {}))}
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as session:
+                async with session.request(
+                    method,
+                    f"{self.api_url}{path}",
+                    auth=self._auth(),
+                    headers=headers,
+                    **kwargs,
+                ) as resp:
+                    raw = await resp.text()
+                    status = resp.status
+        except Exception as exc:
+            raise PaymentError(
+                f"❌ ЮKassa недоступна: <code>{escape(str(exc))}</code>\n"
+                "Проверь YOOKASSA_API_URL и доступность api.yookassa.ru из Railway."
+            ) from exc
+
+        if status >= 400:
+            try:
+                data = json.loads(raw)
+                msg = data.get("description") or data.get("code") or raw[:200]
+            except ValueError:
+                msg = raw[:200]
+            raise PaymentError(
+                f"❌ ЮKassa вернула ошибку HTTP {status}: <code>{escape(str(msg))}</code>\n\n"
+                "Проверь <b>YOOKASSA_SHOP_ID</b> и <b>YOOKASSA_SECRET_KEY</b> "
+                "(Интеграция → Ключи API в личном кабинете ЮKassa)."
+            )
+        try:
+            return json.loads(raw)
+        except ValueError as exc:
+            raise PaymentError(f"❌ ЮKassa вернула не JSON: <code>{escape(_snip(raw, 200))}</code>") from exc
+
+    async def create_payment(self, order: dict) -> dict:
+        """
+        Создаёт платёж и возвращает ответ ЮKassa (в нём confirmation.confirmation_url).
+
+        Ключ идемпотентности = id заказа: повторный запрос не создаст второй платёж.
+        """
+        payload = {
+            "amount": {"value": f"{order['amount_rub']:.2f}", "currency": "RUB"},
+            "capture": True,
+            "confirmation": {"type": "redirect", "return_url": f"{PUBLIC_BASE_URL or 'https://t.me'}"},
+            "description": f"VPN «{order['tariff_name']}» для Telegram {order['tg_id']}",
+            "metadata": {"order_id": order["id"], "tg_id": str(order["tg_id"]), "tariff": order["tariff"]},
+        }
+        # Чек по 54-ФЗ (нужен, если в магазине включена фискализация)
+        if YOOKASSA_VAT_CODE > 0:
+            payload["receipt"] = {
+                "customer": {"account": str(order["tg_id"])},
+                "items": [{
+                    "description": f"VPN {order['tariff_name']} ({order['days']} дн.)"[:128],
+                    "quantity": "1.00",
+                    "amount": {"value": f"{order['amount_rub']:.2f}", "currency": "RUB"},
+                    "vat_code": YOOKASSA_VAT_CODE,
+                    "payment_subject": "service",
+                    "payment_mode": "full_payment",
+                }],
+            }
+        return await self._request(
+            "POST", "/payments", json=payload, headers={"Idempotence-Key": order["id"]}
+        )
+
+    async def get_payment(self, payment_id: str) -> dict:
+        return await self._request("GET", f"/payments/{quote(payment_id, safe='')}")
+
+    async def list_webhooks(self) -> list:
+        data = await self._request("GET", "/webhooks")
+        return data.get("items") if isinstance(data, dict) else []
+
+    async def ensure_webhook(self, url: str) -> bool:
+        """Регистрирует вебхук payment.succeeded, если его ещё нет."""
+        try:
+            hooks = await self.list_webhooks()
+        except PaymentError as exc:
+            logger.warning("Не удалось получить список вебхуков ЮKassa: %s", exc)
+            hooks = []
+        for hook in hooks or []:
+            if hook.get("event") == "payment.succeeded" and hook.get("url") == url:
+                logger.info("Вебхук ЮKassa уже настроен: %s", url)
+                return True
+        try:
+            await self._request("POST", "/webhooks", json={"event": "payment.succeeded", "url": url})
+            logger.info("Вебхук ЮKassa зарегистрирован: %s", url)
+            return True
+        except PaymentError as exc:
+            logger.warning("Не удалось зарегистрировать вебхук ЮKassa: %s", exc)
+            return False
+
+
+def make_yookassa_client() -> YooKassaClient:
+    return YooKassaClient(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
+
+
+# --- выдача подписки в 3x-ui ---
+
+def _paid_client_payload(
+    telegram_id: int,
+    client_uuid: str,
+    now_ms: int,
+    inbound: dict,
+    tariff: dict,
+    expires_ms: int,
+    comment: str,
+    sub_id: str = "",
+    group_name: str = "",
+) -> dict:
+    """Payload платного клиента: лимиты и срок берутся из тарифа."""
+    stream = as_dict(inbound.get("streamSettings"))
+    network = stream.get("network", "tcp")
+    security = stream.get("security", "reality")
+    flow = "xtls-rprx-vision" if (network == "tcp" and security in ("reality", "tls")) else ""
+
+    payload = {
+        "id": client_uuid,
+        "email": f"tg-paid-{telegram_id}",
+        "flow": flow,
+        "enable": True,
+        "limitIp": int(tariff["ip_limit"]),
+        "totalGB": int(tariff["traffic_gb"]) * (1024 ** 3),   # 0 = безлимит
+        "expiryTime": int(expires_ms),
+        "tgId": int(telegram_id),
+        "subId": sub_id or secrets.token_hex(8),
+        "reset": 0,
+        "comment": comment[:120],
+    }
+    if XUI_CLIENT_GROUP and group_name:
+        payload["group"] = group_name
+    return payload
+
+
+async def activate_paid_subscription(
+    telegram_id: int,
+    tariff_key: str,
+    *,
+    order_id: str,
+    payment_ref: str,
+) -> dict:
+    """
+    Создаёт или продлевает платного клиента в 3x-ui по оплаченному заказу.
+
+    Идемпотентно: если в комментарии клиента уже стоит этот платёж, повторная
+    выдача не происходит (защита от дублей вебхука и перезапуска бота).
+    Возвращает словарь с ключом, сроком и деталями подписки.
+    """
+    tariff = TARIFFS[tariff_key]
+    target_email = f"tg-paid-{telegram_id}"
+    now_ms = int(time.time() * 1000)
+    comment = f"{tariff_key} до {format_date(now_ms + tariff['days'] * 86400 * 1000)} | {payment_ref[:40]}"
+
+    async with XUIClient() as client:
+        inbound, auto_picked = await client.find_suitable_inbound(XUI_INBOUND_ID)
+        inbound_id = inbound.get("id")
+        params = extract_vless_params(inbound)
+
+        settings = as_dict(inbound.get("settings"))
+        clients = [c for c in (settings.get("clients") or []) if isinstance(c, dict)]
+        existing = next((c for c in clients if str(c.get("email")) == target_email), None)
+
+        # Уже выдан по этому платежу? (журнал мог не сохраниться — смотрим в панель)
+        if existing is not None and payment_ref and payment_ref[:40] in str(existing.get("comment") or ""):
+            logger.info("Подписка %s уже выдана по платежу %s — повторно не продлеваю.", target_email, payment_ref)
+            return {
+                "email": target_email,
+                "already": True,
+                "expiry_ms": int(existing.get("expiryTime") or 0),
+                "link": build_vless_link(existing, inbound, params),
+                "sub_link": f"{XUI_URL}/sub/{existing['subId']}" if existing.get("subId") else None,
+                "tariff": tariff,
+                "inbound_id": inbound_id,
+                "auto_picked": auto_picked,
+                "group_note": "",
+            }
+
+        group_name, group_state = await client.resolve_client_group()
+
+        # Продление считается от текущего срока, если он ещё не истёк
+        base_ms = now_ms
+        if existing is not None and bool(existing.get("enable", True)):
+            existing_expiry = int(existing.get("expiryTime") or 0)
+            if existing_expiry > now_ms:
+                base_ms = existing_expiry
+        expires_ms = base_ms + tariff["days"] * 86400 * 1000
+
+        payload = _paid_client_payload(
+            telegram_id,
+            (existing or {}).get("id") or str(uuid.uuid4()),
+            now_ms,
+            inbound,
+            tariff,
+            expires_ms,
+            comment,
+            sub_id=(existing or {}).get("subId") or "",
+            group_name=group_name or "",
+        )
+
+        if existing is not None:
+            await client.update_client(inbound_id, payload)
+            status = "extended"
+        else:
+            await client.add_client(inbound_id, payload)
+            status = "created"
+
+        group_note = ""
+        if group_state == "exists" or group_state == "new":
+            group_note = _group_note(
+                await client.add_clients_to_group([target_email], group_name, existed=(group_state == "exists")),
+                group_name,
+            )
+
+        return {
+            "email": target_email,
+            "already": False,
+            "status": status,
+            "expiry_ms": expires_ms,
+            "link": build_vless_link(payload, inbound, params),
+            "sub_link": f"{XUI_URL}/sub/{payload['subId']}" if payload.get("subId") else None,
+            "tariff": tariff,
+            "inbound_id": inbound_id,
+            "auto_picked": auto_picked,
+            "group_note": group_note,
+        }
+
+
+async def get_paid_subscription(telegram_id: int) -> dict | None:
+    """Читает текущую подписку пользователя из панели (срок, трафик, статус)."""
+    target_email = f"tg-paid-{telegram_id}"
+    async with XUIClient() as client:
+        inbounds = await client.get_inbounds()
+        for inbound in inbounds:
+            settings = as_dict(inbound.get("settings"))
+            for candidate in settings.get("clients") or []:
+                if not isinstance(candidate, dict) or str(candidate.get("email")) != target_email:
+                    continue
+                stats = {}
+                for stat in inbound.get("clientStats") or []:
+                    if isinstance(stat, dict) and str(stat.get("email")) == target_email:
+                        stats = stat
+                        break
+                used = int(stats.get("up") or 0) + int(stats.get("down") or 0)
+                return {
+                    "client": candidate,
+                    "inbound": inbound,
+                    "used_bytes": used,
+                    "total_bytes": int(candidate.get("totalGB") or 0),
+                    "expiry_ms": int(candidate.get("expiryTime") or 0),
+                    "enable": bool(stats.get("enable", candidate.get("enable", True))),
+                }
+    return None
+
+
+def subscription_status_text(sub: dict | None) -> str:
+    """Человеческое описание подписки для /profile."""
+    if not sub:
+        return "❌ Активной подписки нет."
+
+    expiry_ms = sub["expiry_ms"]
+    enabled = sub["enable"]
+    expired = expiry_ms > 0 and expiry_ms <= int(time.time() * 1000)
+    if expired:
+        state = "⌛️ Истекла"
+    elif not enabled:
+        state = "⛔️ Отключена администратором"
+    else:
+        state = "✅ Активна"
+
+    lines = [f"• Статус: <b>{state}</b>"]
+    if expiry_ms > 0:
+        left_days = max(0, (expiry_ms - int(time.time() * 1000)) // 86_400_000)
+        date = format_date(expiry_ms)
+        lines.append(f"• Действует до: <b>{date}</b> (осталось {left_days} дн.)")
+
+    total = sub["total_bytes"]
+    used = sub["used_bytes"]
+    if total > 0:
+        lines.append(f"• Трафик: <b>{_human_bytes(used)}</b> из {_human_bytes(total)}")
+    else:
+        lines.append(f"• Трафик: <b>{_human_bytes(used)}</b> (безлимит)")
+    return "\n".join(lines)
+
+
+# --- запуск оплаты ---
+
+def order_paid_message(order: dict, info: dict) -> str:
+    """Сообщение пользователю после успешной оплаты."""
+    tariff = info["tariff"]
+    expiry = format_date(info["expiry_ms"])
+    title = (
+        "♻️ <b>Подписка продлена!</b>"
+        if info.get("status") == "extended"
+        else "🎉 <b>Оплата получена, подписка активирована!</b>"
+    )
+    if info.get("already"):
+        title = "✅ <b>Этот платёж уже учтён — подписка активна.</b>"
+
+    return (
+        f"{title}\n\n"
+        f"📦 <b>Тариф:</b> {tariff['name']}\n"
+        f"⏳ <b>Действует до:</b> {expiry}\n"
+        f"📊 <b>Трафик:</b> {tariff['traffic']}\n"
+        f"📱 <b>Устройств:</b> {tariff['ips']}\n"
+        f"🌍 <b>Локации:</b> {tariff['locations']}\n\n"
+        f"🔑 <b>Твой ключ (нажми, чтобы скопировать):</b>\n<code>{escape(info['link'])}</code>\n"
+        + (f"\n🌐 <b>Ссылка подписки:</b> <code>{escape(info['sub_link'])}</code>\n" if info.get("sub_link") else "")
+        + "\n<b>Как подключиться:</b> установи приложение (Happ, v2rayNG, Streisand, v2rayN) → "
+        "«Импорт из буфера обмена» → Подключить."
+        + (info.get("group_note") or "")
+    )
+
+
+async def notify_payment_success(order: dict, info: dict) -> None:
+    """Отправляет покупателю ключ, а админу — уведомление о продаже."""
+    try:
+        await bot.send_message(
+            order["tg_id"],
+            order_paid_message(order, info),
+            parse_mode="HTML",
+            reply_markup=key_actions_kb(),
+        )
+    except Exception as exc:
+        logger.error("Не удалось отправить ключ пользователю %s: %s", order["tg_id"], exc)
+
+    if ADMIN_ID > 0 and ADMIN_ID != order["tg_id"]:
+        try:
+            amount = (
+                f"{order['amount_stars']} ⭐️" if order["currency"] == "XTR" else f"{order['amount_rub']} ₽"
+            )
+            await bot.send_message(
+                ADMIN_ID,
+                f"💰 <b>Новая оплата:</b> {amount}\n"
+                f"• Тариф: {order['tariff_name']}\n"
+                f"• Пользователь: <code>{order['tg_id']}</code>\n"
+                f"• Заказ: <code>{order['id']}</code>\n"
+                f"• Действует до: <code>{format_date(info['expiry_ms'])}</code>",
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.warning("Не удалось уведомить админа об оплате: %s", exc)
+
+
+async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str | None = None) -> dict:
+    """
+    Помечает заказ оплаченным и выдаёт подписку. Повторные вызовы безопасны:
+    ключ выдаётся один раз, но если выдача упала (панель недоступна) — попробует снова.
+    """
+    existing = await payment_store.find_by_charge(charge_id) if charge_id else None
+    if existing is not None and existing["id"] != order["id"]:
+        logger.warning("Платёж %s уже привязан к заказу %s — игнорирую дубль.", charge_id, existing["id"])
+        return {"duplicate": True, "order": existing}
+
+    order = await payment_store.update(
+        order["id"],
+        status="paid",
+        paid_at=int(time.time()),
+        charge_id=charge_id,
+        provider_charge_id=provider_charge_id,
+    ) or order
+
+    if order.get("provisioned"):
+        logger.info("Заказ %s уже выдан (provisioned) — повторная выдача не нужна.", order["id"])
+        return {"already_provisioned": True, "order": order}
+
+    try:
+        info = await activate_paid_subscription(
+            order["tg_id"],
+            order["tariff"],
+            order_id=order["id"],
+            payment_ref=charge_id or order["id"],
+        )
+    except Exception as exc:
+        logger.error("Не удалось выдать подписку по заказу %s: %s", order["id"], exc)
+        try:
+            await bot.send_message(
+                order["tg_id"],
+                "✅ Оплата получена, но выдача ключа задержалась — уже разбираюсь.\n"
+                f"Напиши в поддержку и укажи номер заказа: <code>{order['id']}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        if ADMIN_ID > 0:
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ <b>Оплата есть, ключ не выдан!</b>\n"
+                    f"• Заказ: <code>{order['id']}</code>\n"
+                    f"• Пользователь: <code>{order['tg_id']}</code>\n"
+                    f"• Ошибка: <code>{escape(str(exc)[:300])}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        raise
+
+    await payment_store.update(order["id"], provisioned=True, expiry_ms=info["expiry_ms"])
+    if not order.get("notified"):
+        await notify_payment_success(order, info)
+        await payment_store.update(order["id"], notified=True)
+    return {"order": order, "info": info}
+
+
+async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
+    """
+    Начинает оплату выбранного тарифа в текущем режиме PAYMENTS_MODE.
+
+    stars/provider — нативный счёт Telegram; yookassa — платёж в API и ссылка на оплату.
+    """
+    tariff = TARIFFS[tariff_key]
+    if tariff["price"] <= 0:
+        raise PaymentError("Этот тариф бесплатный — просто получи тестовый ключ командой /test_vpn.")
+
+    if not payments_enabled():
+        raise PaymentError(
+            "💳 <b>Приём оплаты пока не настроен.</b>\n\n"
+            "Администратору: задай <b>PAYMENTS_MODE</b> (stars / provider / yookassa) "
+            "в Railway → Variables. Пошаговая инструкция — в README и команде /payments."
+        )
+
+    order = await payment_store.create(new_order(tg_id, tariff_key))
+
+    if PAYMENTS_MODE in ("stars", "provider"):
+        provider_token = PAYMENT_PROVIDER_TOKEN if PAYMENTS_MODE == "provider" else None
+        if PAYMENTS_MODE == "provider" and not provider_token:
+            raise PaymentError(
+                "⚠️ Оплата картой не настроена: не задан <b>PAYMENT_PROVIDER_TOKEN</b>.\n\n"
+                "Получи токен в @BotFather → Bot Settings → Payments и добавь его в Railway."
+            )
+        price = LabeledPrice(
+            label=f"{tariff['name']}"[:32],
+            amount=order_amount(order),
+        )
+        await bot.send_invoice(
+            chat_id=chat_id,
+            title=tariff["name"][:32],
+            description=(
+                f"VPN доступ: {tariff['traffic']}, {tariff['ips']} устройств, "
+                f"{tariff['days']} дней. Ключ придёт сразу после оплаты."
+            )[:255],
+            payload=order["id"],
+            currency=order["currency"],
+            prices=[price],
+            provider_token=provider_token,
+        )
+        logger.info("Счёт выставлен: заказ %s (%s) для %s", order["id"], order["currency"], tg_id)
+        return
+
+    # ЮKassa: создаём платёж и отдаём ссылку на оплату
+    client = make_yookassa_client()
+    payment = await client.create_payment(order)
+    payment_id = payment.get("id")
+    confirmation_url = (payment.get("confirmation") or {}).get("confirmation_url")
+    if not confirmation_url:
+        raise PaymentError(
+            "❌ ЮKassa не вернула ссылку на оплату. "
+            f"Ответ: <code>{escape(_snip(json.dumps(payment, ensure_ascii=False), 200))}</code>"
+        )
+
+    await payment_store.update(order["id"], payment_id=payment_id, payment_url=confirmation_url)
+    test_note = "\n🧪 <i>Тестовый магазин ЮKassa — оплата тестовой картой.</i>" if YOOKASSA_TEST else ""
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 Оплатить {tariff['price']} ₽", url=confirmation_url)],
+            [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"checkpay_{order['id']}")],
+            [InlineKeyboardButton(text="◀️ К тарифам", callback_data="tariffs")],
+        ]
+    )
+    await bot.send_message(
+        chat_id,
+        f"💳 <b>Оплата тарифа {tariff['name']}</b>\n\n"
+        f"• Сумма: <b>{tariff['price']} ₽</b>\n"
+        f"• Срок: <b>{tariff['days']} дней</b>\n"
+        f"• Трафик: <b>{tariff['traffic']}</b>\n"
+        f"• Устройств: <b>{tariff['ips']}</b>\n\n"
+        "Нажми «Оплатить» — откроется страница ЮKassa (карта, СБП и другие способы). "
+        "Ключ придёт автоматически после успешной оплаты.\n"
+        f"<i>Номер заказа: <code>{order['id']}</code></i>{test_note}",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    logger.info("Платёж ЮKassa создан: заказ %s, payment %s", order["id"], payment_id)
+
+
+def make_webhook_app() -> web.Application:
+    """HTTP-сервер для вебхуков ЮKassa (запускается вместе с ботом)."""
+
+    async def healthz(request: web.Request) -> web.Response:
+        return web.json_response({"ok": True, "mode": PAYMENTS_MODE})
+
+    async def yookassa_webhook(request: web.Request) -> web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "bad json"}, status=400)
+
+        event = str(data.get("event") or "")
+        obj = data.get("object") or {}
+        payment_id = str(obj.get("id") or "")
+        logger.info("Вебхук ЮKassa: event=%s payment=%s", event, payment_id)
+
+        if event != "payment.succeeded":
+            return web.json_response({"ok": True, "ignored": event})
+
+        if not payment_id:
+            return web.json_response({"ok": False, "error": "no payment id"}, status=400)
+
+        # Телу уведомления не верим: переспрашиваем платёж в API ЮKassa
+        try:
+            client = make_yookassa_client()
+            payment = await client.get_payment(payment_id)
+        except PaymentError as exc:
+            logger.error("Не удалось проверить платёж %s: %s", payment_id, exc)
+            return web.json_response({"ok": False, "error": "verify failed"}, status=503)
+
+        if payment.get("status") != "succeeded" or not payment.get("paid"):
+            logger.warning("Платёж %s ещё не succeeded (%s) — пропускаю.", payment_id, payment.get("status"))
+            return web.json_response({"ok": True, "skipped": payment.get("status")})
+
+        metadata = payment.get("metadata") or {}
+        order_id = str(metadata.get("order_id") or "")
+        order = await payment_store.get(order_id) if order_id else None
+        if order is None:
+            logger.error("Вебхук по неизвестному заказу %r (payment %s)", order_id, payment_id)
+            return web.json_response({"ok": True, "unknown_order": order_id})
+
+        paid_value = str((payment.get("amount") or {}).get("value") or "")
+        if paid_value and order["currency"] == "RUB":
+            try:
+                paid_kop = round(float(paid_value) * 100)
+            except ValueError:
+                paid_kop = -1
+            if paid_kop != order_amount(order):
+                logger.error(
+                    "Сумма платежа %s не совпадает с заказом %s: %.2f vs %s ₽",
+                    payment_id, order["id"], paid_kop / 100, order["amount_rub"],
+                )
+                return web.json_response({"ok": True, "amount_mismatch": True})
+
+        try:
+            await fulfill_order(order, charge_id=payment_id)
+        except Exception as exc:
+            logger.error("Выдача по заказу %s не удалась: %s — ЮKassa повторит вебхук.", order["id"], exc)
+            return web.json_response({"ok": False, "error": "fulfill failed"}, status=503)
+
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_get("/healthz", healthz)
+    app.router.add_post("/yookassa/webhook", yookassa_webhook)
+    app.router.add_post("/payments/yookassa", yookassa_webhook)   # алиас для удобства
+    app.router.add_get("/", healthz)
+    return app
+
+
+async def run_webhook_server() -> web.AppRunner | None:
+    """
+    Поднимает HTTP-сервер бота: /healthz всегда, /yookassa/webhook — для оплаты.
+
+    Сервер слушает PORT и нужен Railway, чтобы контейнер считался живым,
+    а в режиме yookassa — ещё и для приёма уведомлений об оплате.
+    """
+    runner = web.AppRunner(make_webhook_app())
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", WEB_PORT)
+    await site.start()
+    logger.info("Веб-сервер бота запущен на 0.0.0.0:%s (health: /healthz)", WEB_PORT)
+
+    if PAYMENTS_MODE != "yookassa":
+        logger.info("Вебхук ЮKassa не нужен: режим оплаты %s.", PAYMENTS_MODE)
+        return runner
+
+    if PUBLIC_BASE_URL:
+        webhook_url = f"{PUBLIC_BASE_URL}/yookassa/webhook"
+        try:
+            await make_yookassa_client().ensure_webhook(webhook_url)
+        except Exception as exc:
+            logger.warning("Авторегистрация вебхука не удалась: %s", exc)
+    else:
+        logger.warning(
+            "PUBLIC_BASE_URL не задан — вебхук ЮKassa не зарегистрирован. "
+            "На Railway он подставляется автоматически из RAILWAY_PUBLIC_DOMAIN."
+        )
+    return runner
+
 async def send_error_message(message: Message, error: Exception):
     """Понятное человеческое описание ошибок."""
     if isinstance(error, XUIError):
@@ -1462,36 +2323,71 @@ async def send_error_message(message: Message, error: Exception):
 # КЛАВИАТУРЫ
 # =========================
 
+"""
+Тарифные планы. Для каждого платного тарифа:
+  • price      — цена в рублях (0 = бесплатный тестовый доступ);
+  • days       — срок подписки в днях;
+  • traffic_gb — лимит трафика в ГиБ (0 = безлимит);
+  • ip_limit   — сколько устройств (IP) разрешено;
+  • stars      — цена в звёздах Telegram (переопределяется переменной STARS_<ТАРИФ>).
+"""
 TARIFFS = {
     "trial": {
         "name": "🎁 Тестовый период (24 ч)",
         "price": 0,
+        "days": 1,
         "traffic": "1 ГБ",
+        "traffic_gb": 1,
         "ips": 1,
+        "ip_limit": 1,
         "locations": "Все локации",
     },
     "basic": {
         "name": "⚡️ Базовый (1 месяц)",
         "price": 149,
+        "days": 30,
         "traffic": "Безлимит",
+        "traffic_gb": 0,
         "ips": 2,
+        "ip_limit": 2,
         "locations": "Нидерланды, Германия",
     },
     "standard": {
         "name": "🚀 Стандарт (3 месяца)",
         "price": 390,
+        "days": 90,
         "traffic": "Безлимит",
+        "traffic_gb": 0,
         "ips": 3,
+        "ip_limit": 3,
         "locations": "Все локации",
     },
     "premium": {
         "name": "👑 Премиум (1 год)",
         "price": 1190,
+        "days": 365,
         "traffic": "Безлимит",
+        "traffic_gb": 0,
         "ips": 5,
+        "ip_limit": 5,
         "locations": "Все локации + высокий приоритет",
     },
 }
+
+
+def _stars_price(tariff_key: str, tariff: dict) -> int:
+    """Цена тарифа в звёздах: переменная STARS_<ТАРИФ> либо пересчёт из рублей."""
+    override = (os.getenv(f"STARS_{tariff_key.upper()}") or "").strip()
+    if override.isdigit() and int(override) > 0:
+        return int(override)
+    if tariff["price"] <= 0:
+        return 0
+    return max(1, round(tariff["price"] / STARS_RUB_RATE))
+
+
+for _key, _tariff in TARIFFS.items():
+    if _tariff["price"] > 0:
+        _tariff["stars"] = _stars_price(_key, _tariff)
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -1511,8 +2407,14 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 def tariffs_kb() -> InlineKeyboardMarkup:
     buttons = []
     for key, data in TARIFFS.items():
-        price_text = "Бесплатно" if data["price"] == 0 else f"{data['price']} ₽"
-        buttons.append([InlineKeyboardButton(text=f"{data['name']} — {price_text}", callback_data=f"buy_{key}")])
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{data['name']} — {tariff_price_label(data)}",
+                callback_data=f"buy_{key}",
+            )
+        ])
+    if PAYMENTS_MODE == "yookassa":
+        buttons.append([InlineKeyboardButton(text="🔄 Проверить оплату", callback_data="check_payment_help")])
     buttons.append([InlineKeyboardButton(text="◀️ Назад в меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -1543,8 +2445,9 @@ async def cmd_start(message: Message):
         "👋 <b>Добро пожаловать в быстрый и надёжный VPN!</b>\n\n"
         "Мы используем современный протокол <b>VLESS Reality</b>, "
         "который неотличим от обычного интернет-трафика и работает стабильно.\n\n"
-        "✨ Ты можешь бесплатно протестировать VPN прямо сейчас командой /test_vpn "
-        "или нажав кнопку ниже 👇"
+        "🎁 Бесплатный тестовый доступ на 24 часа — команда /test_vpn.\n"
+        "💰 Платные тарифы — раздел «Тарифы» (оплата и моментальная выдача ключа).\n"
+        "👤 Статус подписки и продление — /profile."
     )
     await message.answer(text, reply_markup=main_menu_kb(), parse_mode="HTML")
 
@@ -1973,6 +2876,36 @@ async def cmd_panel_debug(message: Message):
                         f"⚠️ в панели не найдена, будет создана новая (проверь название).{hint}"
                     )
 
+        # 7. Платёжные настройки
+        lines.append("")
+        lines.append(f"7. <b>Оплата:</b> {escape(payments_mode_title())} (<code>{PAYMENTS_MODE}</code>)")
+        if PAYMENTS_MODE == "provider":
+            lines.append(f"   Provider token: {'задан ✅' if PAYMENT_PROVIDER_TOKEN else 'НЕ задан ❌'}")
+        elif PAYMENTS_MODE == "yookassa":
+            lines.append(
+                f"   ЮKassa: shop <code>{escape(YOOKASSA_SHOP_ID or '—')}</code>, "
+                f"ключ {'задан ✅' if YOOKASSA_SECRET_KEY else 'НЕ задан ❌'}"
+                + (" (тестовый магазин 🧪)" if YOOKASSA_TEST else "")
+            )
+            webhook_url = (PUBLIC_BASE_URL + "/yookassa/webhook") if PUBLIC_BASE_URL else "PUBLIC_BASE_URL не задан"
+            lines.append(f"   Вебхук: <code>{escape(webhook_url)}</code>")
+            try:
+                hooks = await make_yookassa_client().list_webhooks()
+                marked = any(
+                    h.get("event") == "payment.succeeded" and h.get("url") == webhook_url for h in hooks or []
+                )
+                lines.append("   Вебхук в ЮKassa: " + ("✅ зарегистрирован" if marked else "⚠️ не найден"))
+            except Exception as exc:
+                lines.append(f"   Вебхук: ❌ {escape(_snip(str(exc), 120))}")
+        elif PAYMENTS_MODE == "stars":
+            lines.append(f"   Курс: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (STARS_RUB_RATE)")
+
+        stats = payment_store.stats()
+        lines.append(
+            f"   Заказов: {stats['orders_total']}, оплачено: {stats['paid_count']}, "
+            f"выручка: {stats['rub']} ₽ / {stats['stars']} ⭐️"
+        )
+
     await message.answer("\n".join(lines)[:4000], parse_mode="HTML")
 
 
@@ -2047,19 +2980,40 @@ async def cb_reset_my_vpn(cb: CallbackQuery):
 @dp.callback_query(F.data == "tariffs")
 async def cb_tariffs(cb: CallbackQuery):
     await cb.answer()
-    text = "💰 <b>Доступные тарифные планы:</b>\n\n"
+    text = "💰 <b>Тарифные планы:</b>\n\n"
     for key, data in TARIFFS.items():
-        price = "Бесплатно" if data["price"] == 0 else f"{data['price']} ₽"
         text += (
-            f"• <b>{data['name']}</b>: <b>{price}</b>\n"
+            f"• <b>{data['name']}</b> — <b>{tariff_price_label(data)}</b>\n"
             f"  📦 Трафик: {data['traffic']} | 📱 Устройств: {data['ips']} | 🌍 {data['locations']}\n\n"
         )
+
+    if not payments_enabled():
+        text += "ℹ️ <i>Приём оплаты временно недоступен — администратор настраивает платёжную систему.</i>\n"
+    elif PAYMENTS_MODE == "stars":
+        text += ("⭐️ <i>Оплата в звёздах Telegram: они уже есть в твоём аккаунте или покупаются в пару нажатий. "
+                 "Ключ придёт сразу после оплаты.</i>")
+    elif PAYMENTS_MODE == "yookassa":
+        text += ("💳 <i>Оплата картой или через СБП на защищённой странице ЮKassa. "
+                 "Ключ придёт автоматически после оплаты.</i>")
+    else:
+        text += "💳 <i>Оплата картой прямо в Telegram. Ключ придёт сразу после оплаты.</i>"
+
     await cb.message.edit_text(text, reply_markup=tariffs_kb(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "check_payment_help")
+async def cb_check_payment_help(cb: CallbackQuery):
+    await cb.answer(
+        "Открой счёт на оплату в разделе «Тарифы» — там есть кнопка «Проверить оплату».",
+        show_alert=True,
+    )
 
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def cb_buy(cb: CallbackQuery):
+    """Покупка тарифа: выставляет счёт или создаёт платёж."""
     tariff_key = cb.data.removeprefix("buy_")
+
     if tariff_key == "trial":
         await cb.answer()
         await cmd_test_vpn(cb.message)
@@ -2070,39 +3024,295 @@ async def cb_buy(cb: CallbackQuery):
         await cb.answer("Тариф не найден.", show_alert=True)
         return
 
-    await cb.answer()
-    text = (
-        f"💳 <b>Выбран тариф: {tariff['name']}</b> ({tariff['price']} ₽)\n\n"
-        "ℹ️ <i>Платёжная система находится в процессе интеграции.</i>\n\n"
-        "Чтобы начать пользоваться VPN прямо сейчас бесплатно, нажми команду /test_vpn "
-        "или кнопку ниже."
+    await cb.answer("Готовлю оплату...")
+    try:
+        await start_checkout(cb.message.chat.id, cb.from_user.id, tariff_key)
+    except PaymentError as exc:
+        await cb.message.answer(str(exc), parse_mode="HTML")
+    except Exception as exc:
+        logger.exception("Ошибка при создании оплаты: %s", exc)
+        await cb.message.answer(
+            "❌ Не удалось создать счёт на оплату.\n"
+            "Попробуй ещё раз через минуту или напиши в поддержку /start → «Поддержка».",
+            parse_mode="HTML",
+        )
+
+
+@dp.pre_checkout_query()
+async def on_pre_checkout(query: PreCheckoutQuery):
+    """
+    Telegram спрашивает подтверждение перед списанием (ответ нужен в течение 10 секунд).
+
+    Здесь только быстрые проверки по журналу заказов — без обращения к панели 3x-ui.
+    """
+    order = await payment_store.get(query.invoice_payload or "")
+    if order is None:
+        await query.answer(ok=False, error_message="Счёт устарел — создай новый в меню «Тарифы».")
+        return
+    if order.get("status") == "paid":
+        await query.answer(ok=False, error_message="Этот счёт уже оплачен.")
+        return
+    if query.total_amount != order_amount(order):
+        await query.answer(ok=False, error_message="Сумма счёта изменилась — создай новый в меню «Тарифы».")
+        return
+    await query.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def on_successful_payment(message: Message):
+    """Telegram подтвердил оплату (Stars или платёжный провайдер) — выдаём ключ."""
+    payment = message.successful_payment
+    order = await payment_store.get(payment.invoice_payload or "")
+    if order is None:
+        logger.error("Оплата по неизвестному заказу: payload=%r", payment.invoice_payload)
+        await message.answer(
+            "✅ Оплата получена, но заказ не найден в журнале.\n"
+            "Напиши в поддержку — разберёмся вручную.\n"
+            f"<i>Номер платежа: <code>{escape(str(payment.telegram_payment_charge_id))}</code></i>",
+            parse_mode="HTML",
+        )
+        return
+
+    if order["tg_id"] != message.from_user.id and ADMIN_ID > 0:
+        logger.warning(
+            "Платёж по заказу %s пришёл от %s, а заказ создан для %s",
+            order["id"], message.from_user.id, order["tg_id"],
+        )
+
+    try:
+        result = await fulfill_order(
+            order,
+            charge_id=payment.telegram_payment_charge_id,
+            provider_charge_id=payment.provider_payment_charge_id,
+        )
+    except Exception as exc:
+        logger.exception("Выдача после оплаты не удалась: %s", exc)
+        return
+
+    info = result.get("info")
+    if not info:
+        # Платёж уже обработан ранее — просто подтверждаем пользователю
+        await message.answer("✅ Этот платёж уже учтён, подписка активна. Проверить срок: /profile")
+        return
+
+    # Сюда попадаем только при новой оплате: notify_payment_success уже отправил ключ,
+    # поэтому дублировать его не нужно — достаточно короткого подтверждения при ошибке доставки.
+    logger.info("Заказ %s оплачен и выдан (режим %s).", order["id"], order["mode"])
+
+
+@dp.callback_query(F.data.startswith("checkpay_"))
+async def cb_check_payment(cb: CallbackQuery):
+    """Ручная проверка оплаты ЮKassa (если вебхук не дошёл)."""
+    order_id = cb.data.removeprefix("checkpay_")
+    order = await payment_store.get(order_id)
+
+    if order is None or order["tg_id"] != cb.from_user.id:
+        await cb.answer("Заказ не найден.", show_alert=True)
+        return
+
+    if order.get("status") == "paid":
+        await cb.answer("Оплата уже подтверждена ✅", show_alert=True)
+        return
+
+    payment_id = order.get("payment_id")
+    if not payment_id:
+        await cb.answer("Платёж ещё не создан, нажми «Оплатить».", show_alert=True)
+        return
+
+    await cb.answer("Проверяю оплату...")
+    try:
+        payment = await make_yookassa_client().get_payment(payment_id)
+    except PaymentError as exc:
+        await cb.message.answer(str(exc), parse_mode="HTML")
+        return
+
+    status = payment.get("status")
+    if status == "succeeded" and payment.get("paid"):
+        try:
+            result = await fulfill_order(order, charge_id=payment_id)
+        except Exception as exc:
+            logger.exception("Ручная проверка оплаты: выдача не удалась: %s", exc)
+            await cb.message.answer(
+                "✅ Оплата прошла, но выдача ключа задержалась — уже разбираюсь. "
+                f"Номер заказа: <code>{order_id}</code>",
+                parse_mode="HTML",
+            )
+            return
+        if not result.get("info"):
+            await cb.message.answer("✅ Оплата уже учтена, ключ выдан ранее. Проверить: /profile")
+        return
+
+    if status == "canceled":
+        await payment_store.update(order_id, status="canceled")
+        await cb.message.answer(
+            "❌ Платёж отменён или не прошёл.\nПопробуй ещё раз: меню «Тарифы» → выбери тариф.",
+            parse_mode="HTML",
+        )
+        return
+
+    await cb.message.answer(
+        f"⏳ Платёж пока в статусе <b>{escape(str(status))}</b> — оплата ещё не завершена.\n"
+        "Если ты только что оплатил, подожди минуту и нажми «Проверить оплату» снова.",
+        parse_mode="HTML",
     )
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔑 Получить тестовый доступ (24 ч)", callback_data="get_test_key_btn")],
-            [InlineKeyboardButton(text="◀️ К тарифам", callback_data="tariffs")],
-        ]
-    )
-    await cb.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+@dp.message(Command("payments"))
+async def cmd_payments(message: Message):
+    """Статистика оплат и диагностика платёжного режима (только админ)."""
+    if ADMIN_ID > 0 and message.from_user.id != ADMIN_ID:
+        await message.answer("⛔️ Команда доступна только администратору.")
+        return
+
+    stats = payment_store.stats()
+    lines = [
+        "💳 <b>Оплата подписок:</b>\n",
+        f"• Режим: <b>{escape(payments_mode_title())}</b> (<code>{PAYMENTS_MODE}</code>)",
+        f"• Журнал заказов: <code>{escape(PAYMENT_STORE_FILE)}</code>",
+    ]
+
+    if PAYMENTS_MODE == "provider":
+        lines.append(f"• Provider token: {'задан ✅' if PAYMENT_PROVIDER_TOKEN else 'НЕ задан ❌'}")
+    if PAYMENTS_MODE == "yookassa":
+        lines.append(f"• Shop ID: <code>{escape(YOOKASSA_SHOP_ID or 'не задан')}</code>"
+                     f" {'(тестовый магазин 🧪)' if YOOKASSA_TEST else ''}")
+        lines.append(f"• Секретный ключ: {'задан ✅' if YOOKASSA_SECRET_KEY else 'НЕ задан ❌'}")
+        lines.append(f"• Вебхук: <code>{escape((PUBLIC_BASE_URL + '/yookassa/webhook') if PUBLIC_BASE_URL else 'PUBLIC_BASE_URL не задан')}</code>")
+    if PAYMENTS_MODE == "stars":
+        lines.append(f"• Курс пересчёта: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (меняется через STARS_RUB_RATE)")
+
+    lines += [
+        "",
+        f"• Заказов всего: <b>{stats['orders_total']}</b>, оплачено: <b>{stats['paid_count']}</b>",
+        f"• Выручка: <b>{stats['rub']} ₽</b> / <b>{stats['stars']} ⭐️</b>",
+    ]
+    if stats["by_tariff"]:
+        breakdown = ", ".join(f"{TARIFFS.get(k, {}).get('name', k)}: {v}" for k, v in stats["by_tariff"].items())
+        lines.append(f"• По тарифам: {escape(breakdown)}")
+
+    recent = payment_store.recent(5)
+    if recent:
+        lines.append("\n<b>Последние заказы:</b>")
+        for order in recent:
+            icons = {"paid": "✅", "pending": "⏳", "canceled": "❌", "failed": "⚠️"}
+            amount = f"{order['amount_stars']} ⭐️" if order["currency"] == "XTR" else f"{order['amount_rub']} ₽"
+            lines.append(
+                f"{icons.get(order.get('status'), '❔')} <code>{escape(order['id'])}</code> — "
+                f"{escape(order.get('tariff_name', '?'))}, {amount}, TG <code>{order['tg_id']}</code>"
+                + (" <i>(ключ выдан)</i>" if order.get("provisioned") else "")
+            )
+
+    if not payments_enabled():
+        lines.append(
+            "\n⚠️ <b>Оплата выключена.</b> Задай PAYMENTS_MODE=stars (проще всего), "
+            "provider или yookassa — инструкция в README."
+        )
+
+    await message.answer("\n".join(lines)[:4000], parse_mode="HTML")
+
+
+@dp.message(Command("revoke"))
+async def cmd_revoke(message: Message):
+    """Удаляет платную подписку (для возвратов и блокировок)."""
+    if ADMIN_ID > 0 and message.from_user.id != ADMIN_ID:
+        await message.answer("⛔️ Команда доступна только администратору.")
+        return
+
+    args = (message.text or "").split()
+    target = args[1] if len(args) > 1 else str(message.from_user.id)
+    if not target.isdigit():
+        await message.answer("Использование: <code>/revoke [telegram_id]</code>", parse_mode="HTML")
+        return
+
+    wait_msg = await message.answer(f"⏳ Удаляю платную подписку пользователя <code>{target}</code>...")
+    try:
+        async with XUIClient() as client:
+            inbounds = await client.get_inbounds()
+            email = f"tg-paid-{target}"
+            removed = False
+            for inbound in inbounds:
+                settings = as_dict(inbound.get("settings"))
+                for candidate in settings.get("clients") or []:
+                    if isinstance(candidate, dict) and str(candidate.get("email")) == email:
+                        await client.delete_client(inbound.get("id"), email, candidate.get("id"))
+                        removed = True
+                        break
+                if removed:
+                    break
+
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+
+        if removed:
+            await message.answer(
+                f"🗑 <b>Подписка <code>{email}</code> удалена из панели.</b>\n\n"
+                "<i>Если это возврат по оплате — сделай возврат в личном кабинете "
+                "платёжной системы (ЮKassa) или через @BotFather для Stars.</i>",
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer(f"ℹ️ Подписки <code>{email}</code> в панели нет.", parse_mode="HTML")
+    except Exception as exc:
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+        await send_error_message(message, exc)
 
 
 @dp.callback_query(F.data == "profile")
 async def cb_profile(cb: CallbackQuery):
-    await cb.answer()
-    user_id = cb.from_user.id
-    text = (
-        f"👤 <b>Твой профиль:</b>\n\n"
-        f"• Telegram ID: <code>{user_id}</code>\n"
-        f"• Статус: активный пользователь\n\n"
-        "🎁 Ты можешь в любой момент получить рабочий тестовый ключ на 24 часа по команде /test_vpn!"
-    )
+    await cb.answer("Загружаю данные подписки...")
+    await send_profile(cb.message, cb.from_user.id)
+
+
+async def send_profile(message: Message, user_id: int):
+    """Показывает статус подписки: срок, трафик, ключ."""
+    try:
+        sub = await get_paid_subscription(user_id)
+    except Exception as exc:
+        logger.warning("Не удалось прочитать подписку %s: %s", user_id, exc)
+        sub = None
+        sub_error = True
+    else:
+        sub_error = False
+
+    lines = [
+        "👤 <b>Твой профиль:</b>\n",
+        f"• Telegram ID: <code>{user_id}</code>",
+        "",
+        "💳 <b>Подписка:</b>",
+        subscription_status_text(sub),
+    ]
+
+    if sub_error:
+        lines.append("<i>Не удалось получить данные из панели — попробуй позже.</i>")
+
+    if sub and sub["client"].get("id"):
+        try:
+            async with XUIClient() as client:
+                inbound = sub["inbound"]
+                params = extract_vless_params(inbound)
+                link = build_vless_link(sub["client"], inbound, params)
+            lines += ["", f"🔑 <b>Ключ:</b>\n<code>{escape(link)}</code>"]
+        except Exception:
+            pass
+
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔑 Мой тестовый ключ", callback_data="get_test_key_btn")],
+            [InlineKeyboardButton(text="💰 Продлить / сменить тариф", callback_data="tariffs")],
+            [InlineKeyboardButton(text="🔑 Тестовый ключ (24 ч)", callback_data="get_test_key_btn")],
             [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
         ]
     )
-    await cb.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    await message.answer("\n".join(lines), reply_markup=keyboard, parse_mode="HTML")
+
+
+@dp.message(Command("profile"))
+async def cmd_profile(message: Message):
+    await send_profile(message, message.from_user.id)
 
 
 @dp.callback_query(F.data == "activation")
@@ -2155,6 +3365,8 @@ async def on_startup():
             BotCommand(command="panel_debug", description="🔍 Диагностика панели"),
             BotCommand(command="totp", description="🔐 Код 2FA для входа в панель"),
             BotCommand(command="groups", description="🏷 Группы клиентов в 3x-ui"),
+            BotCommand(command="profile", description="👤 Моя подписка и ключ"),
+            BotCommand(command="payments", description="💳 Оплаты (для администратора)"),
             BotCommand(command="myid", description="👤 Узнать свой Telegram ID"),
         ]
         await bot.set_my_commands(commands)
@@ -2167,9 +3379,23 @@ async def main():
         logger.warning(
             "⚠️ ADMIN_ID не задан. Отправь боту /myid и укажи свой ID в Railway -> Variables."
         )
+
+    payment_store.load()
+    logger.info("Приём оплаты: %s.", payments_mode_title())
+
+    runner = None
+    try:
+        runner = await run_webhook_server()
+    except Exception as exc:
+        logger.error("Не удалось поднять веб-сервер бота (порт %s): %s", WEB_PORT, exc)
+
     logger.info("VPN-бот успешно запущен и ожидает сообщений...")
-    await on_startup()
-    await dp.start_polling(bot)
+    try:
+        await on_startup()
+        await dp.start_polling(bot)
+    finally:
+        if runner is not None:
+            await runner.cleanup()
 
 
 if __name__ == "__main__":
