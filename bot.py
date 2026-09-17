@@ -247,6 +247,11 @@ PAYMENT_PROVIDER_TOKEN = (os.getenv("PAYMENT_PROVIDER_TOKEN") or "").strip()
 YOOKASSA_SHOP_ID = (os.getenv("YOOKASSA_SHOP_ID") or "").strip()
 YOOKASSA_SECRET_KEY = (os.getenv("YOOKASSA_SECRET_KEY") or "").strip()
 YOOKASSA_API_URL = (os.getenv("YOOKASSA_API_URL") or "https://api.yookassa.ru/v3").strip().rstrip("/")
+
+# OAuth-токен ЮKassa (необязательно). При Basic-авторизации вебхуки настраиваются
+# ТОЛЬКО в личном кабинете (Интеграция → HTTP-уведомления), через API их можно
+# задать лишь OAuth-токеном — если он указан, бот зарегистрирует вебхук сам.
+YOOKASSA_OAUTH_TOKEN = (os.getenv("YOOKASSA_OAUTH_TOKEN") or "").strip()
 YOOKASSA_TEST = (os.getenv("YOOKASSA_TEST") or "").strip().lower() in ("1", "true", "yes", "on") or \
     YOOKASSA_SECRET_KEY.startswith("test_")
 
@@ -277,8 +282,11 @@ PAYMENT_STORE_FILE = (os.getenv("PAYMENT_STORE_FILE") or "data/payments.json").s
 # цену в звёздах для каждого тарифа: STARS_BASIC, STARS_STANDARD, STARS_PREMIUM).
 STARS_RUB_RATE = float((os.getenv("STARS_RUB_RATE") or "1.6").replace(",", "."))
 
-# Ставка НДС для чеков ЮKassa (54-ФЗ): 1..6 или "none" — без НДС.
-YOOKASSA_VAT_CODE = _int_env("YOOKASSA_VAT_CODE", 1)
+# Чек 54-ФЗ для ЮKassa: 1..6 — ставка НДС (чек формирует и передаёт бот), 0 — не передавать.
+# По умолчанию 0 (безопасно): если фискализация не подключена, передача чека ломает
+# создание платежа. Включай 1..6, только если чеки фискализирует твоя онлайн-касса.
+# Если чеки делает сам сервис («Чеки от ЮKassa»), оставь 0 — ЮKassa сформирует их сама.
+YOOKASSA_VAT_CODE = _int_env("YOOKASSA_VAT_CODE", 0)
 
 if not PAYMENTS_MODE:
     if PAYMENT_PROVIDER_TOKEN:
@@ -1700,9 +1708,16 @@ def order_amount(order: dict) -> int:
 class YooKassaClient:
     """Минимальный клиент API ЮKassa (https://yookassa.ru/developers/api)."""
 
-    def __init__(self, shop_id: str, secret_key: str, api_url: str = YOOKASSA_API_URL):
+    def __init__(
+        self,
+        shop_id: str,
+        secret_key: str,
+        api_url: str = YOOKASSA_API_URL,
+        oauth_token: str = "",
+    ):
         self.shop_id = shop_id
         self.secret_key = secret_key
+        self.oauth_token = oauth_token
         self.api_url = api_url.rstrip("/")
 
     def _auth(self) -> aiohttp.BasicAuth:
@@ -1710,12 +1725,17 @@ class YooKassaClient:
 
     async def _request(self, method: str, path: str, **kwargs) -> dict:
         headers = {"Content-Type": "application/json", **(kwargs.pop("headers", {}))}
+        auth = self._auth()
+        if self.oauth_token:
+            # OAuth-токен нужен для API вебхуков; для платежей он тоже подходит
+            headers["Authorization"] = f"Bearer {self.oauth_token}"
+            auth = None
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as session:
                 async with session.request(
                     method,
                     f"{self.api_url}{path}",
-                    auth=self._auth(),
+                    auth=auth,
                     headers=headers,
                     **kwargs,
                 ) as resp:
@@ -1756,7 +1776,7 @@ class YooKassaClient:
             "description": f"VPN «{order['tariff_name']}» для Telegram {order['tg_id']}",
             "metadata": {"order_id": order["id"], "tg_id": str(order["tg_id"]), "tariff": order["tariff"]},
         }
-        # Чек по 54-ФЗ (нужен, если в магазине включена фискализация)
+        # Чек по 54-ФЗ — только если он включён (YOOKASSA_VAT_CODE > 0)
         if YOOKASSA_VAT_CODE > 0:
             payload["receipt"] = {
                 "customer": {"account": str(order["tg_id"])},
@@ -1781,7 +1801,20 @@ class YooKassaClient:
         return data.get("items") if isinstance(data, dict) else []
 
     async def ensure_webhook(self, url: str) -> bool:
-        """Регистрирует вебхук payment.succeeded, если его ещё нет."""
+        """
+        Регистрирует вебхук payment.succeeded, если его ещё нет.
+
+        Требует OAuth-токен: при Basic-авторизации ЮKassa не даёт управлять
+        вебхуками через API (только личный кабинет), поэтому без токена метод
+        ничего не делает и возвращает False.
+        """
+        if not self.oauth_token:
+            logger.info(
+                "OAuth-токен ЮKassa не задан — вебхук нужно добавить в личном кабинете: "
+                "Интеграция → HTTP-уведомления → %s (событие payment.succeeded).",
+                url,
+            )
+            return False
         try:
             hooks = await self.list_webhooks()
         except PaymentError as exc:
@@ -1801,7 +1834,11 @@ class YooKassaClient:
 
 
 def make_yookassa_client() -> YooKassaClient:
-    return YooKassaClient(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
+    return YooKassaClient(
+        YOOKASSA_SHOP_ID,
+        YOOKASSA_SECRET_KEY,
+        oauth_token=YOOKASSA_OAUTH_TOKEN,
+    )
 
 
 # --- выдача подписки в 3x-ui ---
@@ -2020,8 +2057,15 @@ def order_paid_message(order: dict, info: dict) -> str:
     )
 
 
-async def notify_payment_success(order: dict, info: dict) -> None:
-    """Отправляет покупателю ключ, а админу — уведомление о продаже."""
+async def notify_payment_success(order: dict, info: dict) -> bool:
+    """
+    Отправляет покупателю ключ, а админу — уведомление о продаже.
+
+    Возвращает True, если ключ доставлен. Если Telegram не принял сообщение
+    (сбой сети, бот заблокирован), заказ не помечается уведомлённым — при
+    повторной доставке платежа ключ будет отправлен снова.
+    """
+    delivered = True
     try:
         await bot.send_message(
             order["tg_id"],
@@ -2030,7 +2074,11 @@ async def notify_payment_success(order: dict, info: dict) -> None:
             reply_markup=key_actions_kb(),
         )
     except Exception as exc:
-        logger.error("Не удалось отправить ключ пользователю %s: %s", order["tg_id"], exc)
+        delivered = False
+        logger.error(
+            "Не удалось отправить ключ пользователю %s (заказ %s): %s",
+            order["tg_id"], order["id"], exc,
+        )
 
     if ADMIN_ID > 0 and ADMIN_ID != order["tg_id"]:
         try:
@@ -2048,6 +2096,8 @@ async def notify_payment_success(order: dict, info: dict) -> None:
             )
         except Exception as exc:
             logger.warning("Не удалось уведомить админа об оплате: %s", exc)
+
+    return delivered
 
 
 async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str | None = None) -> dict:
@@ -2070,6 +2120,38 @@ async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str 
 
     if order.get("provisioned"):
         logger.info("Заказ %s уже выдан (provisioned) — повторная выдача не нужна.", order["id"])
+        # Ключ мог не дойти (сбой сети у Telegram) — при повторной доставке платежа досылаем его
+        if not order.get("notified") and int(order.get("expiry_ms") or 0) > 0:
+            link = order.get("link")
+            if not link:
+                # заказ был выдан более старой версией бота — пересобираем ключ из панели
+                try:
+                    sub = await get_paid_subscription(order["tg_id"])
+                    if sub:
+                        async with XUIClient() as client:
+                            params = extract_vless_params(sub["inbound"])
+                        link = build_vless_link(sub["client"], sub["inbound"], params)
+                except Exception as exc:
+                    logger.warning("Не удалось пересобрать ключ для заказа %s: %s", order["id"], exc)
+
+            info = {
+                "tariff": TARIFFS.get(order["tariff"], {}),
+                "expiry_ms": int(order["expiry_ms"]),
+                "already": True,
+                "status": "extended",
+                "link": link,
+                "sub_link": order.get("sub_link"),
+            }
+            if not info["link"]:
+                logger.warning(
+                    "Заказ %s выдан, но ключ не сохранился и недоступен в панели — досыл невозможен.",
+                    order["id"],
+                )
+                return {"already_provisioned": True, "order": order}
+            if await notify_payment_success(order, info):
+                await payment_store.update(order["id"], notified=True)
+                logger.info("Ключ по заказу %s дослан повторно.", order["id"])
+                return {"order": order, "info": info}
         return {"already_provisioned": True, "order": order}
 
     try:
@@ -2104,10 +2186,22 @@ async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str 
                 pass
         raise
 
-    await payment_store.update(order["id"], provisioned=True, expiry_ms=info["expiry_ms"])
+    await payment_store.update(
+        order["id"],
+        provisioned=True,
+        expiry_ms=info["expiry_ms"],
+        link=info.get("link"),          # сохраняем ключ: пригодится, если сообщение не дошло
+        sub_link=info.get("sub_link"),
+    )
     if not order.get("notified"):
-        await notify_payment_success(order, info)
-        await payment_store.update(order["id"], notified=True)
+        if await notify_payment_success(order, info):
+            await payment_store.update(order["id"], notified=True)
+        else:
+            logger.warning(
+                "Заказ %s выдан, но ключ не доставлен — отправлю снова при повторной "
+                "доставке платежа. Пользователь может забрать ключ командой /profile.",
+                order["id"],
+            )
     return {"order": order, "info": info}
 
 
@@ -2283,12 +2377,19 @@ async def run_webhook_server() -> web.AppRunner | None:
     if PUBLIC_BASE_URL:
         webhook_url = f"{PUBLIC_BASE_URL}/yookassa/webhook"
         try:
-            await make_yookassa_client().ensure_webhook(webhook_url)
+            if await make_yookassa_client().ensure_webhook(webhook_url):
+                logger.info("Вебхук ЮKassa готов: %s", webhook_url)
+            else:
+                logger.info(
+                    "Вебхук ЮKassa: добавь %s в личном кабинете (Интеграция → HTTP-уведомления) "
+                    "или задай YOOKASSA_OAUTH_TOKEN для автонастройки.",
+                    webhook_url,
+                )
         except Exception as exc:
             logger.warning("Авторегистрация вебхука не удалась: %s", exc)
     else:
         logger.warning(
-            "PUBLIC_BASE_URL не задан — вебхук ЮKassa не зарегистрирован. "
+            "PUBLIC_BASE_URL не задан — вебхук ЮKassa не настроен. "
             "На Railway он подставляется автоматически из RAILWAY_PUBLIC_DOMAIN."
         )
     return runner
@@ -2887,16 +2988,25 @@ async def cmd_panel_debug(message: Message):
                 f"ключ {'задан ✅' if YOOKASSA_SECRET_KEY else 'НЕ задан ❌'}"
                 + (" (тестовый магазин 🧪)" if YOOKASSA_TEST else "")
             )
-            webhook_url = (PUBLIC_BASE_URL + "/yookassa/webhook") if PUBLIC_BASE_URL else "PUBLIC_BASE_URL не задан"
-            lines.append(f"   Вебхук: <code>{escape(webhook_url)}</code>")
-            try:
-                hooks = await make_yookassa_client().list_webhooks()
-                marked = any(
-                    h.get("event") == "payment.succeeded" and h.get("url") == webhook_url for h in hooks or []
+            webhook_url = (PUBLIC_BASE_URL + "/yookassa/webhook") if PUBLIC_BASE_URL else ""
+            if webhook_url:
+                lines.append(f"   Вебхук: <code>{escape(webhook_url)}</code>")
+            else:
+                lines.append("   Вебхук: ⚠️ PUBLIC_BASE_URL не задан (Railway подставляет его сам)")
+            if YOOKASSA_OAUTH_TOKEN and webhook_url:
+                try:
+                    hooks = await make_yookassa_client().list_webhooks()
+                    marked = any(
+                        h.get("event") == "payment.succeeded" and h.get("url") == webhook_url for h in hooks or []
+                    )
+                    lines.append("   Вебхук в ЮKassa: " + ("✅ зарегистрирован" if marked else "⚠️ не найден"))
+                except Exception as exc:
+                    lines.append(f"   Вебхук: ❌ {escape(_snip(str(exc), 120))}")
+            else:
+                lines.append(
+                    "   Настройка: кабинет ЮKassa → Интеграция → HTTP-уведомления → "
+                    "URL выше, событие <b>payment.succeeded</b>"
                 )
-                lines.append("   Вебхук в ЮKassa: " + ("✅ зарегистрирован" if marked else "⚠️ не найден"))
-            except Exception as exc:
-                lines.append(f"   Вебхук: ❌ {escape(_snip(str(exc), 120))}")
         elif PAYMENTS_MODE == "stars":
             lines.append(f"   Курс: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (STARS_RUB_RATE)")
 
@@ -3177,7 +3287,11 @@ async def cmd_payments(message: Message):
         lines.append(f"• Shop ID: <code>{escape(YOOKASSA_SHOP_ID or 'не задан')}</code>"
                      f" {'(тестовый магазин 🧪)' if YOOKASSA_TEST else ''}")
         lines.append(f"• Секретный ключ: {'задан ✅' if YOOKASSA_SECRET_KEY else 'НЕ задан ❌'}")
-        lines.append(f"• Вебхук: <code>{escape((PUBLIC_BASE_URL + '/yookassa/webhook') if PUBLIC_BASE_URL else 'PUBLIC_BASE_URL не задан')}</code>")
+        if PUBLIC_BASE_URL:
+            lines.append(f"• Вебхук: <code>{escape(PUBLIC_BASE_URL + '/yookassa/webhook')}</code>"
+                         + (" (автонастройка ✅)" if YOOKASSA_OAUTH_TOKEN else " (добавляется в кабинете ЮKassa)"))
+        else:
+            lines.append("• Вебхук: ⚠️ PUBLIC_BASE_URL не задан")
     if PAYMENTS_MODE == "stars":
         lines.append(f"• Курс пересчёта: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (меняется через STARS_RUB_RATE)")
 
