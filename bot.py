@@ -1,13 +1,21 @@
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import ssl
+import struct
+import sys
 import time
 import uuid
 
 from contextlib import asynccontextmanager
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from html import escape
 from urllib.parse import quote, urlencode, urlsplit
 
@@ -49,6 +57,115 @@ def _int_env(name: str, default: int = 0) -> int:
         return default
 
 
+# =========================
+# 2FA / TOTP (Google Authenticator)
+# =========================
+# Панель 3x-ui (все сборки на MHSanaei, v2.x и v3.x) при включённой двухфакторке
+# требует в теле POST /login дополнительное поле twoFactorCode — одноразовый
+# 6-значный код из Google Authenticator. Код считается из того же base32-секрета,
+# который панель показывает в Settings -> Security -> Two-factor authentication.
+
+TOTP_PERIOD = 30          # секунд в одном окне кода (стандарт Google Authenticator)
+TOTP_DIGITS = 6           # длина кода
+TOTP_SKEW_WINDOWS = 1     # 3x-ui принимает код текущего окна ±1 (допуск рассинхрона часов ~30 сек)
+TOTP_MIN_SECRET_LEN = 16  # RFC 4226: не короче 128 бит (16 символов base32)
+TOTP_MIN_WINDOW_LEFT = 3  # если до смены кода меньше 3 секунд — дождёмся нового окна
+
+
+def normalize_totp_secret(raw: str) -> str:
+    """
+    Приводит секрет 2FA к каноничному виду: base32 в верхнем регистре без пробелов.
+
+    Понимает любой формат вставки из панели:
+      • сам секрет:        JBSWY3DPEHPK3PXP
+      • с пробелами/дефисами: JBSW Y3DP-EHPK 3PXP
+      • строку параметра:  secret=JBSWY3DPEHPK3PXP
+      • целиком otpauth:   otpauth://totp/3x-ui?secret=JBSWY3DPEHPK3PXP&issuer=3x-ui
+    """
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    match = re.search(r"secret=([A-Za-z2-7=\s]+)", value, re.IGNORECASE)
+    if match:
+        value = match.group(1)
+    value = re.sub(r"[\s\-_]", "", value).rstrip("=").upper()
+    return value
+
+
+def totp_secret_problem(secret: str) -> str | None:
+    """Возвращает описание проблемы с секретом 2FA или None, если секрет корректен."""
+    if not secret:
+        return "секрет пустой"
+    bad_chars = sorted(set(re.findall(r"[^A-Z2-7]", secret)))
+    if bad_chars:
+        return f"в секрете есть символы, недопустимые в base32: {' '.join(bad_chars)}"
+    if len(secret) < TOTP_MIN_SECRET_LEN:
+        return f"секрет слишком короткий ({len(secret)} символов, ожидается ≥ {TOTP_MIN_SECRET_LEN})"
+    try:
+        base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True)
+    except Exception as exc:  # pragma: no cover — защита от экзотических опечаток
+        return f"секрет не декодируется как base32 ({exc})"
+    return None
+
+
+def totp_code(secret: str, at: float | None = None, shift_windows: int = 0) -> str:
+    """
+    Считает код Google Authenticator (RFC 6238: HMAC-SHA1, 30 секунд, 6 цифр).
+
+    :param secret: base32-секрет (как из панели 3x-ui)
+    :param at: момент времени в секундах (по умолчанию — сейчас)
+    :param shift_windows: сдвиг на N окон вперёд/назад (для повторной попытки входа)
+    """
+    if not secret:
+        raise ValueError("Секрет 2FA не задан (XUI_2FA_SECRET)")
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True)
+    moment = (time.time() if at is None else at) + shift_windows * TOTP_PERIOD
+    counter = int(moment // TOTP_PERIOD)
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    number = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(number % (10 ** TOTP_DIGITS)).zfill(TOTP_DIGITS)
+
+
+def totp_seconds_left(at: float | None = None) -> float:
+    """Сколько секунд осталось до смены текущего кода 2FA."""
+    moment = time.time() if at is None else at
+    return TOTP_PERIOD - (moment % TOTP_PERIOD)
+
+
+def _handle_cli_args() -> bool:
+    """
+    Разовые команды для диагностики (без запуска бота):
+
+        python bot.py --totp [BASE32_SECRET]
+
+    Печатает текущий код Google Authenticator, предыдущий и следующий.
+    Секрет можно не указывать — тогда берётся переменная окружения XUI_2FA_SECRET.
+    """
+    args = sys.argv[1:]
+    if not args or args[0] not in ("--totp", "-totp", "--2fa"):
+        return False
+
+    secret = normalize_totp_secret(args[1] if len(args) > 1 else (os.getenv("XUI_2FA_SECRET") or ""))
+    problem = totp_secret_problem(secret)
+    if problem:
+        print(f"❌ Секрет 2FA не задан или некорректен: {problem}")
+        print("Использование: python bot.py --totp BASE32_SECRET")
+        print("Либо задай переменную окружения XUI_2FA_SECRET и запусти: python bot.py --totp")
+        raise SystemExit(1)
+
+    now = time.time()
+    print(f"🔐 Код Google Authenticator: {totp_code(secret, at=now)}  (действует ещё {totp_seconds_left(now):.0f} сек)")
+    print(f"   Предыдущий код: {totp_code(secret, at=now, shift_windows=-1)}")
+    print(f"   Следующий код:  {totp_code(secret, at=now, shift_windows=1)}")
+    return True
+
+
+# Если передан флаг --totp, дальше (проверка BOT_TOKEN, запуск бота) не идём.
+if _handle_cli_args():  # pragma: no cover
+    raise SystemExit(0)
+
+
 # --- Telegram ---
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 if not BOT_TOKEN:
@@ -70,6 +187,22 @@ XUI_PASSWORD = os.getenv("XUI_PASSWORD") or ""
 
 # Если в 3x-ui создан API Token (в настройках панели) — можно указать его вместо логина/пароля
 XUI_TOKEN = (os.getenv("XUI_TOKEN") or "").strip()
+
+# --- Двухфакторная аутентификация (Google Authenticator) ---
+# Если в панели 3x-ui включена 2FA (Settings -> Security -> Two-factor authentication),
+# укажи здесь её секрет — бот сам будет считать 6-значный код при каждом входе.
+# Принимается и сам base32-секрет, и целиком ссылка otpauth:// из QR-кода.
+XUI_2FA_SECRET = normalize_totp_secret(os.getenv("XUI_2FA_SECRET") or "")
+if XUI_2FA_SECRET:
+    _totp_problem = totp_secret_problem(XUI_2FA_SECRET)
+    if _totp_problem:
+        logger.warning(
+            "Переменная XUI_2FA_SECRET заполнена некорректно (%s) — 2FA работать не будет. "
+            "Скопируй секрет из панели 3x-ui: Settings -> Security -> Two-factor authentication.",
+            _totp_problem,
+        )
+    else:
+        logger.info("2FA для панели 3x-ui включена: код будет считаться из XUI_2FA_SECRET.")
 
 # ID входящего подключения (VLESS). Если 0 — бот подберёт подходящее автоматически.
 XUI_INBOUND_ID = _int_env("XUI_INBOUND_ID")
@@ -138,6 +271,47 @@ class XUIError(Exception):
     """Ошибка, текст которой можно безопасно и понятно показать пользователю."""
 
 
+# Подсказки в сообщениях панели, по которым понятно, что отклонили именно код 2FA
+# (в 3x-ui сообщения локализованы, поэтому проверяем и русские варианты).
+_2FA_HINTS = (
+    "2fa", "2-фа", "2фа", "twofactor", "two-factor", "two factor",
+    "otp", "authenticator", "двухфактор", "двух-фактор", "двух фактор",
+    "код аутентификации", "одноразов", "invalid code", "wrong code",
+)
+
+
+def _looks_like_2fa_error(text: str) -> bool:
+    """Похоже ли, что панель отклонила код двухфакторной аутентификации."""
+    low = (text or "").lower()
+    return any(hint in low for hint in _2FA_HINTS)
+
+
+def two_factor_hint() -> str:
+    """Единая подсказка про 2FA для сообщений об ошибках авторизации."""
+    if XUI_2FA_SECRET:
+        problem = totp_secret_problem(XUI_2FA_SECRET)
+        if problem:
+            return (
+                "🔐 <b>Панель использует 2FA</b>, но переменная <b>XUI_2FA_SECRET</b> заполнена некорректно:\n"
+                f"<i>{escape(problem)}</i>\n\n"
+                "Скопируй секрет заново: 3x-ui → Settings → Security → Two-factor authentication "
+                "(кнопка показа секрета / QR-код) и вставь его в Railway → Variables → <b>XUI_2FA_SECRET</b>.\n"
+                "<i>Проверить секрет можно командой /totp у бота или локально: "
+                "<code>python bot.py --totp</code></i>"
+            )
+        return (
+            "🔐 <b>2FA включена</b>: бот отправил панели код из <b>XUI_2FA_SECRET</b>.\n"
+            "Если панель код не приняла, проверь, что секрет тот же, что привязан к Google Authenticator "
+            "(3x-ui → Settings → Security → Two-factor authentication), и что часы сервера синхронизированы по NTP.\n"
+            "<i>Посмотреть текущий код: /totp</i>"
+        )
+    return (
+        "🔐 <b>Если в панели включена 2FA</b> (двухфакторная аутентификация) — добавь в Railway → Variables "
+        "переменную <b>XUI_2FA_SECRET</b> с секретом из 3x-ui → Settings → Security → Two-factor authentication.\n"
+        "<i>Либо сгенерируй API-токен в настройках 3x-ui и укажи его в <b>XUI_TOKEN</b>.</i>"
+    )
+
+
 def as_dict(value) -> dict:
     """3x-ui часто отдаёт settings и streamSettings JSON-строкой — безопасно распаковываем."""
     if isinstance(value, dict):
@@ -185,6 +359,12 @@ class XUIClient:
     def __init__(self):
         self.session: aiohttp.ClientSession | None = None
         self.csrf_token: str | None = None
+        # Рассинхрон часов с панелью (из HTTP-заголовка Date) — нужен для кода 2FA
+        self.server_time_offset: float = 0.0
+        # True/False, если панель умеет отвечать про 2FA; None — если версия старая
+        self.two_factor_enabled: bool | None = None
+        # Номер 30-секундного окна, код которого мы отправили последним
+        self.last_totp_counter: int | None = None
 
     async def __aenter__(self):
         if not XUI_URL:
@@ -223,12 +403,15 @@ class XUIClient:
 
         # 1. Проверяем доступность панели (прогрев)
         try:
-            await self.session.get(
+            async with self.session.get(
                 f"{XUI_URL}/",
                 headers={"User-Agent": BROWSER_UA},
                 allow_redirects=True,
                 proxy=XUI_PROXY,
-            )
+            ) as resp:
+                # По заголовку Date определяем рассинхрон часов: код 2FA должен
+                # быть валиден именно по часам панели.
+                self._remember_server_time(resp.headers.get("Date"))
         except Exception as exc:
             raise XUIError(
                 f"❌ Панель 3x-ui не отвечает по адресу:\n<code>{escape(XUI_URL)}</code>\n\n"
@@ -257,80 +440,256 @@ class XUIClient:
             except Exception:
                 pass
 
-        # 3. Авторизуемся по логину и паролю
-        login_errors = []
-        origin = f"{urlsplit(XUI_URL).scheme}://{urlsplit(XUI_URL).netloc}"
-
-        for login_path in ("/login", "/login/", "/panel/api/login", "/panel/login"):
-            headers = {
-                "User-Agent": BROWSER_UA,
-                "Accept": "application/json, text/plain, */*",
-                "Origin": origin,
-                "Referer": f"{XUI_URL}/",
-                "X-Requested-With": "XMLHttpRequest",
-            }
-            if self.csrf_token:
-                headers["X-CSRF-Token"] = self.csrf_token
-
-            # Пробуем JSON
-            try:
-                async with self.session.post(
-                    f"{XUI_URL}{login_path}",
-                    json={"username": XUI_USERNAME, "password": XUI_PASSWORD},
-                    headers=headers,
-                    proxy=XUI_PROXY,
-                ) as resp:
-                    raw = await resp.text()
-
-                if resp.status in (404, 405):
-                    login_errors.append(f"{login_path} -> HTTP {resp.status}")
-                    continue
-
-                try:
-                    data = json.loads(raw)
-                except ValueError:
-                    # Попробуем form-data (для старых сборок Gin)
-                    try:
-                        async with self.session.post(
-                            f"{XUI_URL}{login_path}",
-                            data={"username": XUI_USERNAME, "password": XUI_PASSWORD},
-                            headers=headers,
-                            proxy=XUI_PROXY,
-                        ) as form_resp:
-                            form_raw = await form_resp.text()
-                            data = json.loads(form_raw)
-                    except Exception:
-                        login_errors.append(f"{login_path} -> не JSON (HTTP {resp.status}): {_snip(raw)}")
-                        continue
-
-                if data.get("success"):
-                    logger.info("Успешный вход в 3x-ui через %s", login_path)
-                    break
-
-                # Панель ответила осмысленно, но отклонила логин/пароль
-                msg = data.get("msg") or raw[:200]
-                raise XUIError(
-                    f"❌ Панель 3x-ui отклонила логин/пароль:\n<code>{escape(msg)}</code>\n\n"
-                    "Проверь <b>XUI_USERNAME</b> и <b>XUI_PASSWORD</b> в Railway Variables.\n"
-                    "<i>Если в панели включена 2FA (двухфакторная аутентификация), отключи её "
-                    "или сгенерируй API Token в настройках 3x-ui и добавь в Railway переменную XUI_TOKEN.</i>"
-                )
-
-            except XUIError:
-                raise
-            except Exception as exc:
-                login_errors.append(f"{login_path} -> {exc}")
-        else:
+        # 3. Узнаём у панели, включена ли двухфакторная аутентификация
+        self.two_factor_enabled = await self._detect_two_factor()
+        if self.two_factor_enabled is True and not XUI_2FA_SECRET:
             raise XUIError(
-                "❌ Не удалось войти в панель 3x-ui:\n"
-                + "\n".join(f"• {e}" for e in login_errors)
-                + "\n\n<b>Возможные причины:</b>\n"
-                "1. Неверный путь панели. Если панель открывается как <code>https://ip:port/mysecret</code>, "
-                "обязательно укажи секретный путь в <b>XUI_URL</b>.\n"
-                "2. Защита хостера (Cloudflare / DDoS-Guard) блокирует запросы Railway."
+                "🔐 <b>В панели 3x-ui включена двухфакторная аутентификация (2FA), "
+                "а секрет не задан.</b>\n\n"
+                "Бот не сможет войти по логину и паролю без одноразовых кодов.\n\n"
+                "<b>Что сделать (любой вариант):</b>\n"
+                "1. Добавь в Railway → Variables переменную <b>XUI_2FA_SECRET</b> — секрет "
+                "из 3x-ui → Settings → Security → Two-factor authentication "
+                "(кнопка показа секрета или QR-код). Бот сам будет считать код Google Authenticator.\n"
+                "2. Либо сгенерируй в панели <b>API Token</b> (Settings → Security → API Token) "
+                "и добавь его в Railway → Variables как <b>XUI_TOKEN</b> — с токеном 2FA не нужна.\n\n"
+                "<i>Проверить секрет можно командой /totp или локально: <code>python bot.py --totp</code></i>"
             )
 
+        # 4. Авторизуемся по логину и паролю (+ код 2FA, если он нужен панели)
+        login_errors: list[str] = []
+        login_paths = ("/login", "/login/", "/panel/api/login", "/panel/login")
+
+        # При настроенном 2FA даём вторую попытку: код мог устареть, пока панель
+        # отвечала, или часы серверов могут слегка расходиться.
+        max_attempts = 2 if XUI_2FA_SECRET else 1
+        for attempt in range(max_attempts):
+            try:
+                # Первая попытка — текущее окно кода, вторая — следующее
+                # (панель допускает сдвиг на TOTP_SKEW_WINDOWS окна).
+                await self._login(login_paths, login_errors, shift_windows=min(attempt, TOTP_SKEW_WINDOWS))
+                break
+            except XUIError as exc:
+                retry_reason = _looks_like_2fa_error(str(exc))
+                if attempt + 1 < max_attempts and (retry_reason or self._code_rolled_over()):
+                    logger.warning(
+                        "Вход с кодом 2FA не удался (%s) — повторяю со следующим кодом.",
+                        _snip(str(exc), 120),
+                    )
+                    continue
+                raise
+
         return self
+
+    def _remember_server_time(self, date_header: str | None) -> None:
+        """Определяет рассинхрон часов с панелью 3x-ui по HTTP-заголовку Date."""
+        if not date_header:
+            return
+        try:
+            server_dt = parsedate_to_datetime(date_header)
+        except Exception:
+            return
+        if server_dt is None:
+            return
+        if server_dt.tzinfo is None:
+            server_dt = server_dt.replace(tzinfo=timezone.utc)
+        offset = server_dt.timestamp() - time.time()
+        if abs(offset) >= 24 * 3600:  # явно мусорный заголовок — не учитываем
+            return
+        self.server_time_offset = offset
+        if abs(offset) >= 5:
+            logger.warning(
+                "Часы панели 3x-ui расходятся с сервером бота на %.0f сек — учту при генерации кода 2FA.",
+                offset,
+            )
+
+    def _server_now(self) -> float:
+        """Текущее время по часам панели 3x-ui (если удалось его узнать)."""
+        return time.time() + self.server_time_offset
+
+    async def _fresh_totp_code(self, shift_windows: int = 0) -> str:
+        """
+        Возвращает актуальный код Google Authenticator для панели.
+
+        Если до смены кода осталось меньше TOTP_MIN_WINDOW_LEFT секунд, ждём
+        начала следующего окна — иначе код «сгорит» прямо во время запроса.
+        """
+        if not XUI_2FA_SECRET:
+            raise XUIError(
+                "🔐 Панель требует код двухфакторной аутентификации, но переменная "
+                "<b>XUI_2FA_SECRET</b> не задана в Railway → Variables."
+            )
+
+        problem = totp_secret_problem(XUI_2FA_SECRET)
+        if problem:
+            raise XUIError(
+                f"🔐 Переменная <b>XUI_2FA_SECRET</b> заполнена некорректно: <i>{escape(problem)}</i>\n\n"
+                "Скопируй секрет заново из 3x-ui → Settings → Security → Two-factor authentication "
+                "(подойдёт и целиком ссылка <code>otpauth://…</code> из QR-кода)."
+            )
+
+        left = totp_seconds_left(self._server_now())
+        if shift_windows == 0 and left < TOTP_MIN_WINDOW_LEFT:
+            logger.info("Код 2FA действует ещё %.1f сек — дожидаюсь нового окна.", left)
+            await asyncio.sleep(left + 0.2)
+
+        moment = self._server_now()
+        code = totp_code(XUI_2FA_SECRET, at=moment, shift_windows=shift_windows)
+        self.last_totp_counter = int((moment + shift_windows * TOTP_PERIOD) // TOTP_PERIOD)
+        return code
+
+    def _code_rolled_over(self) -> bool:
+        """True, если окно кода 2FA успело смениться, пока панель отвечала на запрос."""
+        if not XUI_2FA_SECRET or self.last_totp_counter is None:
+            return False
+        return int(self._server_now() // TOTP_PERIOD) != self.last_totp_counter
+
+    async def _detect_two_factor(self) -> bool | None:
+        """
+        Спрашивает у панели, включена ли 2FA (POST /getTwoFactorEnable).
+
+        Возвращает True/False либо None, если эндпоинт недоступен
+        (старые сборки 3x-ui про 2FA не знают — тогда просто пробуем войти).
+        """
+        for path in ("/getTwoFactorEnable", "/panel/getTwoFactorEnable"):
+            try:
+                async with self.session.post(
+                    f"{XUI_URL}{path}",
+                    headers=self._login_headers(),
+                    proxy=XUI_PROXY,
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json(content_type=None)
+            except Exception:
+                continue
+
+            if isinstance(data, dict) and "obj" in data:
+                enabled = bool(data.get("obj"))
+                logger.info("Панель 3x-ui сообщила: 2FA %s.", "включена" if enabled else "выключена")
+                return enabled
+
+        return None
+
+    def _login_headers(self) -> dict:
+        """Заголовки для запроса авторизации (в стиле браузерной панели)."""
+        origin = f"{urlsplit(XUI_URL).scheme}://{urlsplit(XUI_URL).netloc}"
+        headers = {
+            "User-Agent": BROWSER_UA,
+            "Accept": "application/json, text/plain, */*",
+            "Origin": origin,
+            "Referer": f"{XUI_URL}/",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        if self.csrf_token:
+            headers["X-CSRF-Token"] = self.csrf_token
+        return headers
+
+    async def _post_login(self, path: str, two_factor_code: str | None) -> tuple[int, str, dict | None]:
+        """
+        Отправляет логин/пароль (и код 2FA) на панель.
+
+        Сначала JSON (3x-ui v2.4+ / v3.x), при не-JSON ответе — form-data
+        (для старых сборок Gin). Возвращает (HTTP-статус, тело, JSON или None).
+        """
+        payload = {"username": XUI_USERNAME, "password": XUI_PASSWORD}
+        if two_factor_code:
+            payload["twoFactorCode"] = two_factor_code
+
+        headers = self._login_headers()
+
+        async with self.session.post(
+            f"{XUI_URL}{path}",
+            json=payload,
+            headers=headers,
+            proxy=XUI_PROXY,
+        ) as resp:
+            status = resp.status
+            raw = await resp.text()
+
+        try:
+            return status, raw, json.loads(raw)
+        except ValueError:
+            data = None
+
+        if status in (404, 405):
+            return status, raw, data
+
+        # Ответ не JSON — пробуем form-data
+        async with self.session.post(
+            f"{XUI_URL}{path}",
+            data=payload,
+            headers=headers,
+            proxy=XUI_PROXY,
+        ) as form_resp:
+            form_raw = await form_resp.text()
+            try:
+                return form_resp.status, form_raw, json.loads(form_raw)
+            except ValueError:
+                return status, raw, None
+
+    async def _login(self, paths: tuple[str, ...], login_errors: list[str], shift_windows: int = 0) -> None:
+        """
+        Пробует войти в панель по указанным путям.
+
+        При успехе просто возвращает управление, иначе бросает XUIError
+        с понятным описанием проблемы.
+        """
+        two_factor_code: str | None = None
+        if XUI_2FA_SECRET:
+            two_factor_code = await self._fresh_totp_code(shift_windows)
+            logger.info(
+                "Вход в 3x-ui с кодом двухфакторной аутентификации (окно %+d, рассинхрон часов %.0f сек).",
+                shift_windows,
+                self.server_time_offset,
+            )
+
+        for login_path in paths:
+            try:
+                status, raw, data = await self._post_login(login_path, two_factor_code)
+            except Exception as exc:
+                login_errors.append(f"{login_path} -> {exc}")
+                continue
+
+            if status in (404, 405):
+                login_errors.append(f"{login_path} -> HTTP {status}")
+                continue
+
+            if data is None:
+                login_errors.append(f"{login_path} -> не JSON (HTTP {status}): {_snip(raw)}")
+                continue
+
+            if data.get("success"):
+                logger.info("Успешный вход в 3x-ui через %s", login_path)
+                return
+
+            # Панель ответила осмысленно, но отклонила вход
+            msg = data.get("msg") or raw[:200]
+            raise XUIError(self._login_rejected_message(msg))
+
+        raise XUIError(self._login_failed_message(login_errors))
+
+    def _login_rejected_message(self, msg: str) -> str:
+        """Понятное объяснение отказа во входе с учётом 2FA."""
+        text = (
+            f"❌ Панель 3x-ui отклонила логин/пароль:\n<code>{escape(str(msg))}</code>\n\n"
+            "Проверь <b>XUI_USERNAME</b> и <b>XUI_PASSWORD</b> в Railway Variables.\n\n"
+        )
+        return text + two_factor_hint()
+
+    def _login_failed_message(self, login_errors: list[str]) -> str:
+        """Сообщение, когда ни один из адресов авторизации не ответил внятно."""
+        text = (
+            "❌ Не удалось войти в панель 3x-ui:\n"
+            + "\n".join(f"• {e}" for e in login_errors)
+            + "\n\n<b>Возможные причины:</b>\n"
+            "1. Неверный путь панели. Если панель открывается как <code>https://ip:port/mysecret</code>, "
+            "обязательно укажи секретный путь в <b>XUI_URL</b>.\n"
+            "2. Защита хостера (Cloudflare / DDoS-Guard) блокирует запросы Railway."
+        )
+        if self.two_factor_enabled is True and not XUI_2FA_SECRET:
+            text += "\n3. В панели включена 2FA — нужен <b>XUI_2FA_SECRET</b> или <b>XUI_TOKEN</b>."
+        return text
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.session and not self.session.closed:
@@ -1133,12 +1492,22 @@ async def cmd_panel_debug(message: Message):
         await message.answer("❌ XUI_URL не задан в Railway Variables.")
         return
 
+    if not XUI_2FA_SECRET:
+        two_factor_state = "не задан"
+    elif totp_secret_problem(XUI_2FA_SECRET):
+        two_factor_state = f"⚠️ некорректный ({totp_secret_problem(XUI_2FA_SECRET)})"
+    else:
+        two_factor_state = "задан ✅"
+    secret_tail = f"…{XUI_2FA_SECRET[-4:]}" if len(XUI_2FA_SECRET) > 4 else "—"
+
     lines = [
         "🔍 <b>Диагностика подключения к 3x-ui:</b>\n",
         f"• <b>URL:</b> <code>{escape(XUI_URL)}</code>",
         f"• <b>Прокси:</b> <code>{escape(str(XUI_PROXY or 'нет'))}</code>",
         f"• <b>Логин:</b> <code>{escape(XUI_USERNAME or 'не задан')}</code>",
         f"• <b>API Token:</b> <code>{'задан' if XUI_TOKEN else 'не задан'}</code>",
+        f"• <b>XUI_2FA_SECRET:</b> <code>{escape(two_factor_state)}</code>"
+        + (f" <i>(оканчивается на <code>{secret_tail}</code>)</i>" if two_factor_state == "задан ✅" else ""),
         "",
     ]
 
@@ -1175,7 +1544,7 @@ async def cmd_panel_debug(message: Message):
         except Exception as exc:
             lines.append(f"2. <b>GET /csrf-token</b> -> ❌ {escape(str(exc))}")
 
-        # POST /login (тест)
+        # POST /login (тест) — заодно проверяем, не требует ли панель код 2FA
         try:
             async with session.post(
                 f"{XUI_URL}/login",
@@ -1188,7 +1557,89 @@ async def cmd_panel_debug(message: Message):
         except Exception as exc:
             lines.append(f"3. <b>POST /login</b> -> ❌ {escape(str(exc))}")
 
+        # POST /getTwoFactorEnable — узнаём у панели, включена ли 2FA
+        try:
+            async with session.post(
+                f"{XUI_URL}/getTwoFactorEnable",
+                headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+                proxy=XUI_PROXY,
+            ) as resp:
+                body = await resp.text()
+                lines.append(f"4. <b>POST /getTwoFactorEnable</b> -> HTTP {resp.status}: {_snip(body, 80)}")
+                panel_2fa = None
+                try:
+                    parsed = json.loads(body)
+                    if isinstance(parsed, dict) and "obj" in parsed:
+                        panel_2fa = bool(parsed.get("obj"))
+                except ValueError:
+                    pass
+                secret_ok = bool(XUI_2FA_SECRET) and not totp_secret_problem(XUI_2FA_SECRET)
+                if panel_2fa is True and secret_ok:
+                    lines.append("   ✅ <i>2FA включена, XUI_2FA_SECRET задан — бот передаёт код автоматически.</i>")
+                elif panel_2fa is True:
+                    lines.append("   ⚠️ <i>В панели включена 2FA, а XUI_2FA_SECRET не задан/некорректен — вход не удастся.</i>")
+                elif panel_2fa is False:
+                    lines.append("   ✅ <i>2FA в панели выключена.</i>")
+        except Exception as exc:
+            lines.append(f"4. <b>POST /getTwoFactorEnable</b> -> ❌ {escape(str(exc))}")
+
+        # Текущий код 2FA по секрету из переменной (для проверки, что секрет верный)
+        if XUI_2FA_SECRET and not totp_secret_problem(XUI_2FA_SECRET):
+            now = time.time()
+            lines.append(
+                f"5. <b>Код 2FA из XUI_2FA_SECRET:</b> "
+                f"<code>{totp_code(XUI_2FA_SECRET, at=now)}</code> (осталось {totp_seconds_left(now):.0f} сек)"
+            )
+            lines.append(
+                "   <i>Сравни с кодом в Google Authenticator. Если не совпадает — секрет другой.</i>"
+            )
+        elif XUI_2FA_SECRET:
+            lines.append(f"5. <b>XUI_2FA_SECRET:</b> ⚠️ {escape(str(totp_secret_problem(XUI_2FA_SECRET)))}")
+        else:
+            lines.append("5. <b>XUI_2FA_SECRET:</b> не задан — вход только по логину/паролю или XUI_TOKEN.")
+
     await message.answer("\n".join(lines)[:4000], parse_mode="HTML")
+
+
+@dp.message(Command("totp"))
+async def cmd_totp(message: Message):
+    """Показывает текущий код Google Authenticator для входа в панель (только админ)."""
+    if ADMIN_ID > 0 and message.from_user.id != ADMIN_ID:
+        await message.answer("⛔️ Команда доступна только администратору.")
+        return
+
+    if not XUI_2FA_SECRET:
+        await message.answer(
+            "ℹ️ Переменная <b>XUI_2FA_SECRET</b> не задана, поэтому код 2FA бот не считает.\n\n"
+            "Добавь секрет из 3x-ui → Settings → Security → Two-factor authentication "
+            "(кнопка показа секрета или QR-код) в Railway → Variables, и эта команда "
+            "будет показывать актуальный код.",
+            parse_mode="HTML",
+        )
+        return
+
+    problem = totp_secret_problem(XUI_2FA_SECRET)
+    if problem:
+        await message.answer(
+            f"⚠️ <b>XUI_2FA_SECRET заполнен некорректно:</b> <i>{escape(problem)}</i>\n\n"
+            "Скопируй секрет заново из 3x-ui → Settings → Security → Two-factor authentication "
+            "(можно вставить и целиком ссылку <code>otpauth://…</code> из QR-кода).",
+            parse_mode="HTML",
+        )
+        return
+
+    now = time.time()
+    left = totp_seconds_left(now)
+    bar = "▰" * int(left / TOTP_PERIOD * 10) + "▱" * (10 - int(left / TOTP_PERIOD * 10))
+    await message.answer(
+        "🔐 <b>Код Google Authenticator для панели 3x-ui:</b>\n\n"
+        f"<code>{totp_code(XUI_2FA_SECRET, at=now)}</code>\n"
+        f"{bar} <i>осталось {left:.0f} сек</i>\n\n"
+        f"<i>Секрет оканчивается на <code>…{XUI_2FA_SECRET[-4:]}</code>. "
+        "Код обновляется каждые 30 секунд и подходит для входа в панель из браузера.</i>\n\n"
+        "⚠️ <i>Не пересылай этот код и не показывай его другим: он даёт доступ к панели.</i>",
+        parse_mode="HTML",
+    )
 
 
 # =========================
@@ -1327,6 +1778,7 @@ async def on_startup():
             BotCommand(command="inbounds", description="📡 Список подключений 3x-ui"),
             BotCommand(command="reset_vpn", description="🔄 Сбросить тестовый ключ"),
             BotCommand(command="panel_debug", description="🔍 Диагностика панели"),
+            BotCommand(command="totp", description="🔐 Код 2FA для входа в панель"),
             BotCommand(command="myid", description="👤 Узнать свой Telegram ID"),
         ]
         await bot.set_my_commands(commands)
