@@ -2033,9 +2033,11 @@ def crypto_amount_for_rub(price_rub: float, rate: float, asset: str) -> str:
 class CryptoPayClient:
     """Минимальный клиент Crypto Pay API (https://help.crypt.bot/crypto-pay-api)."""
 
-    def __init__(self, token: str = "", api_url: str = CRYPTOBOT_API_URL):
+    def __init__(self, token: str = "", api_url: str = ""):
         self.token = token or CRYPTOBOT_TOKEN
-        self.api_url = api_url.rstrip("/")
+        # Адрес берём в момент создания клиента, а не на старте модуля: так клиент
+        # корректно работает и после смены переменных окружения (и в тестах).
+        self.api_url = (api_url or CRYPTOBOT_API_URL).rstrip("/")
 
     def _headers(self) -> dict:
         return {"Crypto-Pay-API-Token": self.token, "Content-Type": "application/json"}
@@ -2219,6 +2221,32 @@ def _paid_client_payload(
     return payload
 
 
+def comment_has_payment_ref(comment: str | None, payment_ref: str) -> bool:
+    """
+    Проверяет, что подписка в панели уже выдана именно по этому платежу.
+
+    Комментарий клиента выглядит как «basic до 17.10.2026 | cryptobot-1», поэтому
+    сравниваем только хвост после «|»: иначе короткий ref вроде «2» совпал бы
+    с цифрами в дате и бот зря решил бы, что ключ уже выдан.
+    """
+    ref = (payment_ref or "").strip()[:40]
+    if not ref:
+        return False
+    text = str(comment or "").strip()
+    if not text:
+        return False
+    tail = text.rsplit("|", 1)[-1].strip() if "|" in text else text
+    return tail == ref
+
+
+def order_charge_id(order: dict) -> str:
+    """Идентификатор платежа заказа — тот же, что приходит в вебхуке и при проверке."""
+    if order.get("mode") == "crypto" or order.get("invoice_id"):
+        invoice_id = order.get("invoice_id")
+        return f"cryptobot-{invoice_id}" if invoice_id else ""
+    return str(order.get("payment_id") or "")
+
+
 async def activate_paid_subscription(
     telegram_id: int,
     tariff_key: str,
@@ -2248,7 +2276,7 @@ async def activate_paid_subscription(
         existing = next((c for c in clients if str(c.get("email")) == target_email), None)
 
         # Уже выдан по этому платежу? (журнал мог не сохраниться — смотрим в панель)
-        if existing is not None and payment_ref and payment_ref[:40] in str(existing.get("comment") or ""):
+        if existing is not None and comment_has_payment_ref(existing.get("comment"), payment_ref):
             logger.info("Подписка %s уже выдана по платежу %s — повторно не продлеваю.", target_email, payment_ref)
             return {
                 "email": target_email,
@@ -2668,6 +2696,7 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
         return
 
     # ЮKassa: создаём платёж и отдаём ссылку на оплату
+    order = await payment_store.create(new_order(tg_id, tariff_key))
     client = make_yookassa_client()
     payment = await client.create_payment(order)
     payment_id = payment.get("id")
@@ -3826,7 +3855,7 @@ async def cb_check_payment(cb: CallbackQuery):
         try:
             result = await fulfill_order(
                 order,
-                charge_id=str(order.get("payment_id") or "") or details,
+                charge_id=order_charge_id(order) or details,
             )
         except Exception as exc:
             logger.exception("Ручная проверка оплаты: выдача не удалась: %s", exc)
@@ -3924,8 +3953,8 @@ async def cmd_payments(message: Message):
 
     if not payments_enabled():
         lines.append(
-            "\n⚠️ <b>Оплата выключена.</b> Задай PAYMENTS_MODE=stars (проще всего), "
-            "provider или yookassa — инструкция в README."
+            "\n⚠️ <b>Оплата выключена.</b> Задай PAYMENTS_MODE=stars или crypto "
+            "(проще всего), provider либо yookassa — инструкция в README."
         )
 
     await message.answer("\n".join(lines)[:4000], parse_mode="HTML")
