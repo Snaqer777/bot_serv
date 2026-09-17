@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import difflib
 import hashlib
 import hmac
 import json
@@ -806,22 +807,99 @@ class XUIClient:
         group = as_dict(data).get("group")
         return str(group) if group else None
 
-    async def add_clients_to_group(self, emails: list[str]) -> str:
+    async def resolve_client_group(self) -> tuple[str | None, str]:
         """
-        Помечает клиентов группой из переменной XUI_CLIENT_GROUP.
+        Находит в панели группу XUI_CLIENT_GROUP, чтобы клиенты попадали
+        именно в уже созданную группу, а не в новую с похожим названием.
 
-        Панель сама создаёт группу, если её ещё нет. Возвращает статус:
-          • 'assigned'    — клиент в нужной группе (проверено);
-          • 'unsupported' — версия панели не умеет группы (нужна 3x-ui 3.2+);
+        Возвращает (название группы в панели, статус):
+          • ('bot-test', 'exists')  — группа уже создана в панели (регистр поправлен, если отличался);
+          • ('bot-test', 'new')     — такой группы в панели нет, она будет создана;
+          • (None, 'unsupported')   — версия панели не умеет группы (нужна 3x-ui 3.2+);
+          • (None, 'disabled')      — переменная XUI_CLIENT_GROUP не задана.
+        """
+        if not XUI_CLIENT_GROUP:
+            return None, "disabled"
+
+        groups = await self.list_groups()
+        if groups is None:
+            return None, "unsupported"
+
+        existed = self.group_exists(groups)
+        if existed:
+            # В панели группа уже есть — берём её точное название (регистр и пробелы).
+            if existed != XUI_CLIENT_GROUP:
+                logger.info(
+                    "Группа «%s» найдена в панели как «%s» — использую название из панели.",
+                    XUI_CLIENT_GROUP,
+                    existed,
+                )
+            return existed, "exists"
+
+        close = self.similar_groups(groups)
+        if close:
+            logger.warning(
+                "Группы «%s» в панели нет. Похожие названия: %s — проверь XUI_CLIENT_GROUP, "
+                "иначе будет создана новая группа.",
+                XUI_CLIENT_GROUP,
+                ", ".join(f"«{name}»" for name in close),
+            )
+        return XUI_CLIENT_GROUP, "new"
+
+    @staticmethod
+    def group_names(groups: list[dict]) -> list[str]:
+        """Названия групп из ответа панели."""
+        return [str(g.get("name") or "").strip() for g in (groups or []) if str(g.get("name") or "").strip()]
+
+    @classmethod
+    def group_exists(cls, groups: list[dict], wanted: str | None = None) -> str | None:
+        """
+        Ищет группу в панели и возвращает её точное название, если она есть.
+
+        Сначала точное совпадение, затем сравнение без учёта регистра —
+        чтобы «bot-test» из переменной попал в существующую группу «Bot-Test»,
+        а не создал вторую.
+        """
+        names = cls.group_names(groups)
+        target = (wanted or XUI_CLIENT_GROUP).strip()
+
+        if target in names:
+            return target
+        for name in names:
+            if name.casefold() == target.casefold():
+                return name
+        return None
+
+    @classmethod
+    def similar_groups(cls, groups: list[dict]) -> list[str]:
+        """Похожие названия групп — подсказка при опечатке в XUI_CLIENT_GROUP."""
+        names = cls.group_names(groups)
+        target = XUI_CLIENT_GROUP.casefold()
+        close = difflib.get_close_matches(target, [n.casefold() for n in names], n=3, cutoff=0.7)
+        return [name for name in names if name.casefold() in close]
+
+    async def add_clients_to_group(self, emails: list[str], group_name: str, existed: bool | None = None) -> str:
+        """
+        Помечает клиентов указанной группой панели (обычно уже существующей).
+
+        :param existed: была ли группа в панели до создания клиента. Если None —
+            бот проверяет сам (для вызовов вне обычной выдачи ключа).
+
+        Возвращает статус:
+          • 'assigned'    — клиент в уже созданной группе (проверено);
+          • 'assigned_new'— такой группы в панели не было, панель её создала;
           • 'not_assigned'— панель приняла запрос, но группа не подтвердилась;
-          • 'skipped'     — XUI_CLIENT_GROUP не задана.
+          • 'skipped'     — группа не задана.
         Ошибки не пробрасываем: клиент уже создан, группа — дополнительный штрих.
         """
         emails = [e for e in emails if e]
-        if not XUI_CLIENT_GROUP or not emails:
+        if not XUI_CLIENT_GROUP or not group_name or not emails:
             return "skipped"
 
-        payload = {"emails": emails, "group": XUI_CLIENT_GROUP}
+        if existed is None:
+            existed = self.group_exists(await self._safe_groups(), group_name) is not None
+        payload = {"emails": emails, "group": group_name}
+
         for attempt in range(2):
             try:
                 result = as_dict(await self.request("POST", self.GROUP_BULK_ADD_PATH, json=payload))
@@ -832,24 +910,32 @@ class XUIClient:
                         _snip(str(exc), 120),
                     )
                     return "unsupported"
-                logger.warning("Не удалось добавить клиента в группу «%s»: %s", XUI_CLIENT_GROUP, exc)
+                logger.warning("Не удалось добавить клиента в группу «%s»: %s", group_name, exc)
                 return "not_assigned"
 
             if int(result.get("affected") or 0) > 0:
-                logger.info("Клиент %s добавлен в группу 3x-ui «%s».", emails[0], XUI_CLIENT_GROUP)
-                return "assigned"
+                logger.info("Клиент %s добавлен в группу 3x-ui «%s».", emails[0], group_name)
+                return "assigned" if existed else "assigned_new"
 
             # Панель могла сохранить группу сразу из payload клиента (affected=0)
             # либо ещё не синхронизировать нового клиента в свою базу — проверяем.
-            if await self.client_group(emails[0]) == XUI_CLIENT_GROUP:
-                logger.info("Клиент %s уже состоит в группе 3x-ui «%s».", emails[0], XUI_CLIENT_GROUP)
-                return "assigned"
+            if (await self.client_group(emails[0]) or "").casefold() == group_name.casefold():
+                logger.info("Клиент %s уже состоит в группе 3x-ui «%s».", emails[0], group_name)
+                return "assigned" if existed else "assigned_new"
 
             if attempt == 0:
                 await asyncio.sleep(1.0)
 
-        logger.warning("Клиент %s создан, но остался без группы «%s».", emails[0], XUI_CLIENT_GROUP)
+        logger.warning("Клиент %s создан, но остался без группы «%s».", emails[0], group_name)
         return "not_assigned"
+
+    async def _safe_groups(self) -> list[dict]:
+        """Список групп панели; на старых версиях — пустой список."""
+        try:
+            groups = await self.list_groups()
+        except XUIError:
+            return []
+        return groups or []
 
     async def get_inbound(self, inbound_id: int) -> dict:
         """Получает данные конкретного подключения."""
@@ -1173,7 +1259,13 @@ def build_vless_link(client: dict, inbound: dict, params: dict) -> str:
     return f"vless://{client['id']}@{host}:{port}?{query}#{label}"
 
 
-def _test_client_payload(telegram_id: int, client_uuid: str, now_ms: int, inbound: dict) -> dict:
+def _test_client_payload(
+    telegram_id: int,
+    client_uuid: str,
+    now_ms: int,
+    inbound: dict,
+    group_name: str = "",
+) -> dict:
     """Генерирует payload клиента для 3x-ui с корректными типами полей."""
     stream = as_dict(inbound.get("streamSettings"))
     network = stream.get("network", "tcp")
@@ -1195,21 +1287,30 @@ def _test_client_payload(telegram_id: int, client_uuid: str, now_ms: int, inboun
         "reset": 0,
     }
 
-    # Группа клиента (3x-ui 3.2+; на старых сборках поле просто игнорируется)
-    if XUI_CLIENT_GROUP:
-        payload["group"] = XUI_CLIENT_GROUP
+    # Группа клиента (3x-ui 3.2+; на старых сборках поле просто игнорируется).
+    # Название берём из панели — чтобы клиент попал в уже созданную группу.
+    if XUI_CLIENT_GROUP and group_name:
+        payload["group"] = group_name
 
     return payload
 
 
-def _group_note(status: str) -> str:
+def _group_note(status: str, group_name: str | None = None) -> str:
     """Пояснение к статусу добавления клиента в группу 3x-ui."""
-    if not XUI_CLIENT_GROUP:
+    if not XUI_CLIENT_GROUP or status == "skipped":
         return ""
 
-    group = f"<code>{escape(XUI_CLIENT_GROUP)}</code>"
+    name = group_name or XUI_CLIENT_GROUP
+    group = f"<code>{escape(name)}</code>"
+
     if status == "assigned":
-        return f"\n🏷 <b>Группа:</b> клиент в группе {group} в панели 3x-ui."
+        return f"\n🏷 <b>Группа:</b> клиент добавлен в существующую группу {group}."
+    if status == "assigned_new":
+        return (
+            f"\n🏷 <b>Группа:</b> клиент добавлен в группу {group}.\n"
+            "⚠️ <i>Такой группы в панели раньше не было — если нужна другая (уже созданная), "
+            "проверь название командой /groups.</i>"
+        )
     if status == "unsupported":
         return (
             "\n⚠️ <b>Группы недоступны:</b> эта версия панели 3x-ui не поддерживает группы "
@@ -1246,6 +1347,24 @@ async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool
             None,
         )
 
+        # Группа: ищем в панели именно ту, что указана в XUI_CLIENT_GROUP,
+        # чтобы клиент попал в уже существующую, а не в новую с похожим названием.
+        group_name, group_state = await client.resolve_client_group()
+        if group_state == "exists":
+            logger.info("Клиенты бота будут добавлены в существующую группу 3x-ui «%s».", group_name)
+
+        async def assign_group() -> str:
+            """Досылает клиента в настроенную группу (если она есть)."""
+            if group_state == "unsupported":
+                return "unsupported"
+            if group_state == "disabled" or not group_name:
+                return "skipped"
+            # Важно: existed вычислен ДО создания клиента — панель могла создать
+            # группу сама из payload, и тогда проверка после факта дала бы ложное «уже была».
+            return await client.add_clients_to_group(
+                [target_email], group_name, existed=(group_state == "exists")
+            )
+
         now_ms = int(time.time() * 1000)
 
         if existing is not None:
@@ -1258,7 +1377,7 @@ async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool
                 sub_id = existing.get("subId")
                 sub_link = f"{XUI_URL}/sub/{sub_id}" if sub_id else None
                 # Клиент мог быть создан до настройки группы — досылаем его в группу
-                group_note = _group_note(await client.add_clients_to_group([target_email]))
+                group_note = _group_note(await assign_group(), group_name)
                 return link, "exists", inbound, auto_picked, sub_link, group_note
 
             # Если ключ истёк или выключен — продлеваем на 24 часа
@@ -1267,23 +1386,24 @@ async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool
                 existing.get("id") or str(uuid.uuid4()),
                 now_ms,
                 inbound,
+                group_name or "",
             )
             await client.update_client(inbound_id, payload)
             link = build_vless_link(payload, inbound, params)
             sub_id = payload.get("subId")
             sub_link = f"{XUI_URL}/sub/{sub_id}" if sub_id else None
-            group_note = _group_note(await client.add_clients_to_group([target_email]))
+            group_note = _group_note(await assign_group(), group_name)
             return link, "updated", inbound, auto_picked, sub_link, group_note
 
         # Клиента ещё нет — регистрируем нового
         new_uuid = str(uuid.uuid4())
-        payload = _test_client_payload(telegram_id, new_uuid, now_ms, inbound)
+        payload = _test_client_payload(telegram_id, new_uuid, now_ms, inbound, group_name or "")
         await client.add_client(inbound_id, payload)
 
         link = build_vless_link(payload, inbound, params)
         sub_id = payload.get("subId")
         sub_link = f"{XUI_URL}/sub/{sub_id}" if sub_id else None
-        group_note = _group_note(await client.add_clients_to_group([target_email]))
+        group_note = _group_note(await assign_group(), group_name)
         return link, "created", inbound, auto_picked, sub_link, group_note
 
 
@@ -1651,25 +1771,43 @@ async def cmd_groups(message: Message):
             )
             return
 
+        bot_group = XUIClient.group_exists(groups) if XUI_CLIENT_GROUP else None
+
         lines = ["🏷 <b>Группы клиентов в панели 3x-ui:</b>\n"]
         for group in groups:
             name = str(group.get("name") or "")
             count = group.get("clientCount")
-            mark = " ⬅️ <i>использует бот</i>" if XUI_CLIENT_GROUP and name == XUI_CLIENT_GROUP else ""
+            mark = " ⬅️ <i>использует бот</i>" if bot_group and name == bot_group else ""
             used = _human_bytes(group.get("trafficUsed")) if group.get("trafficUsed") else None
             details = f"{count} клиент(ов)" if count is not None else "—"
             if used:
                 details += f", трафик: {used}"
             lines.append(f"• <code>{escape(name)}</code> — {details}{mark}")
 
-        if XUI_CLIENT_GROUP:
+        if not XUI_CLIENT_GROUP:
             lines.append(
-                f"\n✅ Новые клиенты бота добавляются в группу <code>{escape(XUI_CLIENT_GROUP)}</code>."
+                "\n💡 Задай <b>XUI_CLIENT_GROUP</b> в Railway → Variables с названием нужной группы — "
+                "клиенты бота будут попадать в неё (например <code>bot-test</code>)."
+            )
+        elif bot_group:
+            exact = "" if bot_group == XUI_CLIENT_GROUP else f" <i>(в переменной — «{escape(XUI_CLIENT_GROUP)}»)</i>"
+            lines.append(
+                f"\n✅ Клиенты бота добавляются в существующую группу "
+                f"<code>{escape(bot_group)}</code>{exact}."
             )
         else:
+            similar = XUIClient.similar_groups(groups)
+            hint = (
+                "\n🔍 Похожие названия: " + ", ".join(f"<code>{escape(name)}</code>" for name in similar)
+                if similar
+                else ""
+            )
             lines.append(
-                "\n💡 Задай <b>XUI_CLIENT_GROUP</b> в Railway → Variables, чтобы клиенты бота "
-                "складывались в отдельную группу (например <code>bot-test</code>)."
+                f"\n⚠️ Группы <code>{escape(XUI_CLIENT_GROUP)}</code> в панели нет — панель создаст её "
+                "при выдаче следующего ключа.\n"
+                "<i>Если нужна уже существующая группа, задай её название в XUI_CLIENT_GROUP точно так, "
+                "как оно указано в списке выше.</i>"
+                f"{hint}"
             )
 
         await message.answer("\n".join(lines), parse_mode="HTML")
@@ -1816,12 +1954,24 @@ async def cmd_panel_debug(message: Message):
                     f"6. <b>Группы клиентов</b> -> доступны ({len(groups)} шт.), но <b>XUI_CLIENT_GROUP</b> не задана"
                 )
             else:
-                names = [str(g.get("name") or "") for g in groups]
-                found = XUI_CLIENT_GROUP in names
-                lines.append(
-                    f"6. <b>Группа бота:</b> <code>{escape(XUI_CLIENT_GROUP)}</code> -> "
-                    + ("✅ есть в панели" if found else "ℹ️ пока не создана (появится при выдаче ключа)")
-                )
+                found = XUIClient.group_exists(groups)
+                if found:
+                    exact = "" if found == XUI_CLIENT_GROUP else f" (в панели называется «{escape(found)}»)"
+                    lines.append(
+                        f"6. <b>Группа бота:</b> <code>{escape(XUI_CLIENT_GROUP)}</code> -> "
+                        f"✅ найдена в панели, клиенты попадут в неё{exact}"
+                    )
+                else:
+                    similar = XUIClient.similar_groups(groups)
+                    hint = (
+                        " Похожие: " + ", ".join(f"<code>{escape(n)}</code>" for n in similar) + "."
+                        if similar
+                        else ""
+                    )
+                    lines.append(
+                        f"6. <b>Группа бота:</b> <code>{escape(XUI_CLIENT_GROUP)}</code> -> "
+                        f"⚠️ в панели не найдена, будет создана новая (проверь название).{hint}"
+                    )
 
     await message.answer("\n".join(lines)[:4000], parse_mode="HTML")
 
