@@ -1567,11 +1567,12 @@ async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool
         clients = settings.get("clients") or []
         target_email = f"tg-test-{telegram_id}"
 
+        # ВАЖНО: ищем только тестового клиента (tg-test-*). Платная подписка того же
+        # человека (tg-paid-*) — отдельный клиент, тестовый ключ её не трогает.
         existing = next(
             (
                 c for c in clients
-                if isinstance(c, dict)
-                and (str(c.get("email")) == target_email or str(c.get("tgId")) == str(telegram_id))
+                if isinstance(c, dict) and str(c.get("email")) == target_email
             ),
             None,
         )
@@ -1648,8 +1649,7 @@ async def delete_test_key(telegram_id: int) -> bool:
         existing = next(
             (
                 c for c in clients
-                if isinstance(c, dict)
-                and (str(c.get("email")) == target_email or str(c.get("tgId")) == str(telegram_id))
+                if isinstance(c, dict) and str(c.get("email")) == target_email
             ),
             None,
         )
@@ -5470,13 +5470,14 @@ async def send_profile(message: Message, user_id: int):
         except Exception:
             pass
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💰 Продлить / сменить тариф", callback_data="tariffs")],
-            [InlineKeyboardButton(text="🔑 Тестовый ключ (24 ч)", callback_data="get_test_key_btn")],
-            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
-        ]
-    )
+    profile_rows = [[InlineKeyboardButton(text="💰 Продлить / сменить тариф", callback_data="tariffs")]]
+    # Бесплатный тест предлагаем только тем, кому он доступен (TRIAL_PUBLIC=1 или админ).
+    if trial_available_for(user_id):
+        profile_rows.append([InlineKeyboardButton(text="🔑 Тестовый ключ (24 ч)",
+                                                  callback_data="get_test_key_btn")])
+    profile_rows.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=profile_rows)
     await message.answer("\n".join(lines), reply_markup=keyboard, parse_mode="HTML")
 
 
