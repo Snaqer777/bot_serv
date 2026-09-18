@@ -198,6 +198,8 @@ async def step_start(bot):
     check("текст соглашения умещается в лимит Telegram",
           max(len(t) for t in texts_to(ADMIN)) < 4096,
           f"{max(len(t) for t in texts_to(ADMIN))} символов")
+    check("соглашение приходит свёрнутой цитатой (тап — «Показать полностью»)",
+          any("<blockquote expandable>" in t for t in texts_to(ADMIN)))
     check("под соглашением кнопка «Согласен — продолжить»",
           "accept_terms" in gate_kb, str(gate_kb))
     check("меню до подтверждения не показывается", "tariffs" not in gate_kb)
@@ -502,7 +504,8 @@ async def step_admin_tools(bot):
 
     await bot.cmd_terms(make_message(bot, STRANGER, "/terms"))
     check("/terms отдаёт соглашение", "ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ" in last_text(STRANGER)
-          and "10. Заключительные положения" in last_text(STRANGER))
+          and "10. Заключительные положения" in last_text(STRANGER)
+          and "<blockquote expandable>" in last_text(STRANGER))
 
 
 async def step_production_bot(store_file, ref_file):

@@ -443,7 +443,16 @@ async def test_terms_in_bot():
           "Telegram ID" in text and "не передаются третьим лицам" in text)
     check("оплата: CryptoBot и Telegram Stars", "CryptoBot" in text and "Telegram Stars" in text)
     check("теги HTML закрыты",
-          text.count("<b>") == text.count("</b>") and text.count("<i>") == text.count("</i>"))
+          text.count("<b>") == text.count("</b>") and text.count("<i>") == text.count("</i>")
+          and text.count("<blockquote expandable>") == 1 and text.count("</blockquote>") == 1)
+    check("документ свёрнут в раскрывающуюся цитату",
+          "<blockquote expandable>" in text and text.endswith("</blockquote>"),
+          text[-40:])
+    check("заголовок соглашения остаётся видимым (вне цитаты)",
+          text.index("ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ") < text.index("<blockquote expandable>"))
+    check("внутри цитаты лежит весь текст разделов",
+          text.index("1. Общие положения") > text.index("<blockquote expandable>")
+          and text.index("10. Заключительные положения") < text.index("</blockquote>"))
 
     msg = FakeMsg(text="/terms")
     await bot.cmd_terms(msg)
