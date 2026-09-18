@@ -307,6 +307,14 @@ CRYPTOBOT_ASSET = (os.getenv("CRYPTOBOT_ASSET") or "USDT").strip().upper()
 # PAYMENTS_ALLOW_TEST_PAY=1 (после проверки её лучше убрать).
 PAYMENTS_ALLOW_TEST_PAY = (os.getenv("PAYMENTS_ALLOW_TEST_PAY") or "").strip().lower() in ("1", "true", "yes", "on")
 
+# Видны ли тестовые команды (/test_pay, /crypto_check) и их кнопки.
+# По умолчанию — только когда включена проверка без оплаты (PAYMENTS_ALLOW_TEST_PAY=1)
+# или бот работает в тестовой сети Crypto Pay (CRYPTOBOT_TEST=1). В обычном режиме
+# этих команд в боте нет совсем: ни в меню Telegram, ни в /payments.
+# TEST_TOOLS=0 — спрятать даже в тестовой сети (бот выглядит полностью боевым);
+# TEST_TOOLS=1 — включить принудительно.
+TEST_TOOLS_RAW = (os.getenv("TEST_TOOLS") or "").strip().lower()
+
 # Сколько рублей в одной единице валюты (курс фиксируется вручную).
 # Если не задан — бот берёт курс у Crypto Pay (getExchangeRates).
 CRYPTOBOT_RUB_RATE = float((os.getenv("CRYPTOBOT_RUB_RATE") or "0").replace(",", "."))
@@ -328,6 +336,17 @@ REFERRAL_INVITED_BONUS_DAYS = _int_env("REFERRAL_INVITED_BONUS_DAYS", 3)
 REFERRAL_STORE_FILE = (os.getenv("REFERRAL_STORE_FILE") or "data/referrals.json").strip()
 # Username бота для реферальной ссылки. Если не задан — бот спросит его у Telegram.
 BOT_USERNAME = (os.getenv("BOT_USERNAME") or "").strip().lstrip("@")
+
+# --- Сервис и документы ---
+# Название сервиса — подставляется в тексты (например, в соглашение).
+SERVICE_NAME = (os.getenv("SERVICE_NAME") or "VPN-сервис").strip()
+# Username поддержки без @ — куда писать пользователю. Используется и в соглашении.
+SUPPORT_USERNAME = (os.getenv("SUPPORT_USERNAME") or "Suppr_XYZ").strip().lstrip("@")
+# Кто оказывает услугу (для соглашения): ИП/ООО/самозанятый и город.
+# Если не задано — в тексте будет «администрация сервиса», а реквизиты выдаст поддержка.
+TERMS_OPERATOR = (os.getenv("TERMS_OPERATOR") or "").strip()
+# Дата последней редакции соглашения (меняется вручную при правках текста).
+TERMS_UPDATED = (os.getenv("TERMS_UPDATED") or "18.09.2026").strip()
 
 # ЮKassa: Shop ID и секретный ключ (Интеграция -> Ключи API). test_* ключи = тестовый магазин.
 YOOKASSA_SHOP_ID = (os.getenv("YOOKASSA_SHOP_ID") or "").strip()
@@ -2313,6 +2332,19 @@ def test_pay_enabled() -> bool:
     return PAYMENTS_ALLOW_TEST_PAY
 
 
+def test_tools_enabled() -> bool:
+    """
+    Показывать ли тестовые команды (/test_pay, /crypto_check) и их кнопки.
+
+    В боевом режиме их нет: команды не регистрируются вообще, кнопки не выводятся,
+    в меню Telegram они не попадают. Включаются сами в тестовой сети Crypto Pay
+    или переменной PAYMENTS_ALLOW_TEST_PAY=1; TEST_TOOLS управляет принудительно.
+    """
+    if TEST_TOOLS_RAW:
+        return TEST_TOOLS_RAW in ("1", "true", "yes", "on")
+    return test_pay_enabled()
+
+
 def payments_mode_title() -> str:
     return {
         "stars": "Telegram Stars ⭐️",
@@ -4154,7 +4186,10 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📲 Как подключиться (пошагово)", callback_data="help_menu")],
             [InlineKeyboardButton(text=f"🎁 Пригласить друга — +{REFERRAL_BONUS_DAYS} "
                                         f"{days_word(REFERRAL_BONUS_DAYS)}", callback_data="invite")],
-            [InlineKeyboardButton(text="💬 Поддержка", callback_data="support")],
+            [
+                InlineKeyboardButton(text="💬 Поддержка", callback_data="support"),
+                InlineKeyboardButton(text="📄 Соглашение", callback_data="terms"),
+            ],
         ]
     )
 
@@ -4205,7 +4240,8 @@ async def cmd_start(message: Message):
         "🎁 Бесплатный тестовый доступ на 24 часа — команда /test_vpn.\n"
         "💰 Платные тарифы — раздел «Тарифы» (оплата и моментальная выдача ключа).\n"
         "📲 Подключение по шагам (со ссылками на приложения) — /help.\n"
-        "👤 Статус подписки и продление — /profile."
+        "👤 Статус подписки и продление — /profile.\n"
+        "📄 Условия сервиса, оплаты и возврата — /terms."
     )
     await message.answer(text, reply_markup=main_menu_kb(), parse_mode="HTML")
 
@@ -4233,7 +4269,8 @@ async def cmd_myid(message: Message):
         )
     elif user_id in ADMIN_IDS:
         extra = f" (в списке {len(ADMIN_IDS)} админ(ов))" if len(ADMIN_IDS) > 1 else ""
-        status_text = f"✅ Ты администратор{extra} — все админ-команды доступны: /panel_debug, /groups, /test_pay."
+        admin_tools = "/panel_debug, /groups" + (", /test_pay" if test_tools_enabled() else "")
+        status_text = f"✅ Ты администратор{extra} — все админ-команды доступны: {admin_tools}."
     else:
         status_text = (
             f"ℹ️ Ты не в списке администраторов. Сейчас там: {admins}.\n"
@@ -4700,11 +4737,8 @@ async def cmd_panel_debug(message: Message):
             lines.append(f"   Вебхук: <code>{escape(webhook_url or 'PUBLIC_BASE_URL не задан')}</code>")
             lines.append("   Настройка: @CryptoBot → /pay → My Apps → Webhooks (необязательно)")
             lines.append(f"   Опрос API: каждые {max(15, CRYPTOBOT_POLL_INTERVAL)} сек (работает и без вебхука)")
-            lines.append(
-                "   Проверка без оплаты: /test_pay "
-                + ("✅ включена" if test_pay_enabled() else "выключена (PAYMENTS_ALLOW_TEST_PAY=1)")
-                + ", связка с Crypto Pay: /crypto_check"
-            )
+            if test_tools_enabled():
+                lines.append("   Проверка без оплаты: /test_pay ✅, связка с Crypto Pay: /crypto_check")
             try:
                 me = await CryptoPayClient().get_me()
                 lines.append(
@@ -4805,6 +4839,8 @@ async def cb_tariffs(cb: CallbackQuery):
             f"• <b>{data['name']}</b> — <b>{tariff_price_label(data)}</b>\n"
             f"  📦 Трафик: {data['traffic']} | 📱 Устройств: {data['ips']} | 🌍 {data['locations']}\n\n"
         )
+
+    text += "📄 <i>Оплачивая любой тариф, ты принимаешь условия сервиса — /terms.</i>\n\n"
 
     if not payments_enabled():
         text += "ℹ️ <i>Приём оплаты временно недоступен — администратор настраивает платёжную систему.</i>\n"
@@ -5016,11 +5052,8 @@ async def cmd_payments(message: Message):
 
     if PAYMENTS_MODE == "stars":
         lines.append(f"• Курс пересчёта: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (меняется через STARS_RUB_RATE)")
-    lines.append(
-        "• Проверка без оплаты: /test_pay "
-        + ("✅ (ключ выдаётся тем же путём, что после оплаты)" if test_pay_enabled()
-           else "— включи PAYMENTS_ALLOW_TEST_PAY=1, если нужно проверить выдачу бесплатно")
-    )
+    if test_tools_enabled():
+        lines.append("• Проверка без оплаты: /test_pay ✅ (ключ выдаётся тем же путём, что после оплаты)")
 
     lines += [
         "",
@@ -5051,16 +5084,14 @@ async def cmd_payments(message: Message):
             "(проще всего), provider либо yookassa — инструкция в README."
         )
 
+    # Кнопки проверок показываем только в тестовом режиме — в боевом их нет.
     keyboard = []
-    if test_pay_enabled():
-        keyboard.append([InlineKeyboardButton(text="🧪 Проверить выдачу ключа без оплаты", callback_data="testpay_menu")])
-    if PAYMENTS_MODE == "crypto":
-        keyboard.append([InlineKeyboardButton(text="🔍 Проверить Crypto Pay (счёт без денег)", callback_data="crypto_check")])
-    else:
-        lines.append(
-            "\n💡 Проверить выдачу ключа, не платя: включи <b>PAYMENTS_ALLOW_TEST_PAY=1</b> "
-            "и отправь /test_pay — бот выдаст ключ тем же путём, что после оплаты."
-        )
+    if test_tools_enabled():
+        keyboard.append([InlineKeyboardButton(text="🧪 Проверить выдачу ключа без оплаты",
+                                              callback_data="testpay_menu")])
+        if PAYMENTS_MODE == "crypto":
+            keyboard.append([InlineKeyboardButton(text="🔍 Проверить Crypto Pay (счёт без денег)",
+                                                  callback_data="crypto_check")])
 
     await message.answer(
         "\n".join(lines)[:4000],
@@ -5095,7 +5126,6 @@ def test_pay_intro() -> str:
     )
 
 
-@dp.message(Command("test_pay"))
 async def cmd_test_pay(message: Message):
     """Проверяет выдачу ключа без реальной оплаты (только админ)."""
     if not is_admin(message.from_user.id):
@@ -5138,7 +5168,6 @@ async def cmd_test_pay(message: Message):
             pass
 
 
-@dp.callback_query(F.data == "testpay_menu")
 async def cb_testpay_menu(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Только для администратора — /myid покажет твой ID.", show_alert=True)
@@ -5150,7 +5179,6 @@ async def cb_testpay_menu(cb: CallbackQuery):
     await cb.message.answer(test_pay_intro(), reply_markup=test_pay_kb(), parse_mode="HTML")
 
 
-@dp.callback_query(F.data.startswith("testpay_run_"))
 async def cb_testpay_run(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Только для администратора — /myid покажет твой ID.", show_alert=True)
@@ -5170,7 +5198,6 @@ async def cb_testpay_run(cb: CallbackQuery):
         await cb.message.answer(f"❌ Не получилось: <code>{escape(_snip(str(exc), 300))}</code>", parse_mode="HTML")
 
 
-@dp.callback_query(F.data.startswith("testpay_del_"))
 async def cb_testpay_del(cb: CallbackQuery):
     """Удаляет подписку, созданную проверочной выдачей."""
     if not is_admin(cb.from_user.id):
@@ -5230,7 +5257,6 @@ async def cb_testpay_del(cb: CallbackQuery):
         )
 
 
-@dp.message(Command("crypto_check"))
 async def cmd_crypto_check(message: Message):
     """Проверяет связку с Crypto Pay без денег: счёт создаётся и сразу удаляется."""
     if not is_admin(message.from_user.id):
@@ -5259,7 +5285,6 @@ async def cmd_crypto_check(message: Message):
     await message.answer(text, parse_mode="HTML")
 
 
-@dp.callback_query(F.data == "crypto_check")
 async def cb_crypto_check(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Только для администратора — /myid покажет твой ID.", show_alert=True)
@@ -5271,6 +5296,17 @@ async def cb_crypto_check(cb: CallbackQuery):
         logger.error("Проверка Crypto Pay не удалась: %s", exc)
         text = f"❌ Не получилось: <code>{escape(_snip(str(exc), 300))}</code>"
     await cb.message.answer(text, parse_mode="HTML")
+
+
+# Тестовые команды регистрируем ТОЛЬКО в тестовом режиме (см. test_tools_enabled).
+# В боевом боте их нет: ни команды, ни кнопки — бот выглядит как обычный рабочий.
+if test_tools_enabled():
+    dp.message.register(cmd_test_pay, Command("test_pay"))
+    dp.message.register(cmd_crypto_check, Command("crypto_check"))
+    dp.callback_query.register(cb_testpay_menu, F.data == "testpay_menu")
+    dp.callback_query.register(cb_testpay_run, F.data.startswith("testpay_run_"))
+    dp.callback_query.register(cb_testpay_del, F.data.startswith("testpay_del_"))
+    dp.callback_query.register(cb_crypto_check, F.data == "crypto_check")
 
 
 @dp.message(Command("revoke"))
@@ -5433,13 +5469,126 @@ async def cb_activation(cb: CallbackQuery):
         await cb.message.answer(INSTALL_INTRO, reply_markup=install_menu_kb(), parse_mode="HTML")
 
 
+# =========================
+# ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ
+# =========================
+
+def support_link() -> str:
+    """Ссылка на поддержку (username задаётся переменной SUPPORT_USERNAME)."""
+    return f"https://t.me/{SUPPORT_USERNAME}"
+
+
+def terms_operator_text() -> str:
+    """Кто оказывает услугу — подставляется в соглашение."""
+    return TERMS_OPERATOR or "администрация сервиса"
+
+
+def terms_text() -> str:
+    """
+    Пользовательское соглашение (публичная оферта) для показа в боте.
+
+    Полная версия с реквизитами — в файле TERMS.md репозитория. Здесь тот же текст
+    в коротком виде: он умещается в одно сообщение Telegram (лимит 4096 символов).
+    """
+    return (
+        "📄 <b>Пользовательское соглашение</b>\n"
+        f"<i>Сервис «{SERVICE_NAME}» · редакция от {TERMS_UPDATED}</i>\n\n"
+
+        "<b>1. О сервисе</b>\n"
+        f"«{SERVICE_NAME}» — сервис доступа в интернет через VPN (протокол VLESS Reality). "
+        f"Услугу оказывает {terms_operator_text()}. Сервис предоставляется «как есть» "
+        "и не заменяет интернет-провайдера.\n\n"
+
+        "<b>2. Принятие условий</b>\n"
+        "Пользуясь ботом (запуск бота, получение ключа, оплата тарифа) ты принимаешь это "
+        "соглашение целиком. Если не согласен — не пользуйся сервисом. Пользователи младше "
+        "18 лет пользуются сервисом с согласия родителей или законных представителей.\n\n"
+
+        "<b>3. Подписка и оплата</b>\n"
+        "• Доступ выдаётся на срок выбранного тарифа, ключ приходит сразу после "
+        "подтверждённой оплаты.\n"
+        "• Цена и способ оплаты видны до покупки: рубли, звёзды Telegram, крипта или карта.\n"
+        "• Бесплатный тестовый доступ на 24 часа даётся один раз.\n"
+        "• Подписка не продлевается сама: по окончании срока доступ отключается.\n"
+        "• Услуга цифровая и считается оказанной с момента выдачи ключа.\n\n"
+
+        "<b>4. Возврат</b>\n"
+        "Если доступ не работает по нашей вине и мы не смогли это исправить — напиши "
+        "в поддержку, вернём деньги за неиспользованный период. Возврат не делается "
+        "при нарушении правил из п. 5 и когда оплаченным сроком уже пользовались.\n\n"
+
+        "<b>5. Что запрещено</b>\n"
+        "• нарушать закон и права других людей;\n"
+        "• спам, DDoS-атаки, взломы, фишинг, вредоносное ПО;\n"
+        "• незаконный контент, включая материалы с несовершеннолетними;\n"
+        "• массовые рассылки и автоматические запросы через наши серверы;\n"
+        "• перепродажа доступа и передача ключа третьим лицам;\n"
+        "• подключение больше устройств, чем разрешено тарифом.\n"
+        "При нарушении доступ блокируется без возврата оплаты.\n\n"
+
+        "<b>6. Ответственность</b>\n"
+        "• Скорость и доступность зависят от сетей связи и не гарантируются на 100 %: "
+        "возможны перерывы на обслуживание.\n"
+        "• Ты сам отвечаешь за то, как используешь доступ, и за соблюдение законов "
+        "своей страны.\n"
+        "• Мы не отвечаем за косвенные убытки и упущенную выгоду. Предел ответственности — "
+        "сумма, уплаченная за текущий период.\n\n"
+
+        "<b>7. Данные</b>\n"
+        "Мы храним минимум: твой Telegram ID, тариф и срок подписки, объём использованного "
+        "трафика и номер платежа. Мы не ведём логи посещённых сайтов. Данные не передаём "
+        "третьим лицам, кроме случаев, прямо требуемых законом. Удалить свои данные можно, "
+        "написав в поддержку.\n\n"
+
+        "<b>8. Изменения условий</b>\n"
+        "Соглашение может обновляться: актуальная версия всегда в боте (/terms) с датой "
+        "редакции. Продолжая пользоваться сервисом после изменений, ты принимаешь новую "
+        "редакцию.\n\n"
+
+        "<b>9. Поддержка</b>\n"
+        f"Вопросы, проблемы с подключением и возвраты — @{SUPPORT_USERNAME}.\n\n"
+
+        "<i>Используя бота, ты подтверждаешь, что прочитал соглашение и согласен с ним.</i>"
+    )
+
+
+def terms_kb() -> InlineKeyboardMarkup:
+    """Кнопки под соглашением: поддержка и возврат в меню."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Поддержка", url=support_link())],
+            [InlineKeyboardButton(text="💰 Тарифы", callback_data="tariffs")],
+            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
+        ]
+    )
+
+
+@dp.message(Command("terms"))
+async def cmd_terms(message: Message):
+    """Показывает пользовательское соглашение (публичную оферту)."""
+    await message.answer(terms_text(), reply_markup=terms_kb(), parse_mode="HTML",
+                         disable_web_page_preview=True)
+
+
+@dp.callback_query(F.data == "terms")
+async def cb_terms(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        await cb.message.edit_text(terms_text(), reply_markup=terms_kb(), parse_mode="HTML",
+                                   disable_web_page_preview=True)
+    except Exception:
+        await cb.message.answer(terms_text(), reply_markup=terms_kb(), parse_mode="HTML",
+                                disable_web_page_preview=True)
+
+
 @dp.callback_query(F.data == "support")
 async def cb_support(cb: CallbackQuery):
     await cb.answer()
     text = (
         "💬 <b>Служба заботы и поддержки:</b>\n\n"
         "Если возникли вопросы по настройке, напиши нам:\n"
-        "👉 <a href='https://t.me/Suppr_XYZ'>@Suppr_XYZ</a>\n\n"
+        f"👉 <a href='{support_link()}'>@{SUPPORT_USERNAME}</a>\n\n"
+        "📄 Условия сервиса, оплаты и возврата — /terms.\n\n"
         "Мы всегда рады помочь!"
     )
     await cb.message.edit_text(text, reply_markup=back_kb(), parse_mode="HTML")
@@ -5461,13 +5610,18 @@ async def on_startup():
             BotCommand(command="totp", description="🔐 Код 2FA для входа в панель"),
             BotCommand(command="groups", description="🏷 Группы клиентов в 3x-ui"),
             BotCommand(command="help", description="📲 Как подключиться (пошагово)"),
+            BotCommand(command="terms", description="📄 Условия сервиса"),
             BotCommand(command="invite", description="🎁 Пригласить друга и получить дни"),
             BotCommand(command="profile", description="👤 Моя подписка и ключ"),
             BotCommand(command="payments", description="💳 Оплаты (для администратора)"),
-            BotCommand(command="test_pay", description="🧪 Проверить выдачу ключа без оплаты"),
-            BotCommand(command="crypto_check", description="🔍 Проверить Crypto Pay без денег"),
             BotCommand(command="myid", description="👤 Узнать свой Telegram ID"),
         ]
+        # Тестовые команды — только когда включён тестовый режим (иначе их в боте нет).
+        if test_tools_enabled():
+            commands += [
+                BotCommand(command="test_pay", description="🧪 Проверить выдачу ключа без оплаты"),
+                BotCommand(command="crypto_check", description="🔍 Проверить Crypto Pay без денег"),
+            ]
         await bot.set_my_commands(commands)
     except Exception as exc:
         logger.warning("Не удалось зарегистрировать команды в меню: %s", exc)
