@@ -315,6 +315,20 @@ PAYMENTS_ALLOW_TEST_PAY = (os.getenv("PAYMENTS_ALLOW_TEST_PAY") or "").strip().l
 # TEST_TOOLS=1 — включить принудительно.
 TEST_TOOLS_RAW = (os.getenv("TEST_TOOLS") or "").strip().lower()
 
+# Видны ли служебные команды администратора: /inbounds, /reset_vpn, /panel_debug,
+# /totp, /groups, /payments, /revoke, /test_pay, /crypto_check.
+#   ADMIN_TOOLS=0 (по умолчанию) — в боте их нет совсем: ни в меню Telegram, ни по вводу.
+#     Пользователи видят только рабочие команды, бот выглядит как обычный сервис.
+#   ADMIN_TOOLS=1 — все админ-команды возвращаются (нужно для обслуживания).
+# /myid остаётся доступной всегда: по ней админ понимает свой ID и видит подсказку,
+# как включить служебные команды обратно.
+ADMIN_TOOLS = (os.getenv("ADMIN_TOOLS") or "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Доступен ли бесплатный тест на 24 часа обычным пользователям (/test_vpn).
+#   0 (по умолчанию) — тестовый доступ только у администратора (как было);
+#   1 — тест доступен всем: кнопка есть в меню у каждого, ключ выдаётся на 24 часа.
+TRIAL_PUBLIC = (os.getenv("TRIAL_PUBLIC") or "0").strip().lower() in ("1", "true", "yes", "on")
+
 # Сколько рублей в одной единице валюты (курс фиксируется вручную).
 # Если не задан — бот берёт курс у Crypto Pay (getExchangeRates).
 CRYPTOBOT_RUB_RATE = float((os.getenv("CRYPTOBOT_RUB_RATE") or "0").replace(",", "."))
@@ -2274,7 +2288,9 @@ async def handle_referral_start(message: Message, payload: str) -> None:
                 f"🎁 <b>Тебя пригласили!</b> Друг подарил тебе "
                 f"<b>+{REFERRAL_INVITED_BONUS_DAYS} {days_word(REFERRAL_INVITED_BONUS_DAYS)}</b> — "
                 "они прибавятся к первой оплате любого тарифа.\n\n"
-                "Начни с бесплатного теста на 24 часа: /test_vpn — или смотри тарифы: /start",
+                + ("Начни с бесплатного теста на 24 часа: /test_vpn — "
+                   "или смотри тарифы: /start" if trial_available_for(invited_id)
+                   else "Смотри тарифы и подключайся: /start"),
                 parse_mode="HTML",
             )
         except Exception:
@@ -2332,6 +2348,20 @@ def test_pay_enabled() -> bool:
     return PAYMENTS_ALLOW_TEST_PAY
 
 
+def admin_tools_enabled() -> bool:
+    """Показывать ли служебные команды администратора (ADMIN_TOOLS=1)."""
+    return ADMIN_TOOLS
+
+
+def trial_available_for(user_id: int | None) -> bool:
+    """Доступен ли этому пользователю бесплатный тест на 24 часа."""
+    if TRIAL_PUBLIC:
+        return True
+    if user_id is None:
+        return True
+    return is_admin(user_id)
+
+
 def test_tools_enabled() -> bool:
     """
     Показывать ли тестовые команды (/test_pay, /crypto_check) и их кнопки.
@@ -2340,6 +2370,8 @@ def test_tools_enabled() -> bool:
     в меню Telegram они не попадают. Включаются сами в тестовой сети Crypto Pay
     или переменной PAYMENTS_ALLOW_TEST_PAY=1; TEST_TOOLS управляет принудительно.
     """
+    if not ADMIN_TOOLS:
+        return False          # админ-инструменты скрыты — прячем и проверки оплаты
     if TEST_TOOLS_RAW:
         return TEST_TOOLS_RAW in ("1", "true", "yes", "on")
     return test_pay_enabled()
@@ -3116,7 +3148,7 @@ async def notify_payment_success(order: dict, info: dict) -> bool:
             order["tg_id"],
             order_paid_message(order, info),
             parse_mode="HTML",
-            reply_markup=key_actions_kb(),
+            reply_markup=key_actions_kb(order["tg_id"]),
         )
     except Exception as exc:
         delivered = False
@@ -4175,10 +4207,18 @@ def install_trouble_text() -> str:
     )
 
 
-def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔑 Получить тестовый VPN (24 часа)", callback_data="get_test_key_btn")],
+def main_menu_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
+    """
+    Главное меню.
+
+    Кнопка бесплатного теста показывается только тем, кому тест действительно доступен
+    (TRIAL_PUBLIC=1 или администратор) — чтобы пользователь не упирался в отказ.
+    """
+    rows = []
+    if trial_available_for(tg_id):
+        rows.append([InlineKeyboardButton(text="🔑 Получить тестовый VPN (24 часа)",
+                                          callback_data="get_test_key_btn")])
+    rows += [
             [
                 InlineKeyboardButton(text="💰 Тарифы", callback_data="tariffs"),
                 InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile"),
@@ -4190,8 +4230,8 @@ def main_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="💬 Поддержка", callback_data="support"),
                 InlineKeyboardButton(text="📄 Соглашение", callback_data="terms"),
             ],
-        ]
-    )
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def tariffs_kb() -> InlineKeyboardMarkup:
@@ -4215,15 +4255,25 @@ def back_kb() -> InlineKeyboardMarkup:
     )
 
 
-def key_actions_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📲 Как подключиться (пошагово)", callback_data="help_menu")],
-            [InlineKeyboardButton(text="🔑 Мой ключ и подписка", callback_data="profile")],
-            [InlineKeyboardButton(text="🔄 Сбросить и получить заново", callback_data="reset_my_vpn")],
-            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
-        ]
-    )
+def key_actions_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
+    """
+    Кнопки под выданным ключом.
+
+    «Сбросить и получить заново» — служебная операция (только для администратора),
+    поэтому обычным пользователям кнопка не показывается: вместо отказа в ответ на
+    нажатие они видят понятный набор действий.
+    """
+    rows = [
+        [InlineKeyboardButton(text="📲 Как подключиться (пошагово)", callback_data="help_menu")],
+        [InlineKeyboardButton(text="🔑 Мой ключ и подписка", callback_data="profile")],
+    ]
+    if tg_id is None or is_admin(tg_id):
+        rows.append([InlineKeyboardButton(text="🔄 Сбросить и получить заново",
+                                          callback_data="reset_my_vpn")])
+    else:
+        rows.append([InlineKeyboardButton(text="💬 Поддержка", callback_data="support")])
+    rows.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # =========================
@@ -4233,17 +4283,21 @@ def key_actions_kb() -> InlineKeyboardMarkup:
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     referral_store.touch_user(message.from_user.id)
+    trial_line = (
+        "🎁 Бесплатный тестовый доступ на 24 часа — кнопка ниже.\n"
+        if trial_available_for(message.from_user.id) else ""
+    )
     text = (
         "👋 <b>Добро пожаловать в быстрый и надёжный VPN!</b>\n\n"
         "Мы используем современный протокол <b>VLESS Reality</b>, "
         "который неотличим от обычного интернет-трафика и работает стабильно.\n\n"
-        "🎁 Бесплатный тестовый доступ на 24 часа — команда /test_vpn.\n"
+        + trial_line +
         "💰 Платные тарифы — раздел «Тарифы» (оплата и моментальная выдача ключа).\n"
         "📲 Подключение по шагам (со ссылками на приложения) — /help.\n"
         "👤 Статус подписки и продление — /profile.\n"
         "📄 Условия сервиса, оплаты и возврата — /terms."
     )
-    await message.answer(text, reply_markup=main_menu_kb(), parse_mode="HTML")
+    await message.answer(text, reply_markup=main_menu_kb(message.from_user.id), parse_mode="HTML")
 
     # Переход по реферальной ссылке: t.me/<бот>?start=ref_12345
     parts = (message.text or "").split(maxsplit=1)
@@ -4269,8 +4323,19 @@ async def cmd_myid(message: Message):
         )
     elif user_id in ADMIN_IDS:
         extra = f" (в списке {len(ADMIN_IDS)} админ(ов))" if len(ADMIN_IDS) > 1 else ""
-        admin_tools = "/panel_debug, /groups" + (", /test_pay" if test_tools_enabled() else "")
-        status_text = f"✅ Ты администратор{extra} — все админ-команды доступны: {admin_tools}."
+        if admin_tools_enabled():
+            visible = "/payments, /panel_debug, /groups, /totp, /inbounds, /reset_vpn, /revoke"
+            if test_tools_enabled():
+                visible += ", /test_pay, /crypto_check"
+            status_text = f"✅ Ты администратор{extra} — служебные команды включены: {visible}."
+        else:
+            status_text = (
+                f"✅ Ты администратор{extra}. Служебные команды сейчас <b>скрыты</b> "
+                "(<code>ADMIN_TOOLS=0</code>), поэтому в боте их не видно и они не отвечают.\n"
+                "Нужны /payments, /panel_debug, /groups, /totp? Поставь в Railway → Variables "
+                "<b>ADMIN_TOOLS=1</b> и подожди 1–2 минуты (перезапуск). Обратно — "
+                "<code>ADMIN_TOOLS=0</code> или удалить переменную."
+            )
     else:
         status_text = (
             f"ℹ️ Ты не в списке администраторов. Сейчас там: {admins}.\n"
@@ -4288,7 +4353,6 @@ async def cmd_myid(message: Message):
     )
 
 
-@dp.message(Command("inbounds"))
 async def cmd_inbounds(message: Message):
     """Показывает список подключений в панели (только для админа)."""
     # Если ADMIN_ID не настроен, разрешаем вызов, чтобы владелец мог увидеть inbounds
@@ -4346,9 +4410,15 @@ async def cmd_inbounds(message: Message):
 @dp.message(Command("test_vpn"))
 async def cmd_test_vpn(message: Message):
     """Выдаёт тестовый VPN-ключ."""
-    # Если ADMIN_ID задан и пользователь не админ
-    if not is_admin(message.from_user.id):
-        await message.answer(admin_denied_text(message.from_user.id), parse_mode="HTML")
+    # Тестовый доступ открыт админу всегда; обычным пользователям — только при TRIAL_PUBLIC=1
+    if not trial_available_for(message.from_user.id):
+        await message.answer(
+            "🎁 Бесплатный тестовый доступ сейчас недоступен.\n\n"
+            "Актуальные тарифы и цены — в разделе «💰 Тарифы»: ключ приходит сразу "
+            "после оплаты. Если нужна помощь — напиши в поддержку.",
+            parse_mode="HTML",
+            reply_markup=back_kb(),
+        )
         return
 
     wait_msg = await message.answer("⏳ Подключаюсь к 3x-ui и генерирую ключ...")
@@ -4408,7 +4478,7 @@ async def cmd_test_vpn(message: Message):
             f"{admin_note}"
         )
 
-        await message.answer(msg_text, reply_markup=key_actions_kb(), parse_mode="HTML")
+        await message.answer(msg_text, reply_markup=key_actions_kb(message.from_user.id), parse_mode="HTML")
 
     except Exception as exc:
         try:
@@ -4418,7 +4488,6 @@ async def cmd_test_vpn(message: Message):
         await send_error_message(message, exc)
 
 
-@dp.message(Command("reset_vpn"))
 async def cmd_reset_vpn(message: Message):
     """Удаляет тестового клиента из 3x-ui (для пересоздания)."""
     if not is_admin(message.from_user.id):
@@ -4450,7 +4519,6 @@ async def cmd_reset_vpn(message: Message):
         await send_error_message(message, exc)
 
 
-@dp.message(Command("groups"))
 async def cmd_groups(message: Message):
     """Показывает группы клиентов в панели 3x-ui (только для админа)."""
     if not is_admin(message.from_user.id):
@@ -4534,7 +4602,6 @@ async def cmd_groups(message: Message):
         await send_error_message(message, exc)
 
 
-@dp.message(Command("panel_debug"))
 async def cmd_panel_debug(message: Message):
     """Сетевая диагностика связи между Railway и 3x-ui."""
     if not is_admin(message.from_user.id):
@@ -4762,7 +4829,6 @@ async def cmd_panel_debug(message: Message):
     await message.answer("\n".join(lines)[:4000], parse_mode="HTML")
 
 
-@dp.message(Command("totp"))
 async def cmd_totp(message: Message):
     """Показывает текущий код Google Authenticator для входа в панель (только админ)."""
     if not is_admin(message.from_user.id):
@@ -4812,13 +4878,16 @@ async def cb_main_menu(cb: CallbackQuery):
     await cb.answer()
     await cb.message.edit_text(
         "🏠 <b>Главное меню:</b>\n\nВыбери необходимое действие ниже 👇",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(cb.from_user.id),
         parse_mode="HTML",
     )
 
 
 @dp.callback_query(F.data == "get_test_key_btn")
 async def cb_get_test_key(cb: CallbackQuery):
+    if not trial_available_for(cb.from_user.id):
+        await cb.answer("Бесплатный тест сейчас недоступен — смотри тарифы.", show_alert=True)
+        return
     await cb.answer()
     # Вызываем логику выдачи ключа
     await cmd_test_vpn(cb.message)
@@ -5013,7 +5082,6 @@ async def cb_check_payment(cb: CallbackQuery):
     )
 
 
-@dp.message(Command("payments"))
 async def cmd_payments(message: Message):
     """Статистика оплат и диагностика платёжного режима (только админ)."""
     if not is_admin(message.from_user.id):
@@ -5298,18 +5366,6 @@ async def cb_crypto_check(cb: CallbackQuery):
     await cb.message.answer(text, parse_mode="HTML")
 
 
-# Тестовые команды регистрируем ТОЛЬКО в тестовом режиме (см. test_tools_enabled).
-# В боевом боте их нет: ни команды, ни кнопки — бот выглядит как обычный рабочий.
-if test_tools_enabled():
-    dp.message.register(cmd_test_pay, Command("test_pay"))
-    dp.message.register(cmd_crypto_check, Command("crypto_check"))
-    dp.callback_query.register(cb_testpay_menu, F.data == "testpay_menu")
-    dp.callback_query.register(cb_testpay_run, F.data.startswith("testpay_run_"))
-    dp.callback_query.register(cb_testpay_del, F.data.startswith("testpay_del_"))
-    dp.callback_query.register(cb_crypto_check, F.data == "crypto_check")
-
-
-@dp.message(Command("revoke"))
 async def cmd_revoke(message: Message):
     """Удаляет платную подписку (для возвратов и блокировок)."""
     if not is_admin(message.from_user.id):
@@ -5595,28 +5651,73 @@ async def cb_support(cb: CallbackQuery):
 
 
 # =========================
+# СЛУЖЕБНЫЕ КОМАНДЫ: РЕГИСТРАЦИЯ ПО ПЕРЕМЕННОЙ ADMIN_TOOLS
+# =========================
+# ADMIN_TOOLS=0 (по умолчанию) — служебных команд в боте нет: пользователи видят
+# только рабочие разделы. ADMIN_TOOLS=1 — всё возвращается для обслуживания.
+ADMIN_COMMANDS = {
+    "inbounds": cmd_inbounds,
+    "reset_vpn": cmd_reset_vpn,
+    "groups": cmd_groups,
+    "panel_debug": cmd_panel_debug,
+    "totp": cmd_totp,
+    "payments": cmd_payments,
+    "revoke": cmd_revoke,
+}
+
+if admin_tools_enabled():
+    for _command, _handler in ADMIN_COMMANDS.items():
+        dp.message.register(_handler, Command(_command))
+    logger.info("Служебные команды администратора включены (ADMIN_TOOLS=1): /%s.",
+                ", /".join(ADMIN_COMMANDS))
+else:
+    logger.info(
+        "Служебные команды администратора скрыты (ADMIN_TOOLS=0). "
+        "Включить при необходимости: ADMIN_TOOLS=1 в Railway → Variables."
+    )
+
+# Тестовые команды (проверка оплаты без денег) — отдельный флаг TEST_TOOLS,
+# и только когда включены служебные команды.
+if test_tools_enabled():
+    dp.message.register(cmd_test_pay, Command("test_pay"))
+    dp.message.register(cmd_crypto_check, Command("crypto_check"))
+    dp.callback_query.register(cb_testpay_menu, F.data == "testpay_menu")
+    dp.callback_query.register(cb_testpay_run, F.data.startswith("testpay_run_"))
+    dp.callback_query.register(cb_testpay_del, F.data.startswith("testpay_del_"))
+    dp.callback_query.register(cb_crypto_check, F.data == "crypto_check")
+
+
+# =========================
 # ЗАПУСК БОТА
 # =========================
 
 async def on_startup():
     """Регистрирует подсказки команд в меню Telegram."""
     try:
-        commands = [
-            BotCommand(command="test_vpn", description="🔑 Получить рабочий VPN-ключ"),
-            BotCommand(command="start", description="🏠 Главное меню"),
-            BotCommand(command="inbounds", description="📡 Список подключений 3x-ui"),
-            BotCommand(command="reset_vpn", description="🔄 Сбросить тестовый ключ"),
-            BotCommand(command="panel_debug", description="🔍 Диагностика панели"),
-            BotCommand(command="totp", description="🔐 Код 2FA для входа в панель"),
-            BotCommand(command="groups", description="🏷 Группы клиентов в 3x-ui"),
-            BotCommand(command="help", description="📲 Как подключиться (пошагово)"),
-            BotCommand(command="terms", description="📄 Условия сервиса"),
-            BotCommand(command="invite", description="🎁 Пригласить друга и получить дни"),
+        # Пользовательские команды — всегда.
+        commands = [BotCommand(command="start", description="🏠 Главное меню")]
+        if TRIAL_PUBLIC:
+            commands.append(BotCommand(command="test_vpn", description="🔑 Бесплатный доступ на 24 часа"))
+        commands += [
             BotCommand(command="profile", description="👤 Моя подписка и ключ"),
-            BotCommand(command="payments", description="💳 Оплаты (для администратора)"),
+            BotCommand(command="help", description="📲 Как подключиться (пошагово)"),
+            BotCommand(command="invite", description="🎁 Пригласить друга и получить дни"),
+            BotCommand(command="terms", description="📄 Условия сервиса"),
             BotCommand(command="myid", description="👤 Узнать свой Telegram ID"),
         ]
-        # Тестовые команды — только когда включён тестовый режим (иначе их в боте нет).
+        # Служебные команды — только при ADMIN_TOOLS=1; в боевом виде их в меню нет.
+        if admin_tools_enabled():
+            commands += [
+                BotCommand(command="payments", description="💳 Оплаты (для администратора)"),
+                BotCommand(command="panel_debug", description="🔍 Диагностика панели"),
+                BotCommand(command="groups", description="🏷 Группы клиентов в 3x-ui"),
+                BotCommand(command="inbounds", description="📡 Список подключений 3x-ui"),
+                BotCommand(command="totp", description="🔐 Код 2FA для входа в панель"),
+                BotCommand(command="reset_vpn", description="🔄 Сбросить тестовый ключ"),
+            ]
+            if not TRIAL_PUBLIC:
+                commands.insert(1, BotCommand(command="test_vpn", description="🔑 Тестовый ключ (24 часа)"))
+        # Тестовые команды проверки оплаты — отдельный флаг TEST_TOOLS.
         if test_tools_enabled():
             commands += [
                 BotCommand(command="test_pay", description="🧪 Проверить выдачу ключа без оплаты"),

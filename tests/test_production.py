@@ -28,6 +28,10 @@ TEST_HANDLERS = {
     "cmd_test_pay", "cmd_crypto_check",
     "cb_testpay_menu", "cb_testpay_run", "cb_testpay_del", "cb_crypto_check",
 }
+ADMIN_HANDLERS = {
+    "cmd_inbounds", "cmd_reset_vpn", "cmd_groups", "cmd_panel_debug",
+    "cmd_totp", "cmd_payments", "cmd_revoke",
+}
 TERMS_SECTIONS = (
     "1. О сервисе",
     "2. Принятие условий",
@@ -111,6 +115,8 @@ def load(env=None):
         "CRYPTOBOT_TEST": env.get("crypto_testnet"),
         "CRYPTOBOT_TOKEN": env.get("crypto_token"),
         "TEST_TOOLS": env.get("test_tools"),
+        "ADMIN_TOOLS": env.get("admin_tools"),
+        "TRIAL_PUBLIC": env.get("trial_public"),
         "SERVICE_NAME": env.get("service_name"),
         "SUPPORT_USERNAME": env.get("support_username"),
         "TERMS_OPERATOR": env.get("terms_operator"),
@@ -148,8 +154,18 @@ async def test_production_look():
           "test_pay" not in names and "crypto_check" not in names, str(names))
     check("в меню Telegram есть /terms, /help и /invite",
           {"terms", "help", "invite"} <= set(names), str(names))
-    check("рабочие админ-команды остались",
-          {"payments", "panel_debug", "totp", "groups", "myid"} <= set(names))
+    check("служебных команд админа в меню нет",
+          not ({"payments", "panel_debug", "totp", "groups", "inbounds", "reset_vpn"} & set(names)),
+          str(names))
+    check("в меню остались только рабочие команды",
+          set(names) == {"start", "profile", "help", "invite", "terms", "myid"}, str(names))
+
+    admin_handlers = handler_names(bot.dp.message)
+    check("админские обработчики не зарегистрированы",
+          not (ADMIN_HANDLERS & admin_handlers),
+          str(sorted(ADMIN_HANDLERS & admin_handlers)))
+    check("/myid доступна всегда (по ней админ узнаёт свой ID)",
+          "cmd_myid" in admin_handlers)
 
     msg = FakeMsg()
     await bot.cmd_payments(msg)
@@ -163,8 +179,25 @@ async def test_production_look():
 
     myid = FakeMsg(uid=ADMIN_ID, text="/myid")
     await bot.cmd_myid(myid)
-    check("админ-подсказка /myid не отправляет в /test_pay",
-          "/test_pay" not in myid.last and "/panel_debug" in myid.last)
+    check("админ-подсказка /myid не отправляет в /test_pay", "/test_pay" not in myid.last)
+    check("/myid объясняет, как вернуть служебные команды",
+          "ADMIN_TOOLS=1" in myid.last and "скрыты" in myid.last)
+
+    other = FakeMsg(uid=555, text="/myid")
+    await bot.cmd_myid(other)
+    check("обычный пользователь не видит подсказок про ADMIN_TOOLS",
+          "ADMIN_TOOLS" not in other.last)
+
+    # Пользовательское меню: без кнопки теста и без служебных кнопок после оплаты
+    user_menu = callbacks_of(bot.main_menu_kb(555))
+    check("у обычного пользователя нет кнопки тестового доступа",
+          "get_test_key_btn" not in user_menu, str(user_menu))
+    check("у администратора кнопка теста остаётся",
+          "get_test_key_btn" in callbacks_of(bot.main_menu_kb(ADMIN_ID)))
+    user_key = callbacks_of(bot.key_actions_kb(555))
+    check("обычному пользователю не предлагают сброс ключа (это админ-операция)",
+          "reset_my_vpn" not in user_key and "support" in user_key, str(user_key))
+    check("админу кнопка сброса остаётся", "reset_my_vpn" in callbacks_of(bot.key_actions_kb(ADMIN_ID)))
 
     main_cbs = callbacks_of(bot.main_menu_kb())
     check("в главном меню есть соглашение", "terms" in main_cbs, str(main_cbs))
@@ -178,7 +211,8 @@ async def test_production_look():
 
 async def test_test_mode_returns_tools():
     print("\n▶ 2. Тестовый режим: команды проверки возвращаются")
-    bot = load({"mode": "crypto", "crypto_token": "1:x", "allow_test_pay": "1"})
+    bot = load({"mode": "crypto", "crypto_token": "1:x", "allow_test_pay": "1",
+                "admin_tools": "1"})
     check("проверка включена явно", bot.test_tools_enabled() is True)
     handlers = handler_names(bot.dp.message) | handler_names(bot.dp.callback_query)
     check("тестовые обработчики зарегистрированы", TEST_HANDLERS <= handlers,
@@ -202,16 +236,81 @@ async def test_test_mode_returns_tools():
           "test_pay" in names and "crypto_check" in names, str(names))
 
     # Тестовая сеть включает проверку сама, но TEST_TOOLS=0 её прячет
-    testnet = load({"mode": "crypto", "crypto_token": "1:x", "crypto_testnet": "1"})
+    testnet = load({"mode": "crypto", "crypto_token": "1:x", "crypto_testnet": "1", "admin_tools": "1"})
     check("в тестовой сети проверка включается автоматически", testnet.test_tools_enabled() is True)
 
-    hidden = load({"mode": "crypto", "crypto_token": "1:x", "crypto_testnet": "1", "test_tools": "0"})
+    hidden = load({"mode": "crypto", "crypto_token": "1:x", "crypto_testnet": "1",
+                   "admin_tools": "1", "test_tools": "0"})
     check("TEST_TOOLS=0 прячет проверку даже в тестовой сети", hidden.test_tools_enabled() is False)
     hidden_handlers = handler_names(hidden.dp.message) | handler_names(hidden.dp.callback_query)
     check("в этом случае обработчиков проверки нет", not (TEST_HANDLERS & hidden_handlers))
 
-    forced = load({"mode": "crypto", "crypto_token": "1:x", "test_tools": "1"})
+    forced = load({"mode": "crypto", "crypto_token": "1:x", "test_tools": "1", "admin_tools": "1"})
     check("TEST_TOOLS=1 включает проверку в боевом режиме", forced.test_tools_enabled() is True)
+
+    # Без служебных команд проверки оплаты не показываются даже при allow_test_pay
+    no_admin = load({"mode": "crypto", "crypto_token": "1:x", "allow_test_pay": "1", "admin_tools": "0"})
+    check("ADMIN_TOOLS=0 прячет проверки оплаты", no_admin.test_tools_enabled() is False)
+    check("обработчиков проверок нет", not (TEST_HANDLERS & (handler_names(no_admin.dp.message)
+                                                             | handler_names(no_admin.dp.callback_query))))
+
+
+async def test_admin_switch():
+    print("\n▶ 2а. ADMIN_TOOLS: одна переменная открывает и закрывает служебные команды")
+    for value, expected in (("1", True), ("true", True), ("0", False), ("", False)):
+        bot = load({"admin_tools": value} if value else {})
+        check(f"ADMIN_TOOLS={value or 'не задана'} → служебные команды "
+              f"{'включены' if expected else 'скрыты'}",
+              bot.admin_tools_enabled() is expected)
+
+    on = load({"admin_tools": "1"})
+    handlers = handler_names(on.dp.message)
+    check("ADMIN_TOOLS=1 регистрирует все служебные команды",
+          ADMIN_HANDLERS <= handlers, str(sorted(ADMIN_HANDLERS - handlers)))
+    commands = []
+
+    async def fake_set_my_commands(items):
+        commands.extend(items)
+
+    on.bot.set_my_commands = fake_set_my_commands
+    await on.on_startup()
+    names = [c.command for c in commands]
+    check("ADMIN_TOOLS=1 возвращает команды в меню Telegram",
+          {"payments", "panel_debug", "groups", "inbounds", "totp", "reset_vpn"} <= set(names),
+          str(names))
+
+    off = load({"admin_tools": "0"})
+    check("ADMIN_TOOLS=0 закрывает обратно",
+          not (ADMIN_HANDLERS & handler_names(off.dp.message)))
+    check("тестовые проверки тоже закрыты", off.test_tools_enabled() is False)
+
+
+async def test_trial_visibility():
+    print("\n▶ 2б. TRIAL_PUBLIC: кому виден бесплатный тест на 24 часа")
+    closed = load({})
+    check("по умолчанию тест доступен только администратору",
+          closed.trial_available_for(555) is False and closed.trial_available_for(ADMIN_ID) is True)
+    check("админу тест разрешён и его кнопка на месте",
+          "get_test_key_btn" in callbacks_of(closed.main_menu_kb(ADMIN_ID)))
+
+    start = FakeMsg(uid=555, text="/start")
+    await closed.cmd_start(start)
+    check("обычному пользователю /start не обещает бесплатный тест",
+          "/test_vpn" not in start.last and "Бесплатный тестовый доступ" not in start.last)
+
+    denied = FakeMsg(uid=555, text="/test_vpn")
+    await closed.cmd_test_vpn(denied)
+    check("если пользователь всё же отправит /test_vpn — вежливый ответ без админ-текста",
+          "недоступен" in denied.last and "ADMIN_ID" not in denied.last and "администратор" not in denied.last.lower())
+
+    open_bot = load({"trial_public": "1"})
+    check("TRIAL_PUBLIC=1 открывает тест всем", open_bot.trial_available_for(555) is True)
+    opened_start = FakeMsg(uid=555, text="/start")
+    await open_bot.cmd_start(opened_start)
+    check("и /start снова обещает бесплатный тест",
+          "Бесплатный тестовый доступ" in opened_start.last)
+    check("кнопка теста есть в меню у всех",
+          "get_test_key_btn" in callbacks_of(open_bot.main_menu_kb(555)))
 
 
 async def test_terms_in_bot():
@@ -282,6 +381,8 @@ async def test_terms_file_matches_bot():
 async def main():
     await test_production_look()
     await test_test_mode_returns_tools()
+    await test_admin_switch()
+    await test_trial_visibility()
     await test_terms_in_bot()
     await test_terms_file_matches_bot()
 
