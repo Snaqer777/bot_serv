@@ -78,6 +78,11 @@ def texts_to(chat_id):
            [p.get("text", "") for p in api("editMessageText", chat_id)]
 
 
+def got_terms(chat_id):
+    """Пришёл ли пользователю текст соглашения (отдельным сообщением)."""
+    return any("ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ" in text for text in texts_to(chat_id))
+
+
 # ---------------- инфраструктура ----------------
 
 def e2e_bot(store_file, ref_file, admins=None, secret=TOTP_SECRET, **overrides):
@@ -187,10 +192,12 @@ async def step_start(bot):
     print("\n▶ 1. Первый запуск: соглашение → «✅ Согласен» → приветствие и меню")
     fp.TG["calls"].clear()
     await bot.cmd_start(make_message(bot, ADMIN, "/start"))
-    first = last_text(ADMIN)
     gate_kb = buttons(last_sent(ADMIN))
-    check("первый /start показывает пользовательское соглашение",
-          "Пользовательское соглашение" in first and "2. Принятие условий" in first)
+    check("первый /start присылает пользовательское соглашение",
+          got_terms(ADMIN) and "1. Общие положения" in " ".join(texts_to(ADMIN)))
+    check("текст соглашения умещается в лимит Telegram",
+          max(len(t) for t in texts_to(ADMIN)) < 4096,
+          f"{max(len(t) for t in texts_to(ADMIN))} символов")
     check("под соглашением кнопка «Согласен — продолжить»",
           "accept_terms" in gate_kb, str(gate_kb))
     check("меню до подтверждения не показывается", "tariffs" not in gate_kb)
@@ -207,7 +214,7 @@ async def step_start(bot):
     menu = buttons(last_sent(ADMIN))
 
     check("второй /start — сразу приветствие, без соглашения",
-          "Пользовательское соглашение" not in text and "Добро пожаловать" in text)
+          "ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ" not in text and "Добро пожаловать" in text)
     check("приветствие показывает протокол и тарифы",
           "VLESS Reality" in text and "Тарифы" in text)
     check("кнопки тестового VPN нет даже у админа (TRIAL_BUTTON=0)",
@@ -227,14 +234,12 @@ async def step_start(bot):
     fp.TG["calls"].clear()
     await bot.cmd_start(make_message(bot, STRANGER, "/start"))
     check("новичок тоже сначала видит соглашение",
-          "Пользовательское соглашение" in last_text(STRANGER)
-          and "accept_terms" in buttons(last_sent(STRANGER)))
+          got_terms(STRANGER) and "accept_terms" in buttons(last_sent(STRANGER)))
 
     fp.TG["calls"].clear()
     await bot.cmd_help(make_message(bot, STRANGER, "/help"))
     check("до подтверждения инструкция не открывается — только соглашение",
-          "Пользовательское соглашение" in last_text(STRANGER)
-          and "Подключение VPN" not in last_text(STRANGER))
+          got_terms(STRANGER) and not any("Подключение VPN: пошагово" in t for t in texts_to(STRANGER)))
 
     await bot.cb_accept_terms(click(bot, "accept_terms", uid=STRANGER))
     check("после «Согласен» новичок видит меню", bot.terms_store.is_accepted(STRANGER))
@@ -374,7 +379,7 @@ async def step_referral(bot):
     fp.TG["calls"].clear()
     await bot.cmd_start(make_message(bot, FRIEND, f"/start ref_{ADMIN}"))
     check("друг по ссылке сначала видит соглашение",
-          "Пользовательское соглашение" in last_text(FRIEND))
+          got_terms(FRIEND) and "Тебя пригласили" not in " ".join(texts_to(FRIEND)))
     check("приглашение уже засчитано: админу ушло уведомление о новом друге",
           any("пришёл друг" in t for t in texts_to(ADMIN)))
     check("а приветствие с бонусом ждёт кнопки «Согласен»",
@@ -496,7 +501,8 @@ async def step_admin_tools(bot):
           "@test_support" in support_text, support_text[:90].replace("\n", " "))
 
     await bot.cmd_terms(make_message(bot, STRANGER, "/terms"))
-    check("/terms отдаёт соглашение", "Пользовательское соглашение" in last_text(STRANGER))
+    check("/terms отдаёт соглашение", "ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ" in last_text(STRANGER)
+          and "10. Заключительные положения" in last_text(STRANGER))
 
 
 async def step_production_bot(store_file, ref_file):
@@ -514,7 +520,7 @@ async def step_production_bot(store_file, ref_file):
     fp.TG["calls"].clear()
     await bot.cmd_start(make_message(bot, ADMIN, "/start"))
     check("боевой бот тоже просит подтвердить соглашение при первом запуске",
-          "Пользовательское соглашение" in last_text(ADMIN))
+          got_terms(ADMIN))
     await bot.cb_accept_terms(click(bot, "accept_terms", uid=ADMIN))
 
     fp.TG["calls"].clear()

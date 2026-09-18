@@ -33,15 +33,16 @@ ADMIN_HANDLERS = {
     "cmd_totp", "cmd_payments", "cmd_revoke",
 }
 TERMS_SECTIONS = (
-    "1. О сервисе",
-    "2. Принятие условий",
-    "3. Подписка и оплата",
-    "4. Возврат",
-    "5. Что запрещено",
-    "6. Ответственность",
-    "7. Данные",
-    "8. Изменения условий",
-    "9. Поддержка",
+    "1. Общие положения",
+    "2. Предмет соглашения",
+    "3. Порядок оплаты",
+    "4. Предоставление доступа",
+    "5. Возврат и отмена",
+    "6. Контакты поддержки",
+    "7. Политика обработки персональных данных",
+    "8. Ответственность",
+    "9. Изменение условий",
+    "10. Заключительные положения",
 )
 
 FAILURES = []
@@ -93,6 +94,16 @@ class FakeCallback:
         return True
 
 
+def has_terms_text(msg):
+    """Есть ли среди отправленных сообщений текст соглашения."""
+    return any("ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ" in text for text in msg.sent)
+
+
+def has_accept_button(msg):
+    """Есть ли в последнем сообщении кнопка «✅ Согласен — продолжить»."""
+    return "accept_terms" in callbacks_of(_last_markup(msg))
+
+
 def _last_markup(target):
     """reply_markup из последнего ответа FakeMsg/FakeCallback."""
     msg = target.message if isinstance(target, FakeCallback) else target
@@ -126,6 +137,7 @@ def load(env=None):
         "TRIAL_BUTTON": env.get("trial_button"),
         "SERVICE_NAME": env.get("service_name"),
         "SUPPORT_USERNAME": env.get("support_username"),
+        "SUPPORT_EMAIL": env.get("support_email"),
         "TERMS_OPERATOR": env.get("terms_operator"),
         "TERMS_UPDATED": env.get("terms_updated"),
         # Экран соглашения при первом запуске проверяется отдельным сценарием
@@ -339,8 +351,9 @@ async def test_trial_visibility():
         check("start_checkout(trial) для пользователя отклонён без упоминания /test_vpn",
               "test_vpn" not in str(exc) and "недоступен" in str(exc), str(exc)[:70])
 
-    check("соглашение для обычного пользователя не обещает бесплатный тест",
-          "Бесплатный тестовый доступ" not in closed.terms_text())
+    check("в соглашении нет рекламы бесплатного теста (текст оферты утверждён владельцем)",
+          "тестовый доступ" not in closed.terms_text().lower()
+          and "test_vpn" not in closed.terms_text())
 
     open_bot = load({"trial_public": "1", "trial_button": "1"})
     check("TRIAL_PUBLIC=1 + TRIAL_BUTTON=1 открывают тест всем",
@@ -353,8 +366,8 @@ async def test_trial_visibility():
           "get_test_key_btn" in callbacks_of(open_bot.main_menu_kb(555)))
     check("при TRIAL_PUBLIC=1 и TRIAL_BUTTON=1 тестовый пункт вернулся и в тарифы",
           "buy_trial" in callbacks_of(open_bot.tariffs_kb(555)))
-    check("и соглашение снова упоминает бесплатный тест",
-          "Бесплатный тестовый доступ" in open_bot.terms_text())
+    check("текст соглашения одинаков при любом TRIAL_PUBLIC",
+          open_bot.terms_text() == closed.terms_text())
 
     # TRIAL_BUTTON: вид кнопок отдельно от права на тест
     hidden = load({"trial_public": "1"})
@@ -404,19 +417,31 @@ async def test_terms_in_bot():
     print("\n▶ 3. Пользовательское соглашение доступно в боте")
     bot = load({"mode": "stars", "service_name": "SuperVPN",
                 "terms_operator": "ИП Иванов И.И., г. Тверь",
-                "support_username": "my_support", "terms_updated": "01.10.2026"})
+                "support_username": "my_support", "support_email": "help@example.com",
+                "terms_updated": "01.10.2026"})
     text = bot.terms_text()
 
     check("соглашение умещается в одно сообщение Telegram", len(text) < 4096, f"{len(text)} символов")
+    check("заголовок и подзаголовок как в утверждённом тексте",
+          "ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ (ПУБЛИЧНАЯ ОФЕРТА)" in text)
     check("указаны название сервиса и дата редакции",
           "SuperVPN" in text and "01.10.2026" in text)
-    check("указан исполнитель", "ИП Иванов И.И." in text)
-    check("указана поддержка", "@my_support" in text)
+    check("указан исполнитель (переменная TERMS_OPERATOR)",
+          "ИП Иванов И.И." in text)
+    check("указаны Telegram и почта поддержки",
+          "@my_support" in text and "help@example.com" in text)
     check("все обязательные разделы на месте",
           all(section in text for section in TERMS_SECTIONS),
           str([s for s in TERMS_SECTIONS if s not in text]))
-    check("есть запреты и возврат", "спам" in text and "DDoS" in text and "Возврат" in text)
-    check("сказано про данные и отсутствие логов", "не ведём логи" in text)
+    check("сказано про акцепт оферты и цифровую услугу",
+          "акцепт оферты" in text and "в цифровом виде" in text)
+    check("есть безвозвратность и порядок возврата",
+          "безвозвратной" in text and "Возврат средств за уже оказанную услугу не производится" in text)
+    check("есть запреты и ответственность",
+          "противоправных действий" in text and "заблокирован без возврата средств" in text)
+    check("описана обработка персональных данных",
+          "Telegram ID" in text and "не передаются третьим лицам" in text)
+    check("оплата: CryptoBot и Telegram Stars", "CryptoBot" in text and "Telegram Stars" in text)
     check("теги HTML закрыты",
           text.count("<b>") == text.count("</b>") and text.count("<i>") == text.count("</i>"))
 
@@ -449,10 +474,11 @@ async def test_terms_file_matches_bot():
 
     check("в документе есть титул и дата редакции",
           "Пользовательское соглашение" in doc and "Редакция от" in doc)
-    check("в документе есть все содержательные разделы",
-          all(title in doc for title in ("Возврат средств", "Обязанности и запреты",
-                                         "Персональные данные", "Изменение условий",
-                                         "Реквизиты Исполнителя")))
+    check("в документе есть все разделы утверждённого текста",
+          all(title in doc for title in (
+              "Предмет соглашения", "Порядок оплаты", "Предоставление доступа",
+              "Возврат и отмена", "Контакты поддержки", "Политика обработки персональных данных",
+              "Ответственность", "Заключительные положения", "Реквизиты Исполнителя")))
     check("в документе отмечено, что реквизиты нужно заполнить",
           "заполните" in doc.lower())
     check("в документе описано, как подключено в боте",
@@ -461,8 +487,8 @@ async def test_terms_file_matches_bot():
     bot = load({"mode": "stars"})
     bot_text = bot.terms_text()
     check("ключевые обещания бота и документа совпадают",
-          ("не ведём логи" in bot_text or "не ведём логи посещённых сайтов" in doc)
-          and "18 лет" in bot_text and "18 лет" in doc)
+          "акцепт оферты" in bot_text and "акцепт оферты" in doc
+          and "24 часов" in bot_text and "24 часов" in doc)
 
 
 async def test_terms_gate():
@@ -474,13 +500,15 @@ async def test_terms_gate():
 
     start = FakeMsg(uid=555, text="/start")
     await bot.cmd_start(start)
-    check("первый /start показывает соглашение, а не меню",
-          "Пользовательское соглашение" in start.last and "Привет!" in start.last)
-    check("в соглашении есть раздел о принятии условий",
-          "2. Принятие условий" in start.last)
-    check("под соглашением кнопка «Согласен — продолжить»",
-          "accept_terms" in callbacks_of(_last_markup(start)))
-    check("меню в первом сообщении не показывается",
+    check("первый /start присылает текст соглашения отдельным сообщением",
+          len(start.sent) == 2 and "ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ" in start.sent[0]
+          and "1. Общие положения" in start.sent[0],
+          f"сообщений: {len(start.sent)}")
+    check("текст соглашения умещается в лимит Telegram", len(start.sent[0]) < 4096,
+          f"{len(start.sent[0])} символов")
+    check("вторым сообщением идёт просьба подтвердить с кнопкой",
+          "Привет!" in start.last and "accept_terms" in callbacks_of(_last_markup(start)))
+    check("меню до подтверждения не показывается",
           "tariffs" not in callbacks_of(_last_markup(start)))
     check("до подтверждения пользователь не отмечен принявшим",
           bot.terms_store.is_accepted(555) is False)
@@ -493,14 +521,12 @@ async def test_terms_gate():
     ):
         await handler(msg)
         check(f"{name} до подтверждения тоже показывает соглашение",
-              "Пользовательское соглашение" in msg.last
-              and "accept_terms" in callbacks_of(_last_markup(msg)), msg.last[:60])
+              has_terms_text(msg) and has_accept_button(msg), msg.last[:60])
 
     terms_cmd = FakeMsg(uid=555, text="/terms")
     await bot.cmd_terms(terms_cmd)
     check("/terms у новичка даёт кнопку принятия",
-          "accept_terms" in callbacks_of(_last_markup(terms_cmd))
-          and "Пользовательское соглашение" in terms_cmd.last)
+          has_accept_button(terms_cmd) and "ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ" in terms_cmd.last)
 
     still_terms = FakeMsg(uid=555, text="/terms")
     await bot.cmd_terms(still_terms)
@@ -527,13 +553,13 @@ async def test_terms_gate():
     stale = FakeCallback("main_menu", FakeMsg(uid=777), uid=777)
     await bot.cb_main_menu(stale)
     check("старая кнопка меню у непринявшего ведёт на соглашение",
-          "Пользовательское соглашение" in stale.message.last)
+          has_terms_text(stale.message) and has_accept_button(stale.message))
 
     stale_tariffs = FakeCallback("tariffs", FakeMsg(uid=777), uid=777)
     await bot.cb_tariffs(stale_tariffs)
     check("старая кнопка «Тарифы» тоже ведёт на соглашение",
-          "Пользовательское соглашение" in stale_tariffs.message.last
-          and "Школьник" not in stale_tariffs.message.last)
+          has_terms_text(stale_tariffs.message)
+          and not any("Школьник" in t for t in stale_tariffs.message.sent))
 
     try:
         await bot.start_checkout(777, 777, "basic")
