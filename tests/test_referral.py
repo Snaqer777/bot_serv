@@ -329,7 +329,7 @@ async def test_second_friend_immediate(store_file, ref_file):
 
     TG["calls"].clear()
     await bot.cmd_start(make_message(bot, FRIEND2, f"/start ref_{REFERRER}"))
-    await pay_stars(bot, FRIEND2, "standard")
+    await pay_stars(bot, FRIEND2, "family")
 
     after = expiry_of(REFERRER)
     check(f"пригласившему добавилось ровно {BONUS_DAYS} дней",
