@@ -93,6 +93,12 @@ class FakeCallback:
         return True
 
 
+def _last_markup(target):
+    """reply_markup из последнего ответа FakeMsg/FakeCallback."""
+    msg = target.message if isinstance(target, FakeCallback) else target
+    return msg.kwargs[-1].get("reply_markup") if msg.kwargs else None
+
+
 def callbacks_of(markup):
     if markup is None:
         return []
@@ -303,6 +309,31 @@ async def test_trial_visibility():
     check("если пользователь всё же отправит /test_vpn — вежливый ответ без админ-текста",
           "недоступен" in denied.last and "ADMIN_ID" not in denied.last and "администратор" not in denied.last.lower())
 
+    # Тестовый пункт не должен маячить в тарифах у обычного пользователя
+    tariffs = FakeCallback("tariffs", FakeMsg(uid=555), uid=555)
+    await closed.cb_tariffs(tariffs)
+    check("в тарифах у обычного пользователя нет бесплатного теста",
+          "Тестовый период" not in tariffs.message.last, tariffs.message.last[:80])
+    user_tariffs = callbacks_of(_last_markup(tariffs))
+    check("и кнопки buy_trial у него нет", "buy_trial" not in user_tariffs, str(user_tariffs))
+    admin_tariffs = callbacks_of(closed.tariffs_kb(ADMIN_ID))
+    check("у администратора тестовый пункт в тарифах остался", "buy_trial" in admin_tariffs)
+
+    trial_click = FakeCallback("buy_trial", FakeMsg(uid=555), uid=555)
+    await closed.cb_buy(trial_click)
+    check("нажатие на тестовый тариф даёт понятный ответ, а не тишину",
+          any("недоступен" in a for a in trial_click.answers), str(trial_click.answers))
+
+    try:
+        await closed.start_checkout(555, 555, "trial")
+        check("start_checkout(trial) для пользователя отклонён", False)
+    except Exception as exc:
+        check("start_checkout(trial) для пользователя отклонён без упоминания /test_vpn",
+              "test_vpn" not in str(exc) and "недоступен" in str(exc), str(exc)[:70])
+
+    check("соглашение для обычного пользователя не обещает бесплатный тест",
+          "Бесплатный тестовый доступ" not in closed.terms_text())
+
     open_bot = load({"trial_public": "1"})
     check("TRIAL_PUBLIC=1 открывает тест всем", open_bot.trial_available_for(555) is True)
     opened_start = FakeMsg(uid=555, text="/start")
@@ -311,6 +342,10 @@ async def test_trial_visibility():
           "Бесплатный тестовый доступ" in opened_start.last)
     check("кнопка теста есть в меню у всех",
           "get_test_key_btn" in callbacks_of(open_bot.main_menu_kb(555)))
+    check("при TRIAL_PUBLIC=1 тестовый пункт вернулся и в тарифы",
+          "buy_trial" in callbacks_of(open_bot.tariffs_kb(555)))
+    check("и соглашение снова упоминает бесплатный тест",
+          "Бесплатный тестовый доступ" in open_bot.terms_text())
 
 
 async def test_terms_in_bot():

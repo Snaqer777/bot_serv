@@ -3460,7 +3460,9 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
     """
     tariff = TARIFFS[tariff_key]
     if tariff["price"] <= 0:
-        raise PaymentError("Этот тариф бесплатный — просто получи тестовый ключ командой /test_vpn.")
+        if trial_available_for(tg_id):
+            raise PaymentError("Этот тариф бесплатный — просто получи тестовый ключ командой /test_vpn.")
+        raise PaymentError("Этот тариф бесплатный и сейчас недоступен. Выбери платный тариф — ключ придёт сразу после оплаты.")
 
     if not payments_enabled():
         raise PaymentError(
@@ -4234,9 +4236,18 @@ def main_menu_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def tariffs_kb() -> InlineKeyboardMarkup:
+def tariffs_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
+    """
+    Кнопки тарифов.
+
+    Бесплатный тестовый пункт показываем только тем, кому тест реально доступен
+    (TRIAL_PUBLIC=1 или администратор) — иначе пользователь нажмёт «Бесплатно»
+    и получит отказ.
+    """
     buttons = []
     for key, data in TARIFFS.items():
+        if data["price"] <= 0 and not trial_available_for(tg_id):
+            continue
         buttons.append([
             InlineKeyboardButton(
                 text=f"{data['name']} — {tariff_price_label(data)}",
@@ -4904,6 +4915,8 @@ async def cb_tariffs(cb: CallbackQuery):
     await cb.answer()
     text = "💰 <b>Тарифные планы:</b>\n\n"
     for key, data in TARIFFS.items():
+        if data["price"] <= 0 and not trial_available_for(cb.from_user.id):
+            continue          # бесплатный тест — только тем, кому он доступен
         text += (
             f"• <b>{data['name']}</b> — <b>{tariff_price_label(data)}</b>\n"
             f"  📦 Трафик: {data['traffic']} | 📱 Устройств: {data['ips']} | 🌍 {data['locations']}\n\n"
@@ -4926,7 +4939,7 @@ async def cb_tariffs(cb: CallbackQuery):
         text += ("💳 <i>Оплата картой прямо в Telegram — без перехода на другие сайты. "
                  "Ключ придёт сразу после оплаты.</i>")
 
-    await cb.message.edit_text(text, reply_markup=tariffs_kb(), parse_mode="HTML")
+    await cb.message.edit_text(text, reply_markup=tariffs_kb(cb.from_user.id), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "check_payment_help")
@@ -4943,6 +4956,9 @@ async def cb_buy(cb: CallbackQuery):
     tariff_key = cb.data.removeprefix("buy_")
 
     if tariff_key == "trial":
+        if not trial_available_for(cb.from_user.id):
+            await cb.answer("Бесплатный тест сейчас недоступен — смотри платные тарифы.", show_alert=True)
+            return
         await cb.answer()
         await cmd_test_vpn(cb.message)
         return
@@ -5546,6 +5562,9 @@ def terms_text() -> str:
     Полная версия с реквизитами — в файле TERMS.md репозитория. Здесь тот же текст
     в коротком виде: он умещается в одно сообщение Telegram (лимит 4096 символов).
     """
+    # Бесплатный тест есть не у всех пользователей — тогда и в соглашении об этом молчим.
+    trial_note = "• Бесплатный тестовый доступ на 24 часа даётся один раз.\n" if TRIAL_PUBLIC else ""
+
     return (
         "📄 <b>Пользовательское соглашение</b>\n"
         f"<i>Сервис «{SERVICE_NAME}» · редакция от {TERMS_UPDATED}</i>\n\n"
@@ -5564,7 +5583,7 @@ def terms_text() -> str:
         "• Доступ выдаётся на срок выбранного тарифа, ключ приходит сразу после "
         "подтверждённой оплаты.\n"
         "• Цена и способ оплаты видны до покупки: рубли, звёзды Telegram, крипта или карта.\n"
-        "• Бесплатный тестовый доступ на 24 часа даётся один раз.\n"
+        f"{trial_note}"
         "• Подписка не продлевается сама: по окончании срока доступ отключается.\n"
         "• Услуга цифровая и считается оказанной с момента выдачи ключа.\n\n"
 
