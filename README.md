@@ -496,13 +496,13 @@ Telegram-бот на **aiogram 3**, работающий на **Railway**.
 **«📲 Как подключиться (пошагово)»**). Тот же список для справки:
 
 - **iOS (iPhone/iPad, российский App Store):** [Streisand](https://apps.apple.com/ru/app/streisand/id6450534064),
-  [FoXray](https://apps.apple.com/ru/app/foxray/id6448898396),
+  [INCY](https://apps.apple.com/ru/app/incy/id6756943388),
   [V2Box](https://apps.apple.com/ru/app/v2box-v2ray-client/id6446814690),
   [V2RayTUN](https://apps.apple.com/ru/app/v2raytun/id6476628951).
   Happ в российском App Store нет — только с зарубежным Apple ID ([happ.su](https://happ.su)).
 - **Android:** [v2rayNG (Google Play)](https://play.google.com/store/apps/details?id=com.v2ray.ang),
   [v2rayNG (APK с GitHub)](https://github.com/2dust/v2rayNG/releases),
-  [Happ](https://happ.su), [Hiddify](https://hiddify.com/#app).
+  [Happ](https://happ.su).
 - **Windows / macOS:** [Happ](https://happ.su) (десктоп-сборки: [GitHub](https://github.com/Happ-proxy/happ-desktop/releases)),
   [v2rayN](https://github.com/2dust/v2rayN/releases), [Hiddify](https://hiddify.com/#app),
   [V2Box](https://apps.apple.com/ru/app/v2box-v2ray-client/id6446814690) (macOS).
@@ -621,7 +621,7 @@ Telegram-бот на **aiogram 3**, работающий на **Railway**.
 pip install -r requirements.txt pyotp
 
 python tests/test_payments.py   # оплата: Stars, BotFather, ЮKassa, крипта (Crypto Pay) — 282 проверки
-python tests/test_help.py       # пошаговая инструкция подключения и её кнопки — 70 проверок
+python tests/test_help.py       # пошаговая инструкция подключения и её кнопки — 74 проверки
 python tests/test_production.py # боевой вид (ADMIN_TOOLS, TRIAL_PUBLIC, TRIAL_BUTTON, TERMS_ACCEPT) — 106 проверок
 python tests/test_referral.py   # реферальная программа: ссылка → друг → оплата → дни — 48 проверок
 python tests/test_groups.py     # группы клиентов 3x-ui 3.2+ — 45 проверок
@@ -659,7 +659,8 @@ python tests/test_e2e.py        # сквозной прогон всех фун�
 
 Что проверяется в `tests/test_help.py` и `tests/test_referral.py`:
 
-- в инструкции для каждой платформы есть ссылки на официальные приложения (и нет сайтов-клонов),
+- в инструкции для каждой платформы есть ссылки на официальные приложения (iOS — Streisand и INCY,
+  Android — v2rayNG и Happ, и нет сайтов-клонов),
   шаги «скачать → скопировать ключ → импорт из буфера → подключить → проверить IP»;
 - все кнопки инструкции открывают нужные экраны, старая кнопка ведёт в новое меню,
   команды `/help` и `/invite` видны в меню Telegram;

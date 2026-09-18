@@ -4129,6 +4129,7 @@ APP_LINKS = {
     "hiddify": "https://hiddify.com/#app",
     "hiddify_gh": "https://github.com/hiddify/hiddify-app/releases",
     "streisand": "https://apps.apple.com/ru/app/streisand/id6450534064",
+    "incy": "https://apps.apple.com/ru/app/incy/id6756943388",
     "foxray": "https://apps.apple.com/ru/app/foxray/id6448898396",
     "v2box": "https://apps.apple.com/ru/app/v2box-v2ray-client/id6446814690",
     "v2raytun": "https://apps.apple.com/ru/app/v2raytun/id6476628951",
@@ -4203,7 +4204,7 @@ def install_text(platform: str) -> str:
             "📱 <b>iPhone / iPad — пошагово</b>\n\n"
             "<b>Шаг 1. Установи приложение</b> (подойдёт любое):\n"
             f"• {_a('streisand', 'Streisand')} — самый простой вариант, бесплатно;\n"
-            f"• {_a('foxray', 'FoXray')} — тоже бесплатно и просто;\n"
+            f"• {_a('incy', 'INCY')} — современный клиент, есть в российском App Store;\n"
             f"• {_a('v2box', 'V2Box')} — поддерживает VLESS и ссылки подписки;\n"
             f"• {_a('happ', 'Happ')} — сайт разработчика (в российском App Store его нет, "
             "понадобится зарубежный Apple ID).\n\n"
@@ -4226,8 +4227,7 @@ def install_text(platform: str) -> str:
             "<b>Шаг 1. Установи приложение</b> (подойдёт любое):\n"
             f"• {_a('v2rayng_play', 'v2rayNG (Google Play)')} — самый популярный;\n"
             f"• {_a('v2rayng', 'v2rayNG (APK с GitHub)')} — если Play недоступен;\n"
-            f"• {_a('happ', 'Happ')} — современный, простой интерфейс;\n"
-            f"• {_a('hiddify', 'Hiddify')} — поддерживает много протоколов.\n\n"
+            f"• {_a('happ', 'Happ')} — современный, простой интерфейс.\n\n"
             "<b>Шаг 2. Скопируй ключ</b>\n"
             "«👤 Мой профиль» → нажми на ключ <code>vless://…</code> — он попадёт в буфер обмена.\n\n"
             "<b>Шаг 3. Добавь ключ</b>\n"

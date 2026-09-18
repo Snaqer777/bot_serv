@@ -88,8 +88,13 @@ async def test_platform_steps():
           "Streisand" in ios and "apps.apple.com" in ios)
     check("iOS: предупреждение про зарубежный Apple ID для Happ",
           "Apple ID" in ios)
+    check("iOS: есть INCY из российского App Store",
+          "INCY" in ios and "apps.apple.com/ru/app/incy/id6756943388" in ios)
+    check("iOS: FoXray больше не предлагается", "FoXray" not in ios)
     android = bot.install_text("android")
     check("Android: v2rayNG и из Google Play, и APK", "Google Play" in android and "GitHub" in android)
+    check("Android: Hiddify убран из списка", "Hiddify" not in android)
+    check("Android: v2rayNG и Happ остались", "v2rayNG" in android and "Happ" in android)
     windows = bot.install_text("windows")
     check("Windows: v2rayN и системный прокси/TUN", "v2rayN" in windows and "прокси" in windows)
     tv = bot.install_text("tv")
