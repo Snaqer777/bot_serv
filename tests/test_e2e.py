@@ -2,8 +2,9 @@
 Сквозной прогон ВСЕХ функций бота — так, как их видит живой Telegram.
 
 В отличие от специализированных наборов (test_payments, test_help, test_referral,
-test_production), здесь один длинный путь: /start → инструкция → тарифы → оплата →
-ключ → профиль → рефералка → админ-функции → тестовый ключ. Каждый шаг идёт через
+test_production), здесь один длинный путь: первый запуск и принятие соглашения →
+инструкция → тарифы → оплата → ключ → профиль → рефералка → админ-функции →
+тестовый ключ. Каждый шаг идёт через
 настоящий слой aiogram: сообщения уходят на фейковый Bot API, ключи создаются в
 фейковой панели 3x-ui, оплата проходит через фейковый Crypto Pay.
 
@@ -103,6 +104,9 @@ def e2e_bot(store_file, ref_file, admins=None, secret=TOTP_SECRET, **overrides):
         "REFERRAL_INVITED_BONUS_DAYS": "3",
         "STARS_RUB_RATE": "1.6",
         "XUI_2FA_SECRET": secret,
+        "TERMS_ACCEPT": "1",          # экран соглашения при первом запуске — как в бою
+        "TERMS_STORE_FILE": os.path.join(os.path.dirname(store_file),
+                                          "terms-" + os.path.basename(store_file)),
     }
     full_env.update(overrides)
     bot = load_bot(fp.PANEL_PORT, admins=str(admins or ADMIN), secret=secret, env=full_env)
@@ -179,12 +183,30 @@ async def pay_via_crypto(bot, uid, tariff, *, webhook=False):
 # ---------------- сценарии ----------------
 
 async def step_start(bot):
-    print("\n▶ 1. /start: приветствие и главное меню")
+    print("\n▶ 1. Первый запуск: соглашение → «✅ Согласен» → приветствие и меню")
+    fp.TG["calls"].clear()
+    await bot.cmd_start(make_message(bot, ADMIN, "/start"))
+    first = last_text(ADMIN)
+    gate_kb = buttons(last_sent(ADMIN))
+    check("первый /start показывает пользовательское соглашение",
+          "Пользовательское соглашение" in first and "2. Принятие условий" in first)
+    check("под соглашением кнопка «Согласен — продолжить»",
+          "accept_terms" in gate_kb, str(gate_kb))
+    check("меню до подтверждения не показывается", "tariffs" not in gate_kb)
+
+    await bot.cb_accept_terms(click(bot, "accept_terms", uid=ADMIN))
+    check("кнопка «Согласен» открывает приветствие и главное меню",
+          "Добро пожаловать" in last_text(ADMIN, method="editMessageText")
+          and {"tariffs", "profile", "help_menu"} <= set(buttons(last_edit(ADMIN))))
+    check("принятие сохранено (файл отметок)", bot.terms_store.is_accepted(ADMIN))
+
     fp.TG["calls"].clear()
     await bot.cmd_start(make_message(bot, ADMIN, "/start"))
     text = last_text(ADMIN)
     menu = buttons(last_sent(ADMIN))
 
+    check("второй /start — сразу приветствие, без соглашения",
+          "Пользовательское соглашение" not in text and "Добро пожаловать" in text)
     check("приветствие показывает протокол и тарифы",
           "VLESS Reality" in text and "Тарифы" in text)
     check("меню админа: тестовый ключ на месте (TRIAL_PUBLIC=0)",
@@ -195,11 +217,28 @@ async def step_start(bot):
     check("обычному пользователю тестовый ключ не предлагают",
           "get_test_key_btn" not in buttons_from(bot.main_menu_kb(STRANGER)))
 
+    # Обычный пользователь проходит тот же путь
+    fp.TG["calls"].clear()
+    await bot.cmd_start(make_message(bot, STRANGER, "/start"))
+    check("новичок тоже сначала видит соглашение",
+          "Пользовательское соглашение" in last_text(STRANGER)
+          and "accept_terms" in buttons(last_sent(STRANGER)))
+
+    fp.TG["calls"].clear()
+    await bot.cmd_help(make_message(bot, STRANGER, "/help"))
+    check("до подтверждения инструкция не открывается — только соглашение",
+          "Пользовательское соглашение" in last_text(STRANGER)
+          and "Подключение VPN" not in last_text(STRANGER))
+
+    await bot.cb_accept_terms(click(bot, "accept_terms", uid=STRANGER))
+    check("после «Согласен» новичок видит меню", bot.terms_store.is_accepted(STRANGER))
+
     fp.TG["calls"].clear()
     await bot.cmd_start(make_message(bot, STRANGER, "/start"))
     check("/start обычного пользователя без обещаний бесплатного теста",
           "Бесплатный тестовый доступ" not in last_text(STRANGER)
-          and "test_vpn" not in last_text(STRANGER))
+          and "test_vpn" not in last_text(STRANGER)
+          and "Добро пожаловать" in last_text(STRANGER))
 
 
 def buttons_from(markup):
@@ -318,9 +357,16 @@ async def step_referral(bot):
 
     fp.TG["calls"].clear()
     await bot.cmd_start(make_message(bot, FRIEND, f"/start ref_{ADMIN}"))
-    check("друг увидел приветствие с бонусом", "Тебя пригласили" in last_text(FRIEND))
-    check("админу ушло уведомление о новом друге",
+    check("друг по ссылке сначала видит соглашение",
+          "Пользовательское соглашение" in last_text(FRIEND))
+    check("приглашение уже засчитано: админу ушло уведомление о новом друге",
           any("пришёл друг" in t for t in texts_to(ADMIN)))
+    check("а приветствие с бонусом ждёт кнопки «Согласен»",
+          not any("Тебя пригласили" in t for t in texts_to(FRIEND)))
+
+    await bot.cb_accept_terms(click(bot, "accept_terms", uid=FRIEND))
+    check("после «Согласен» друг видит приветствие с бонусом +3 дня",
+          any("Тебя пригласили" in t for t in texts_to(FRIEND)))
 
     expiry_before = int(panel_client(ADMIN)["expiryTime"])
     await pay_via_crypto(bot, FRIEND, "basic", webhook=True)   # вебхук-путь выдачи
@@ -450,9 +496,16 @@ async def step_production_bot(store_file, ref_file):
     check("/myid остаётся всегда", "cmd_myid" in handlers)
 
     fp.TG["calls"].clear()
+    await bot.cmd_start(make_message(bot, ADMIN, "/start"))
+    check("боевой бот тоже просит подтвердить соглашение при первом запуске",
+          "Пользовательское соглашение" in last_text(ADMIN))
+    await bot.cb_accept_terms(click(bot, "accept_terms", uid=ADMIN))
+
+    fp.TG["calls"].clear()
     await bot.cmd_myid(make_message(bot, ADMIN, "/myid"))
     check("админу /myid подсказывает, как вернуть команды", "ADMIN_TOOLS=1" in last_text(ADMIN))
 
+    await bot.cb_accept_terms(click(bot, "accept_terms", uid=STRANGER))
     await bot.cmd_profile(make_message(bot, STRANGER, "/profile"))
     check("в профиле пользователя нет кнопки тестового ключа",
           "get_test_key_btn" not in buttons(last_sent(STRANGER)),

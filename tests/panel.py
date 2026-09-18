@@ -281,6 +281,10 @@ def load_bot(port=8742, group=None, secret=None, admins="42", host=None, env=Non
         "XUI_INBOUND_ID": "1",
         "XUI_PROXY": "",
         "VPN_HOST": host or "",
+        # Экран «соглашение при первом запуске» в тестах выключен, чтобы не мешать
+        # сценариям про панель и оплату. Включается явно: env={"TERMS_ACCEPT": "1"}
+        # (так делают tests/test_production.py и tests/test_e2e.py).
+        "TERMS_ACCEPT": "0",
     })
     for key, value in (("XUI_2FA_SECRET", secret), ("XUI_CLIENT_GROUP", group)):
         if value is None:

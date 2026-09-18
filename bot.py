@@ -362,6 +362,13 @@ TERMS_OPERATOR = (os.getenv("TERMS_OPERATOR") or "").strip()
 # Дата последней редакции соглашения (меняется вручную при правках текста).
 TERMS_UPDATED = (os.getenv("TERMS_UPDATED") or "18.09.2026").strip()
 
+# Показывать ли соглашение при первом запуске бота (кнопка «✅ Согласен»).
+#   1 (по умолчанию) — новичок сначала видит соглашение и подтверждает его;
+#   0 — соглашение не спрашивается, бот сразу показывает меню (остаётся /terms).
+TERMS_ACCEPT = (os.getenv("TERMS_ACCEPT") or "1").strip().lower() not in ("0", "false", "no", "off")
+# Файл с отметками о принятии соглашения (кто и когда подтвердил).
+TERMS_STORE_FILE = (os.getenv("TERMS_STORE_FILE") or "data/terms.json").strip()
+
 # ЮKassa: Shop ID и секретный ключ (Интеграция -> Ключи API). test_* ключи = тестовый магазин.
 YOOKASSA_SHOP_ID = (os.getenv("YOOKASSA_SHOP_ID") or "").strip()
 YOOKASSA_SECRET_KEY = (os.getenv("YOOKASSA_SECRET_KEY") or "").strip()
@@ -1989,6 +1996,79 @@ class ReferralStore:
 
 referral_store = ReferralStore(REFERRAL_STORE_FILE)
 
+
+class TermsStore:
+    """
+    Отметки о принятии пользовательского соглашения: кто и когда нажал «✅ Согласен».
+
+    Формат файла (TERMS_STORE_FILE) — JSON: {"accepted": {"<telegram_id>": <unixtime>}}.
+    Если файл недоступен (например, эфемерная файловая система Railway) — работаем
+    в памяти: после перезапуска бот ещё раз покажет соглашение, ничего не сломается.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.accepted: dict[str, int] = {}
+        self._loaded = False
+
+    def load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        if not self.path:
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.accepted = {
+                str(k): int(v) for k, v in (data.get("accepted") or {}).items()
+                if str(k).lstrip("-").isdigit() and str(v).lstrip("-").isdigit()
+            }
+            logger.info("Отметки о принятии соглашения загружены: %s пользователей.", len(self.accepted))
+        except FileNotFoundError:
+            logger.info("Отметок о принятии соглашения нет — создам %s при первом принятии.", self.path)
+        except Exception as exc:
+            logger.warning("Не удалось прочитать отметки о соглашении (%s): %s", self.path, exc)
+
+    def _write(self) -> None:
+        if not self.path:
+            return
+        try:
+            directory = os.path.dirname(self.path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            tmp = f"{self.path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "accepted": self.accepted}, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)
+        except Exception as exc:
+            logger.warning("Не удалось сохранить отметки о соглашении (%s): %s", self.path, exc)
+
+    def accepted_at(self, tg_id: int | None) -> int:
+        """Когда пользователь принял соглашение (0 — ещё не принимал)."""
+        if not tg_id:
+            return 0
+        self.load()
+        return int(self.accepted.get(str(tg_id)) or 0)
+
+    def is_accepted(self, tg_id: int | None) -> bool:
+        return self.accepted_at(tg_id) > 0
+
+    def accept(self, tg_id: int) -> bool:
+        """Отмечает принятие. Возвращает True, если это первое принятие."""
+        if not tg_id:
+            return False
+        self.load()
+        key = str(tg_id)
+        if key in self.accepted:
+            return False
+        self.accepted[key] = int(time.time())
+        self._write()
+        return True
+
+
+terms_store = TermsStore(TERMS_STORE_FILE)
+
 # Username бота нужен для реферальной ссылки: спрашиваем у Telegram один раз и кэшируем.
 _bot_username_cache = ""
 
@@ -2014,6 +2094,12 @@ async def referral_link(tg_id: int) -> str:
     if not username:
         return ""
     return f"https://t.me/{username}?start=ref_{tg_id}"
+
+
+# Приветствия приглашённых, которые ждут нажатия «✅ Согласен — продолжить».
+# Хранится в памяти: после перезапуска бота друг просто не увидит приветствие,
+# а сами бонусные дни (журнал приглашений) уже записаны и не потеряются.
+pending_referral_greet: dict[int, str] = {}
 
 
 def parse_referral_payload(payload: str) -> int | None:
@@ -2252,6 +2338,8 @@ async def send_referral_page(target, tg_id: int, *, edit: bool = False) -> None:
 async def cmd_invite(message: Message):
     """Реферальная программа: личная ссылка, статистика и правила."""
     referral_store.touch_user(message.from_user.id)
+    if await terms_gate(message):
+        return
     await send_referral_page(message, message.from_user.id)
 
 
@@ -2262,8 +2350,14 @@ async def cb_invite(cb: CallbackQuery):
     await send_referral_page(cb.message, cb.from_user.id)
 
 
-async def handle_referral_start(message: Message, payload: str) -> None:
-    """Обрабатывает переход по реферальной ссылке (/start ref_12345)."""
+async def handle_referral_start(message: Message, payload: str, defer_greeting: bool = False) -> None:
+    """
+    Обрабатывает переход по реферальной ссылке (/start ref_12345).
+
+    defer_greeting=True — приглашённый ещё не принял соглашение: приглашение
+    записываем и сообщаем пригласившему сейчас, а приветствие с бонусом покажем
+    после кнопки «✅ Согласен» (текст берётся из referral_greet_text).
+    """
     referrer_id = parse_referral_payload(payload)
     if referrer_id is None:
         return
@@ -2283,25 +2377,48 @@ async def handle_referral_start(message: Message, payload: str) -> None:
             )
         except Exception as exc:
             logger.warning("Не удалось сообщить рефереру %s о новом друге: %s", referrer_id, exc)
-        try:
-            await message.answer(
-                f"🎁 <b>Тебя пригласили!</b> Друг подарил тебе "
-                f"<b>+{REFERRAL_INVITED_BONUS_DAYS} {days_word(REFERRAL_INVITED_BONUS_DAYS)}</b> — "
-                "они прибавятся к первой оплате любого тарифа.\n\n"
-                + ("Начни с бесплатного теста на 24 часа: /test_vpn — "
-                   "или смотри тарифы: /start" if trial_available_for(invited_id)
-                   else "Смотри тарифы и подключайся: /start"),
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
+        if defer_greeting:
+            pending_referral_greet[invited_id] = status
+            return
     elif status == "self":
-        try:
-            await message.answer("🙂 Своя же ссылка не считается — пригласи друга, и бонус будет твоим.")
-        except Exception:
-            pass
+        if defer_greeting:
+            pending_referral_greet[invited_id] = status
+            return
     elif status == "unknown_referrer":
         logger.info("Реферальная ссылка с неизвестным приглашающим: %s", referrer_id)
+        return
+
+    await send_referral_greet(message.answer, invited_id, status)
+
+
+def referral_greet_text(invited_id: int, status: str) -> str:
+    """Приветствие приглашённого друга (после перехода по ссылке)."""
+    if status == "self":
+        return "🙂 Своя же ссылка не считается — пригласи друга, и бонус будет твоим."
+    return (
+        "🎁 <b>Тебя пригласили!</b> Друг подарил тебе "
+        f"<b>+{REFERRAL_INVITED_BONUS_DAYS} {days_word(REFERRAL_INVITED_BONUS_DAYS)}</b> — "
+        "они прибавятся к первой оплате любого тарифа.\n\n"
+        + ("Начни с бесплатного теста на 24 часа: /test_vpn — "
+           "или смотри тарифы: /start" if trial_available_for(invited_id)
+           else "Смотри тарифы и подключайся: /start")
+    )
+
+
+async def send_referral_greet(answer, invited_id: int, status: str) -> None:
+    """Отправляет приветствие приглашённого (answer — message.answer или cb.message.answer)."""
+    try:
+        await answer(referral_greet_text(invited_id, status), parse_mode="HTML")
+    except Exception as exc:
+        logger.warning("Не удалось поздороваться с приглашённым %s: %s", invited_id, exc)
+
+
+async def send_pending_referral_greet(message: Message, invited_id: int) -> None:
+    """Показывает отложенное приветствие друга — вызывается после принятия соглашения."""
+    status = pending_referral_greet.pop(invited_id, None)
+    if not status:
+        return
+    await send_referral_greet(message.answer, invited_id, status)
 
 
 
@@ -3458,6 +3575,13 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
     stars/provider — нативный счёт Telegram; yookassa и crypto — счёт через API
     и ссылка на страницу оплаты.
     """
+    if terms_gate_needed(tg_id):
+        raise PaymentError(
+            "📄 Сначала подтверди пользовательское соглашение.\n\n"
+            "Открой /start и нажми кнопку «✅ Согласен — продолжить» — после этого оплата "
+            "и выдача ключа станут доступны."
+        )
+
     tariff = TARIFFS[tariff_key]
     if tariff["price"] <= 0:
         if trial_available_for(tg_id):
@@ -4293,12 +4417,36 @@ def key_actions_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    referral_store.touch_user(message.from_user.id)
+    """Первый экран: соглашение (один раз) → приветствие и главное меню."""
+    uid = message.from_user.id
+    referral_store.touch_user(uid)
+
+    # Переход по реферальной ссылке: t.me/<бот>?start=ref_12345
+    parts = (message.text or "").split(maxsplit=1)
+    payload = parts[1] if len(parts) > 1 else ""
+
+    if terms_gate_needed(uid):
+        # Приглашение засчитываем сразу (друг уже оплатил ожидания), а приветствие
+        # приглашённому покажем после кнопки «✅ Согласен» — чтобы порядок был логичным.
+        if payload:
+            await handle_referral_start(message, payload, defer_greeting=True)
+        await message.answer(terms_gate_text(), reply_markup=terms_gate_kb(),
+                             parse_mode="HTML", disable_web_page_preview=True)
+        return
+
+    await message.answer(welcome_text(uid), reply_markup=main_menu_kb(uid), parse_mode="HTML")
+
+    if payload:
+        await handle_referral_start(message, payload)
+
+
+def welcome_text(tg_id: int) -> str:
+    """Приветствие /start: показывается после принятия соглашения и по кнопке «Меню»."""
     trial_line = (
         "🎁 Бесплатный тестовый доступ на 24 часа — кнопка ниже.\n"
-        if trial_available_for(message.from_user.id) else ""
+        if trial_available_for(tg_id) else ""
     )
-    text = (
+    return (
         "👋 <b>Добро пожаловать в быстрый и надёжный VPN!</b>\n\n"
         "Мы используем современный протокол <b>VLESS Reality</b>, "
         "который неотличим от обычного интернет-трафика и работает стабильно.\n\n"
@@ -4308,12 +4456,6 @@ async def cmd_start(message: Message):
         "👤 Статус подписки и продление — /profile.\n"
         "📄 Условия сервиса, оплаты и возврата — /terms."
     )
-    await message.answer(text, reply_markup=main_menu_kb(message.from_user.id), parse_mode="HTML")
-
-    # Переход по реферальной ссылке: t.me/<бот>?start=ref_12345
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) > 1:
-        await handle_referral_start(message, parts[1])
 
 
 @dp.message(Command("myid"))
@@ -4421,6 +4563,8 @@ async def cmd_inbounds(message: Message):
 @dp.message(Command("test_vpn"))
 async def cmd_test_vpn(message: Message):
     """Выдаёт тестовый VPN-ключ."""
+    if await terms_gate(message):
+        return
     # Тестовый доступ открыт админу всегда; обычным пользователям — только при TRIAL_PUBLIC=1
     if not trial_available_for(message.from_user.id):
         await message.answer(
@@ -4887,6 +5031,10 @@ async def cmd_totp(message: Message):
 @dp.callback_query(F.data == "main_menu")
 async def cb_main_menu(cb: CallbackQuery):
     await cb.answer()
+    if terms_gate_needed(cb.from_user.id):
+        # Кнопка осталась от старого бота: соглашение всё ещё не подтверждено
+        await show_terms_gate(cb.message)
+        return
     await cb.message.edit_text(
         "🏠 <b>Главное меню:</b>\n\nВыбери необходимое действие ниже 👇",
         reply_markup=main_menu_kb(cb.from_user.id),
@@ -4913,6 +5061,9 @@ async def cb_reset_my_vpn(cb: CallbackQuery):
 @dp.callback_query(F.data == "tariffs")
 async def cb_tariffs(cb: CallbackQuery):
     await cb.answer()
+    if terms_gate_needed(cb.from_user.id):
+        await show_terms_gate(cb.message)
+        return
     text = "💰 <b>Тарифные планы:</b>\n\n"
     for key, data in TARIFFS.items():
         if data["price"] <= 0 and not trial_available_for(cb.from_user.id):
@@ -5483,12 +5634,16 @@ async def send_profile(message: Message, user_id: int):
 
 @dp.message(Command("profile"))
 async def cmd_profile(message: Message):
+    if await terms_gate(message):
+        return
     await send_profile(message, message.from_user.id)
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     """Пошаговая инструкция по подключению: устройство → приложение → ключ → проверка."""
+    if await terms_gate(message):
+        return
     await message.answer(INSTALL_INTRO, reply_markup=install_menu_kb(), parse_mode="HTML")
 
 
@@ -5552,8 +5707,8 @@ def support_link() -> str:
 
 
 def terms_operator_text() -> str:
-    """Кто оказывает услугу — подставляется в соглашение."""
-    return TERMS_OPERATOR or "администрация сервиса"
+    """Кто оказывает услугу — подставляется в соглашение (без точки на конце)."""
+    return (TERMS_OPERATOR or "администрация сервиса").strip().rstrip(".")
 
 
 def terms_text() -> str:
@@ -5576,6 +5731,8 @@ def terms_text() -> str:
         "и не заменяет интернет-провайдера.\n\n"
 
         "<b>2. Принятие условий</b>\n"
+        "При первом запуске бот показывает это соглашение и просит подтвердить его кнопкой "
+        "«✅ Согласен — продолжить» — до подтверждения сервис недоступен. "
         "Пользуясь ботом (запуск бота, получение ключа, оплата тарифа) ты принимаешь это "
         "соглашение целиком. Если не согласен — не пользуйся сервисом. Пользователи младше "
         "18 лет пользуются сервисом с согласия родителей или законных представителей.\n\n"
@@ -5628,21 +5785,87 @@ def terms_text() -> str:
     )
 
 
-def terms_kb() -> InlineKeyboardMarkup:
-    """Кнопки под соглашением: поддержка и возврат в меню."""
+def terms_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
+    """Кнопки под соглашением: принять (если ещё не принято), поддержка, тарифы, меню."""
+    rows = []
+    if terms_gate_needed(tg_id):
+        rows.append([InlineKeyboardButton(text="✅ Согласен — продолжить", callback_data="accept_terms")])
+    rows += [
+        [InlineKeyboardButton(text="💬 Поддержка", url=support_link())],
+        [InlineKeyboardButton(text="💰 Тарифы", callback_data="tariffs")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def terms_gate_needed(tg_id: int | None) -> bool:
+    """Показывать ли экран соглашения: включён TERMS_ACCEPT и человек ещё не подтвердил."""
+    if not TERMS_ACCEPT:
+        return False
+    return not terms_store.is_accepted(tg_id)
+
+
+def terms_gate_text() -> str:
+    """Первое сообщение новичка: соглашение и просьба подтвердить кнопкой."""
+    return (
+        "👋 <b>Привет!</b> Это бот сервиса «" + SERVICE_NAME + "».\n\n"
+        "Чтобы начать пользоваться, прочитай и подтверди соглашение — один раз, "
+        "дальше кнопка больше не появится.\n\n"
+        + terms_text()
+    )
+
+
+def terms_gate_kb() -> InlineKeyboardMarkup:
+    """Кнопки под первым экраном: «Согласен» и поддержка."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Согласен — продолжить", callback_data="accept_terms")],
             [InlineKeyboardButton(text="💬 Поддержка", url=support_link())],
-            [InlineKeyboardButton(text="💰 Тарифы", callback_data="tariffs")],
-            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
         ]
     )
+
+
+async def show_terms_gate(message: Message) -> None:
+    """Показывает экран соглашения (вместо любой другой команды до подтверждения)."""
+    await message.answer(terms_gate_text(), reply_markup=terms_gate_kb(), parse_mode="HTML",
+                         disable_web_page_preview=True)
+
+
+async def terms_gate(message: Message) -> bool:
+    """
+    Проверяет, принял ли пользователь соглашение.
+
+    True — дальше по команде идти нельзя (экран соглашения уже отправлен).
+    Используется в пользовательских командах: до подтверждения они не работают.
+    """
+    if not terms_gate_needed(message.from_user.id):
+        return False
+    await show_terms_gate(message)
+    return True
+
+
+@dp.callback_query(F.data == "accept_terms")
+async def cb_accept_terms(cb: CallbackQuery):
+    """Кнопка «✅ Согласен — продолжить»: отмечаем принятие и открываем главное меню."""
+    uid = cb.from_user.id
+    first_time = terms_store.accept(uid)
+    if first_time:
+        logger.info("Пользователь %s принял пользовательское соглашение.", uid)
+    await cb.answer("✅ Спасибо! Соглашение принято." if first_time else "✅ Соглашение уже принято.")
+
+    try:
+        await cb.message.edit_text(welcome_text(uid), reply_markup=main_menu_kb(uid), parse_mode="HTML")
+    except Exception:
+        await cb.message.answer(welcome_text(uid), reply_markup=main_menu_kb(uid), parse_mode="HTML")
+
+    # Если человек пришёл по ссылке друга — теперь, после соглашения, показываем его бонус
+    await send_pending_referral_greet(cb.message, uid)
 
 
 @dp.message(Command("terms"))
 async def cmd_terms(message: Message):
     """Показывает пользовательское соглашение (публичную оферту)."""
-    await message.answer(terms_text(), reply_markup=terms_kb(), parse_mode="HTML",
+    await message.answer(terms_text(), reply_markup=terms_kb(message.from_user.id), parse_mode="HTML",
                          disable_web_page_preview=True)
 
 
@@ -5650,10 +5873,10 @@ async def cmd_terms(message: Message):
 async def cb_terms(cb: CallbackQuery):
     await cb.answer()
     try:
-        await cb.message.edit_text(terms_text(), reply_markup=terms_kb(), parse_mode="HTML",
+        await cb.message.edit_text(terms_text(), reply_markup=terms_kb(cb.from_user.id), parse_mode="HTML",
                                    disable_web_page_preview=True)
     except Exception:
-        await cb.message.answer(terms_text(), reply_markup=terms_kb(), parse_mode="HTML",
+        await cb.message.answer(terms_text(), reply_markup=terms_kb(cb.from_user.id), parse_mode="HTML",
                                 disable_web_page_preview=True)
 
 

@@ -127,6 +127,10 @@ def load(env=None):
         "SUPPORT_USERNAME": env.get("support_username"),
         "TERMS_OPERATOR": env.get("terms_operator"),
         "TERMS_UPDATED": env.get("terms_updated"),
+        # Экран соглашения при первом запуске проверяется отдельным сценарием
+        # (test_terms_gate), остальным он не мешает.
+        "TERMS_ACCEPT": env.get("terms_accept", "0"),
+        "TERMS_STORE_FILE": os.path.join(tempfile.mkdtemp(), "terms.json"),
     }
     return load_bot(8742, admins=str(ADMIN_ID), env=full_env)
 
@@ -413,6 +417,92 @@ async def test_terms_file_matches_bot():
           and "18 лет" in bot_text and "18 лет" in doc)
 
 
+async def test_terms_gate():
+    print("\n▶ 5. Соглашение при первом запуске: экран и кнопка «Согласен»")
+    bot = load({"terms_accept": "1"})
+    check("TERMS_ACCEPT=1 по умолчанию включён для незнакомого пользователя",
+          bot.TERMS_ACCEPT is True and bot.terms_gate_needed(555) is True)
+    check("у администратора тот же экран, что и у всех", bot.terms_gate_needed(ADMIN_ID) is True)
+
+    start = FakeMsg(uid=555, text="/start")
+    await bot.cmd_start(start)
+    check("первый /start показывает соглашение, а не меню",
+          "Пользовательское соглашение" in start.last and "Привет!" in start.last)
+    check("в соглашении есть раздел о принятии условий",
+          "2. Принятие условий" in start.last)
+    check("под соглашением кнопка «Согласен — продолжить»",
+          "accept_terms" in callbacks_of(_last_markup(start)))
+    check("меню в первом сообщении не показывается",
+          "tariffs" not in callbacks_of(_last_markup(start)))
+    check("до подтверждения пользователь не отмечен принявшим",
+          bot.terms_store.is_accepted(555) is False)
+
+    for name, handler, msg in (
+        ("/help", bot.cmd_help, FakeMsg(uid=555, text="/help")),
+        ("/profile", bot.cmd_profile, FakeMsg(uid=555, text="/profile")),
+        ("/invite", bot.cmd_invite, FakeMsg(uid=555, text="/invite")),
+        ("/test_vpn", bot.cmd_test_vpn, FakeMsg(uid=555, text="/test_vpn")),
+    ):
+        await handler(msg)
+        check(f"{name} до подтверждения тоже показывает соглашение",
+              "Пользовательское соглашение" in msg.last
+              and "accept_terms" in callbacks_of(_last_markup(msg)), msg.last[:60])
+
+    terms_cmd = FakeMsg(uid=555, text="/terms")
+    await bot.cmd_terms(terms_cmd)
+    check("/terms у новичка даёт кнопку принятия",
+          "accept_terms" in callbacks_of(_last_markup(terms_cmd))
+          and "Пользовательское соглашение" in terms_cmd.last)
+
+    still_terms = FakeMsg(uid=555, text="/terms")
+    await bot.cmd_terms(still_terms)
+    check("повторный /terms до принятия кнопку не теряет",
+          "accept_terms" in callbacks_of(_last_markup(still_terms)))
+
+    agree = FakeCallback("accept_terms", FakeMsg(uid=555), uid=555)
+    await bot.cb_accept_terms(agree)
+    check("нажатие «Согласен» открывает приветствие и главное меню",
+          "Добро пожаловать" in agree.message.last
+          and {"tariffs", "profile", "help_menu"} <= set(callbacks_of(_last_markup(agree))))
+    check("принятие записано (кто и когда)",
+          bot.terms_store.is_accepted(555) and bot.terms_store.accepted_at(555) > 0)
+    check("повторное нажатие не путает бота",
+          any("принято" in a for a in agree.answers), str(agree.answers))
+
+    again = FakeMsg(uid=555, text="/start")
+    await bot.cmd_start(again)
+    check("второй /start показывает обычное приветствие без соглашения",
+          "Добро пожаловать" in again.last and "Пользовательское соглашение" not in again.last)
+    check("в /terms кнопки принятия больше нет",
+          "accept_terms" not in callbacks_of(bot.terms_kb(555)))
+
+    stale = FakeCallback("main_menu", FakeMsg(uid=777), uid=777)
+    await bot.cb_main_menu(stale)
+    check("старая кнопка меню у непринявшего ведёт на соглашение",
+          "Пользовательское соглашение" in stale.message.last)
+
+    stale_tariffs = FakeCallback("tariffs", FakeMsg(uid=777), uid=777)
+    await bot.cb_tariffs(stale_tariffs)
+    check("старая кнопка «Тарифы» тоже ведёт на соглашение",
+          "Пользовательское соглашение" in stale_tariffs.message.last
+          and "Школьник" not in stale_tariffs.message.last)
+
+    try:
+        await bot.start_checkout(777, 777, "basic")
+        check("оплата до подтверждения соглашения отклонена", False)
+    except Exception as exc:
+        check("оплата до подтверждения соглашения отклонена",
+              "соглашение" in str(exc) and "Согласен" in str(exc), str(exc)[:60])
+
+    off = load({"terms_accept": "0"})
+    check("TERMS_ACCEPT=0 выключает экран", off.terms_gate_needed(777) is False)
+    off_start = FakeMsg(uid=777, text="/start")
+    await off.cmd_start(off_start)
+    check("с выключенным экраном /start сразу показывает меню",
+          "Добро пожаловать" in off_start.last
+          and "accept_terms" not in callbacks_of(_last_markup(off_start)))
+
+
 async def main():
     await test_production_look()
     await test_test_mode_returns_tools()
@@ -420,6 +510,7 @@ async def main():
     await test_trial_visibility()
     await test_terms_in_bot()
     await test_terms_file_matches_bot()
+    await test_terms_gate()
 
     print()
     if FAILURES:
