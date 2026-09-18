@@ -30,6 +30,7 @@ from aiogram.filters import Command
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
@@ -313,6 +314,20 @@ CRYPTOBOT_RUB_RATE = float((os.getenv("CRYPTOBOT_RUB_RATE") or "0").replace(",",
 # Сколько живёт счёт и как часто бот проверяет неоплаченные счета (секунды).
 CRYPTOBOT_INVOICE_TTL = _int_env("CRYPTOBOT_INVOICE_TTL", 3600)
 CRYPTOBOT_POLL_INTERVAL = _int_env("CRYPTOBOT_POLL_INTERVAL", 60)
+
+# --- Реферальная программа («пригласи друга») ---
+# Работает во всех режимах оплаты: бонусные дни начисляются после ПЕРВОЙ оплаты
+# приглашённого. Пока приглашённый не купил подписку, ничего не начисляется —
+# так программа не превращается в способ раздавать бесплатные ключи.
+REFERRAL_ENABLED = (os.getenv("REFERRAL_ENABLED") or "1").strip().lower() not in ("0", "false", "no", "off")
+# Сколько дней получает пригласивший за друга, который оплатил подписку.
+REFERRAL_BONUS_DAYS = _int_env("REFERRAL_BONUS_DAYS", 7)
+# Сколько дней получает сам приглашённый (добавляются к его первой оплате).
+REFERRAL_INVITED_BONUS_DAYS = _int_env("REFERRAL_INVITED_BONUS_DAYS", 3)
+# Журнал рефералов (кто кого пригласил, кому какие дни уже начислены).
+REFERRAL_STORE_FILE = (os.getenv("REFERRAL_STORE_FILE") or "data/referrals.json").strip()
+# Username бота для реферальной ссылки. Если не задан — бот спросит его у Telegram.
+BOT_USERNAME = (os.getenv("BOT_USERNAME") or "").strip().lstrip("@")
 
 # ЮKassa: Shop ID и секретный ключ (Интеграция -> Ключи API). test_* ключи = тестовый магазин.
 YOOKASSA_SHOP_ID = (os.getenv("YOOKASSA_SHOP_ID") or "").strip()
@@ -1745,6 +1760,518 @@ class PaymentStore:
 payment_store = PaymentStore(PAYMENT_STORE_FILE)
 
 
+# =========================
+# РЕФЕРАЛЬНАЯ ПРОГРАММА
+# =========================
+
+class ReferralStore:
+    """
+    Журнал приглашений: кто кого позвал, кто уже оплатил и какие дни начислены.
+
+    Файл отдельный от журнала заказов (REFERRAL_STORE_FILE), формат — JSON:
+
+        users:   {"<id приглашённого>": {..., "referrer": <id>, "first_paid_at": 0}}
+        users_started: ["<id>"]  — все, кто хоть раз запускал бота (кого можно приглашать)
+        pending: {"<id пригласившего>": <сколько дней ждёт следующей подписки>}
+        rewarded: [ ... история начислений для статистики ]
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.users: dict[str, dict] = {}
+        self.started: list[int] = []
+        self.pending: dict[str, int] = {}
+        self.rewarded: list[dict] = []
+        self._lock = asyncio.Lock()
+        self._loaded = False
+
+    # --- файл ---
+
+    def load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        if not self.path:
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.users = {str(k): v for k, v in (data.get("users") or {}).items() if isinstance(v, dict)}
+            self.started = [int(x) for x in (data.get("users_started") or []) if str(x).isdigit()]
+            self.pending = {str(k): int(v) for k, v in (data.get("pending") or {}).items() if str(v).lstrip("-").isdigit()}
+            self.rewarded = [r for r in (data.get("rewarded") or []) if isinstance(r, dict)][-500:]
+            logger.info("Журнал рефералов загружен: %s приглашений, %s ожидающих бонусов.",
+                        len(self.users), len(self.pending))
+        except FileNotFoundError:
+            logger.info("Журнал рефералов пуст — создам %s при первом приглашении.", self.path)
+        except Exception as exc:
+            logger.warning("Не удалось прочитать журнал рефералов (%s): %s", self.path, exc)
+
+    def _write(self) -> None:
+        if not self.path:
+            return
+        try:
+            directory = os.path.dirname(self.path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            tmp = f"{self.path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "version": 1,
+                    "users": self.users,
+                    "users_started": self.started[-5000:],
+                    "pending": self.pending,
+                    "rewarded": self.rewarded[-500:],
+                }, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)
+        except Exception as exc:
+            logger.warning("Не удалось сохранить журнал рефералов (%s): %s", self.path, exc)
+
+    # --- пользователи ---
+
+    def touch_user(self, tg_id: int) -> None:
+        """Запоминает, что человек запускал бота (только таких можно приглашать)."""
+        if tg_id and tg_id not in self.started:
+            self.started.append(tg_id)
+            self._write()
+
+    def knows_user(self, tg_id: int) -> bool:
+        return tg_id in self.started
+
+    # --- приглашения ---
+
+    async def register(self, invited_id: int, referrer_id: int) -> str:
+        """
+        Записывает, что пользователя позвал referrer_id.
+
+        Возвращает статус: 'ok', 'self', 'already', 'unknown_referrer', 'disabled'.
+        Первое приглашение побеждает: переписать его другой ссылкой нельзя.
+        """
+        if not REFERRAL_ENABLED:
+            return "disabled"
+        if not invited_id or not referrer_id:
+            return "unknown_referrer"
+        if invited_id == referrer_id:
+            return "self"
+        self.load()
+        key = str(invited_id)
+        if key in self.users:
+            return "already"
+        if not self.knows_user(referrer_id):
+            return "unknown_referrer"
+        async with self._lock:
+            self.users[key] = {
+                "referrer": int(referrer_id),
+                "joined_at": int(time.time()),
+                "first_paid_at": 0,
+                "order_id": "",
+            }
+            self._write()
+        logger.info("Реферал: %s пришёл по ссылке %s.", invited_id, referrer_id)
+        return "ok"
+
+    def invite_of(self, invited_id: int) -> dict | None:
+        self.load()
+        return self.users.get(str(invited_id))
+
+    def invite_pending(self, invited_id: int, order: dict) -> dict | None:
+        """
+        Приглашение, по которому ещё не начислён бонус, — и только если текущий
+        заказ оплачен ПОСЛЕ прихода по ссылке (иначе бонус задним числом не даём).
+        """
+        invite = self.invite_of(invited_id)
+        if not invite or invite.get("first_paid_at"):
+            return None
+        if int(order.get("created_at") or 0) < int(invite.get("joined_at") or 0):
+            return None
+        return invite
+
+    async def mark_first_payment(self, invited_id: int, order_id: str) -> None:
+        """Помечает, что приглашённый оплатил подписку (бонус начисляется один раз)."""
+        key = str(invited_id)
+        invite = self.users.get(key)
+        if not invite:
+            return
+        async with self._lock:
+            invite["first_paid_at"] = int(time.time())
+            invite["order_id"] = order_id
+            self._write()
+
+    async def log_reward(self, referrer_id: int, invited_id: int, days: int, applied: str, order_id: str) -> None:
+        async with self._lock:
+            self.rewarded.append({
+                "referrer": int(referrer_id),
+                "invited": int(invited_id),
+                "days": int(days),
+                "applied": applied,          # immediate | pending | invited
+                "order": order_id,
+                "at": int(time.time()),
+            })
+            self._write()
+
+    # --- отложенные бонусы пригласившего ---
+
+    def pending_days(self, referrer_id: int) -> int:
+        self.load()
+        return int(self.pending.get(str(referrer_id)) or 0)
+
+    async def add_pending(self, referrer_id: int, days: int) -> None:
+        if days <= 0:
+            return
+        async with self._lock:
+            key = str(referrer_id)
+            self.pending[key] = int(self.pending.get(key) or 0) + int(days)
+            self._write()
+
+    async def clear_pending(self, referrer_id: int) -> None:
+        async with self._lock:
+            self.pending.pop(str(referrer_id), None)
+            self._write()
+
+    # --- статистика ---
+
+    def stats(self, referrer_id: int) -> dict:
+        self.load()
+        invited = [u for u in self.users.values() if int(u.get("referrer") or 0) == int(referrer_id)]
+        earned = sum(
+            int(r.get("days") or 0) for r in self.rewarded
+            if int(r.get("referrer") or 0) == int(referrer_id) and r.get("applied") != "invited"
+        )
+        return {
+            "came": len(invited),                                   # пришло по ссылке
+            "paid": len([u for u in invited if u.get("first_paid_at")]),  # из них оплатили
+            "earned_days": earned,                                  # начислено дней всего
+            "pending_days": self.pending_days(referrer_id),         # ждут следующей подписки
+        }
+
+    def totals(self) -> dict:
+        self.load()
+        return {
+            "invites": len(self.users),
+            "paid": len([u for u in self.users.values() if u.get("first_paid_at")]),
+            "days": sum(int(r.get("days") or 0) for r in self.rewarded),
+            "rewards": len(self.rewarded),
+        }
+
+
+referral_store = ReferralStore(REFERRAL_STORE_FILE)
+
+# Username бота нужен для реферальной ссылки: спрашиваем у Telegram один раз и кэшируем.
+_bot_username_cache = ""
+
+
+async def get_bot_username() -> str:
+    """Username бота для ссылок вида t.me/<username>?start=ref_123."""
+    global _bot_username_cache
+    if BOT_USERNAME:
+        return BOT_USERNAME
+    if _bot_username_cache:
+        return _bot_username_cache
+    try:
+        me = await bot.get_me()
+        _bot_username_cache = (getattr(me, "username", "") or "").strip()
+    except Exception as exc:
+        logger.warning("Не удалось узнать username бота для реферальной ссылки: %s", exc)
+    return _bot_username_cache
+
+
+async def referral_link(tg_id: int) -> str:
+    """Личная ссылка-приглашение. Пустая строка, если username бота неизвестен."""
+    username = await get_bot_username()
+    if not username:
+        return ""
+    return f"https://t.me/{username}?start=ref_{tg_id}"
+
+
+def parse_referral_payload(payload: str) -> int | None:
+    """Разбирает deep-link «ref_12345» (то, что приходит в /start ref_12345)."""
+    text = (payload or "").strip()
+    if not text:
+        return None
+    match = re.fullmatch(r"ref[_-]?(\d{1,15})", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    value = int(match.group(1))
+    return value if value > 0 else None
+
+
+def referral_rules_text() -> str:
+    """Правила программы — показываем в /invite, чтобы не было вопросов."""
+    return (
+        f"• За каждого друга, который <b>оплатил</b> подписку, тебе — "
+        f"<b>+{REFERRAL_BONUS_DAYS} {days_word(REFERRAL_BONUS_DAYS)}</b>. Другу — "
+        f"<b>+{REFERRAL_INVITED_BONUS_DAYS} {days_word(REFERRAL_INVITED_BONUS_DAYS)}</b> "
+        "к первой оплате.\n"
+        "• Бонус начисляется один раз за друга и только после его первой оплаты.\n"
+        "• Дни прибавляются к текущей подписке; если подписки нет — копится и добавится "
+        "к следующей покупке.\n"
+        "• Пригласить можно только того, кто ещё не оплачивал VPN, и нельзя себя самого."
+    )
+
+
+def days_word(days: int) -> str:
+    """«1 день», «3 дня», «7 дней» — чтобы сообщения читались по-человечески."""
+    value = abs(int(days))
+    if value % 100 in (11, 12, 13, 14):
+        return "дней"
+    if value % 10 == 1:
+        return "день"
+    if value % 10 in (2, 3, 4):
+        return "дня"
+    return "дней"
+
+
+def comment_with_new_expiry(comment: str | None, expiry_ms: int) -> str:
+    """
+    Обновляет дату в комментарии клиента, сохраняя номер платежа.
+
+    Комментарий выглядит как «basic до 17.10.2026 | cryptobot-1»; по хвосту после «|»
+    бот понимает, что подписка уже выдана (защита от повторной выдачи), поэтому
+    при продлении меняем только дату.
+    """
+    text = str(comment or "").strip()
+    if not text or "|" not in text:
+        return text
+    head, ref = text.rsplit("|", 1)
+    tariff_key = head.split()[0] if head.split() else ""
+    if not tariff_key:
+        return text
+    return f"{tariff_key} до {format_date(expiry_ms)} | {ref.strip()}"
+
+
+async def extend_subscription_days(tg_id: int, days: int) -> dict | None:
+    """
+    Продлевает подписку пользователя на N дней (без оплаты) — например, за друга.
+
+    Возвращает {'expiry_ms': ...} или None, если подписки в панели нет.
+    """
+    if days <= 0:
+        return None
+    sub = await get_paid_subscription(tg_id)
+    if not sub or not sub.get("client"):
+        return None
+
+    client_row = dict(sub["client"])
+    inbound = sub["inbound"]
+    now_ms = int(time.time() * 1000)
+    current_expiry = int(client_row.get("expiryTime") or 0)
+    base_ms = max(now_ms, current_expiry)          # продлеваем от конца оплаченного срока
+    new_expiry = base_ms + days * 86400 * 1000
+
+    client_row["expiryTime"] = new_expiry
+    client_row["enable"] = True
+    client_row["comment"] = comment_with_new_expiry(client_row.get("comment"), new_expiry)
+
+    async with XUIClient() as client:
+        await client.update_client(inbound.get("id"), client_row)
+
+    logger.info("Подписка %s продлена на %s дней (без оплаты) — реферальный бонус.", tg_id, days)
+    return {"expiry_ms": new_expiry, "days": days}
+
+
+async def reward_referrer(referrer_id: int, invited_id: int, order_id: str) -> str:
+    """
+    Начисляет бонус пригласившему: сразу к подписке либо в копилку до следующей покупки.
+
+    Возвращает 'immediate' (дни уже в подписке) или 'pending' (лежат до следующей оплаты).
+    """
+    days = REFERRAL_BONUS_DAYS
+    if days <= 0:
+        return "disabled"
+    extended = await extend_subscription_days(referrer_id, days)
+    if extended:
+        await referral_store.log_reward(referrer_id, invited_id, days, "immediate", order_id)
+        try:
+            await bot.send_message(
+                referrer_id,
+                f"🎉 <b>По твоей ссылке оплатили подписку!</b>\n\n"
+                f"Начислил тебе <b>+{days} {days_word(days)}</b> — они уже в твоей подписке.\n"
+                f"Срок: <b>{format_date(extended['expiry_ms'])}</b>\n\n"
+                "Приглашай ещё — за каждого друга, который оплатит, снова +"
+                f"{days} {days_word(days)}. Твоя ссылка: /invite",
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.warning("Не удалось уведомить реферера %s: %s", referrer_id, exc)
+        return "immediate"
+
+    await referral_store.add_pending(referrer_id, days)
+    await referral_store.log_reward(referrer_id, invited_id, days, "pending", order_id)
+    total = referral_store.pending_days(referrer_id)
+    try:
+        await bot.send_message(
+            referrer_id,
+            f"🎉 <b>По твоей ссылке оплатили подписку!</b>\n\n"
+            f"Начислил тебе <b>+{days} {days_word(days)}</b>. Подписки сейчас нет, поэтому дни копятся: "
+            f"сейчас на счету <b>{total} {days_word(total)}</b> — прибавлю их автоматически "
+            "при следующей покупке.\n\n"
+            "Приглашай ещё: /invite",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        logger.warning("Не удалось уведомить реферера %s: %s", referrer_id, exc)
+    return "pending"
+
+
+async def grant_referral_rewards(order: dict, info: dict, invite: dict | None) -> None:
+    """
+    Выдаёт реферальные бонусы после подтверждённой оплаты.
+
+    Приглашённому дни уже добавлены при выдаче подписки (extra_days), здесь только
+    уведомление и бонус пригласившему. Ошибки не роняют оплату: ключ важнее.
+    """
+    invited_id = int(order.get("tg_id") or 0)
+    if invite:
+        await referral_store.mark_first_payment(invited_id, order["id"])
+        if REFERRAL_INVITED_BONUS_DAYS > 0:
+            await referral_store.log_reward(invited_id, invited_id, REFERRAL_INVITED_BONUS_DAYS, "invited", order["id"])
+            try:
+                await bot.send_message(
+                    invited_id,
+                    f"🎁 <b>Тебя пригласил друг — держи +{REFERRAL_INVITED_BONUS_DAYS} "
+                    f"{days_word(REFERRAL_INVITED_BONUS_DAYS)}</b> к подписке!\n\n"
+                    "Хочешь так же? Приглашай своих друзей: /invite — за каждого, кто оплатит, "
+                    f"+{REFERRAL_BONUS_DAYS} {days_word(REFERRAL_BONUS_DAYS)}.",
+                    parse_mode="HTML",
+                )
+            except Exception as exc:
+                logger.warning("Не удалось уведомить приглашённого %s: %s", invited_id, exc)
+
+        referrer_id = int(invite.get("referrer") or 0)
+        if referrer_id:
+            try:
+                await reward_referrer(referrer_id, invited_id, order["id"])
+            except Exception as exc:
+                logger.error("Не удалось начислить реферальный бонус %s: %s", referrer_id, exc)
+
+
+def referral_kb(link: str, with_share: bool = True) -> InlineKeyboardMarkup:
+    """Кнопки под текстом «Пригласи друга»."""
+    rows = []
+    if with_share and link:
+        share_text = (
+            f"Советую этот VPN: быстро, есть бесплатный тест на 24 часа. "
+            f"Заходи по моей ссылке — бонус к подписке: {link}"
+        )
+        rows.append([InlineKeyboardButton(
+            text="📤 Поделиться ссылкой",
+            url=f"https://t.me/share/url?url={quote(link, safe='')}&text={quote(share_text, safe='')}",
+        )])
+    if link:
+        rows.append([InlineKeyboardButton(text="📋 Скопировать ссылку",
+                                          copy_text=CopyTextButton(text=link))])
+    rows.append([InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile")])
+    rows.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_referral_page(target, tg_id: int, *, edit: bool = False) -> None:
+    """Показывает страницу реферальной программы (и для команды, и для кнопки)."""
+    if not REFERRAL_ENABLED:
+        text = (
+            "🎁 <b>Реферальная программа сейчас выключена.</b>\n\n"
+            "Администратору: включи переменную <b>REFERRAL_ENABLED=1</b> в Railway → Variables."
+        )
+        kb = back_kb()
+    else:
+        stats = referral_store.stats(tg_id)
+        link = await referral_link(tg_id)
+        link_line = (
+            f"Твоя ссылка:\n<code>{escape(link)}</code>"
+            if link else
+            "⚠️ Не удалось получить ссылку: задай переменную <b>BOT_USERNAME</b> "
+            "(username бота без @) в Railway → Variables."
+        )
+        pending_note = (
+            f"\n🎁 <b>В копилке: {stats['pending_days']} "
+            f"{days_word(stats['pending_days'])}</b> — добавлю к следующей подписке."
+            if stats["pending_days"] else ""
+        )
+        text = (
+            f"🎁 <b>Пригласи друга — получи {REFERRAL_BONUS_DAYS} "
+            f"{days_word(REFERRAL_BONUS_DAYS)} бесплатно</b>\n\n"
+            f"{link_line}\n\n"
+            "<b>Как это работает:</b>\n"
+            f"1. Отправь ссылку другу (кнопка ниже).\n"
+            f"2. Друг получает VPN и, если понравится, покупает тариф.\n"
+            f"3. Тебе — <b>+{REFERRAL_BONUS_DAYS} {days_word(REFERRAL_BONUS_DAYS)}</b>, другу — "
+            f"<b>+{REFERRAL_INVITED_BONUS_DAYS} {days_word(REFERRAL_INVITED_BONUS_DAYS)}</b> "
+            "к подписке.\n\n"
+            f"<b>Твоя статистика:</b>\n"
+            f"• Пришло по ссылке: <b>{stats['came']}</b>\n"
+            f"• Из них оплатили: <b>{stats['paid']}</b>\n"
+            f"• Начислено: <b>{stats['earned_days']} {days_word(stats['earned_days'])}</b>"
+            f"{pending_note}\n\n"
+            f"<b>Правила:</b>\n{referral_rules_text()}"
+        )
+        kb = referral_kb(link)
+
+    if edit:
+        try:
+            await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+    await target.answer(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+
+
+@dp.message(Command("invite"))
+async def cmd_invite(message: Message):
+    """Реферальная программа: личная ссылка, статистика и правила."""
+    referral_store.touch_user(message.from_user.id)
+    await send_referral_page(message, message.from_user.id)
+
+
+@dp.callback_query(F.data == "invite")
+async def cb_invite(cb: CallbackQuery):
+    referral_store.touch_user(cb.from_user.id)
+    await cb.answer()
+    await send_referral_page(cb.message, cb.from_user.id)
+
+
+async def handle_referral_start(message: Message, payload: str) -> None:
+    """Обрабатывает переход по реферальной ссылке (/start ref_12345)."""
+    referrer_id = parse_referral_payload(payload)
+    if referrer_id is None:
+        return
+    invited_id = message.from_user.id
+    status = await referral_store.register(invited_id, referrer_id)
+
+    if status == "ok":
+        logger.info("Новый реферал: %s ← %s", invited_id, referrer_id)
+        try:
+            await bot.send_message(
+                referrer_id,
+                "👋 <b>По твоей ссылке пришёл друг!</b>\n\n"
+                f"Как только он оплатит подписку — начислю тебе "
+                f"<b>+{REFERRAL_BONUS_DAYS} {days_word(REFERRAL_BONUS_DAYS)}</b> автоматически.\n"
+                "Статистика: /invite",
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.warning("Не удалось сообщить рефереру %s о новом друге: %s", referrer_id, exc)
+        try:
+            await message.answer(
+                f"🎁 <b>Тебя пригласили!</b> Друг подарил тебе "
+                f"<b>+{REFERRAL_INVITED_BONUS_DAYS} {days_word(REFERRAL_INVITED_BONUS_DAYS)}</b> — "
+                "они прибавятся к первой оплате любого тарифа.\n\n"
+                "Начни с бесплатного теста на 24 часа: /test_vpn — или смотри тарифы: /start",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    elif status == "self":
+        try:
+            await message.answer("🙂 Своя же ссылка не считается — пригласи друга, и бонус будет твоим.")
+        except Exception:
+            pass
+    elif status == "unknown_referrer":
+        logger.info("Реферальная ссылка с неизвестным приглашающим: %s", referrer_id)
+
+
+
+
+
 def payments_enabled() -> bool:
     """Включён ли приём оплаты (режим off выключает кнопки покупки)."""
     return PAYMENTS_MODE != "off"
@@ -2340,18 +2867,25 @@ async def activate_paid_subscription(
     *,
     order_id: str,
     payment_ref: str,
+    extra_days: int = 0,
 ) -> dict:
     """
     Создаёт или продлевает платного клиента в 3x-ui по оплаченному заказу.
 
     Идемпотентно: если в комментарии клиента уже стоит этот платёж, повторная
     выдача не происходит (защита от дублей вебхука и перезапуска бота).
+    extra_days — реферальный бонус приглашённого; к ним добавляются накопленные
+    бонусы самого покупателя (он тоже мог приглашать друзей).
     Возвращает словарь с ключом, сроком и деталями подписки.
     """
     tariff = TARIFFS[tariff_key]
     target_email = f"tg-paid-{telegram_id}"
+    bonus_days = max(0, int(extra_days))
+    pending_bonus = referral_store.pending_days(telegram_id) if REFERRAL_ENABLED else 0
+    bonus_days += pending_bonus
+    total_days = tariff["days"] + bonus_days
     now_ms = int(time.time() * 1000)
-    comment = f"{tariff_key} до {format_date(now_ms + tariff['days'] * 86400 * 1000)} | {payment_ref[:40]}"
+    comment = f"{tariff_key} до {format_date(now_ms + total_days * 86400 * 1000)} | {payment_ref[:40]}"
 
     async with XUIClient() as client:
         inbound, auto_picked = await client.find_suitable_inbound(XUI_INBOUND_ID)
@@ -2375,6 +2909,7 @@ async def activate_paid_subscription(
                 "inbound_id": inbound_id,
                 "auto_picked": auto_picked,
                 "group_note": "",
+                "bonus_days": 0,
             }
 
         group_name, group_state = await client.resolve_client_group()
@@ -2385,7 +2920,7 @@ async def activate_paid_subscription(
             existing_expiry = int(existing.get("expiryTime") or 0)
             if existing_expiry > now_ms:
                 base_ms = existing_expiry
-        expires_ms = base_ms + tariff["days"] * 86400 * 1000
+        expires_ms = base_ms + total_days * 86400 * 1000
 
         payload = _paid_client_payload(
             telegram_id,
@@ -2406,6 +2941,11 @@ async def activate_paid_subscription(
             await client.add_client(inbound_id, payload)
             status = "created"
 
+        # Дни за друзей потрачены — обнуляем копилку, чтобы не начислить их второй раз.
+        if pending_bonus:
+            await referral_store.clear_pending(telegram_id)
+            logger.info("Заказу %s зачтены накопленные реферальные дни: +%s.", order_id, pending_bonus)
+
         group_note = ""
         if group_state == "exists" or group_state == "new":
             group_note = _group_note(
@@ -2424,6 +2964,7 @@ async def activate_paid_subscription(
             "inbound_id": inbound_id,
             "auto_picked": auto_picked,
             "group_note": group_note,
+            "bonus_days": bonus_days,
         }
 
 
@@ -2504,13 +3045,16 @@ def order_paid_message(order: dict, info: dict) -> str:
         f"{title}\n\n"
         f"📦 <b>Тариф:</b> {tariff['name']}\n"
         f"⏳ <b>Действует до:</b> {expiry}\n"
+        + (f"🎁 <b>Бонус за друзей:</b> +{info['bonus_days']} "
+           f"{days_word(info['bonus_days'])} к сроку\n" if info.get("bonus_days") else "")
+        +
         f"📊 <b>Трафик:</b> {tariff['traffic']}\n"
         f"📱 <b>Устройств:</b> {tariff['ips']}\n"
         f"🌍 <b>Локации:</b> {tariff['locations']}\n\n"
         f"🔑 <b>Твой ключ (нажми, чтобы скопировать):</b>\n<code>{escape(info['link'])}</code>\n"
         + (f"\n🌐 <b>Ссылка подписки:</b> <code>{escape(info['sub_link'])}</code>\n" if info.get("sub_link") else "")
-        + "\n<b>Как подключиться:</b> установи приложение (Happ, v2rayNG, Streisand, v2rayN) → "
-        "«Импорт из буфера обмена» → Подключить."
+        + "\n📲 <b>Как подключиться:</b> нажми кнопку под сообщением — покажу по шагам, "
+        "что скачать и куда вставить ключ (инструкции для iPhone, Android, Windows и macOS)."
         + (info.get("group_note") or "")
     )
 
@@ -2623,12 +3167,18 @@ async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str 
                 return {"order": order, "info": info}
         return {"already_provisioned": True, "order": order}
 
+    # Реферальные бонусы считаем только по реальным (не тестовым) оплатам.
+    referral_invite = None
+    if REFERRAL_ENABLED and not order.get("simulated") and order.get("mode") != "test":
+        referral_invite = referral_store.invite_pending(order["tg_id"], order)
+
     try:
         info = await activate_paid_subscription(
             order["tg_id"],
             order["tariff"],
             order_id=order["id"],
             payment_ref=charge_id or order["id"],
+            extra_days=REFERRAL_INVITED_BONUS_DAYS if referral_invite else 0,
         )
     except Exception as exc:
         logger.error("Не удалось выдать подписку по заказу %s: %s", order["id"], exc)
@@ -2660,6 +3210,13 @@ async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str 
         link=info.get("link"),          # сохраняем ключ: пригодится, если сообщение не дошло
         sub_link=info.get("sub_link"),
     )
+    # Бонус пригласившему — после того, как подписка реально выдана.
+    if referral_invite:
+        try:
+            await grant_referral_rewards(order, info, referral_invite)
+        except Exception as exc:
+            logger.error("Реферальные бонусы по заказу %s не начислены: %s", order["id"], exc)
+
     if not order.get("notified"):
         if await notify_payment_success(order, info):
             await payment_store.update(order["id"], notified=True)
@@ -3341,6 +3898,241 @@ for _key, _tariff in TARIFFS.items():
         _tariff["stars"] = _stars_price(_key, _tariff)
 
 
+# =========================
+# ИНСТРУКЦИЯ ПО ПОДКЛЮЧЕНИЮ (пошагово, со ссылками на приложения)
+# =========================
+
+# Ссылки только на официальные источники: сайты разработчиков, App Store, Google Play, GitHub.
+APP_LINKS = {
+    "happ": "https://happ.su/",
+    "happ_desktop": "https://github.com/Happ-proxy/happ-desktop/releases/latest",
+    "v2rayng": "https://github.com/2dust/v2rayNG/releases",
+    "v2rayng_play": "https://play.google.com/store/apps/details?id=com.v2ray.ang",
+    "v2rayn": "https://github.com/2dust/v2rayN/releases",
+    "hiddify": "https://hiddify.com/#app",
+    "hiddify_gh": "https://github.com/hiddify/hiddify-app/releases",
+    "streisand": "https://apps.apple.com/ru/app/streisand/id6450534064",
+    "foxray": "https://apps.apple.com/ru/app/foxray/id6448898396",
+    "v2box": "https://apps.apple.com/ru/app/v2box-v2ray-client/id6446814690",
+    "v2raytun": "https://apps.apple.com/ru/app/v2raytun/id6476628951",
+    "shadowrocket": "https://apps.apple.com/ru/app/shadowrocket/id932747118",
+    "check_ip": "https://2ip.ru/",
+    "whoer": "https://whoer.net/ru",
+}
+
+PLATFORM_TITLES = {
+    "ios": "📱 iPhone / iPad",
+    "android": "🤖 Android",
+    "windows": "💻 Windows",
+    "macos": "🍎 macOS",
+    "tv": "📺 Android TV / приставка",
+}
+
+
+def _a(key: str, text: str) -> str:
+    """Ссылка на приложение для вставки в текст инструкции."""
+    return f'<a href="{APP_LINKS[key]}">{text}</a>'
+
+
+def install_menu_kb() -> InlineKeyboardMarkup:
+    """Меню выбора устройства — начало пошаговой инструкции."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=PLATFORM_TITLES["ios"], callback_data="help_ios"),
+                InlineKeyboardButton(text=PLATFORM_TITLES["android"], callback_data="help_android"),
+            ],
+            [
+                InlineKeyboardButton(text=PLATFORM_TITLES["windows"], callback_data="help_windows"),
+                InlineKeyboardButton(text=PLATFORM_TITLES["macos"], callback_data="help_macos"),
+            ],
+            [InlineKeyboardButton(text=PLATFORM_TITLES["tv"], callback_data="help_tv")],
+            [
+                InlineKeyboardButton(text="✅ Проверить подключение", callback_data="help_check"),
+                InlineKeyboardButton(text="🆘 Не работает", callback_data="help_trouble"),
+            ],
+            [
+                InlineKeyboardButton(text="🔑 Показать мой ключ", callback_data="profile"),
+                InlineKeyboardButton(text="◀️ Меню", callback_data="main_menu"),
+            ],
+        ]
+    )
+
+
+def install_step_kb(platform: str) -> InlineKeyboardMarkup:
+    """Кнопки под инструкцией конкретного устройства."""
+    rows = [
+        [InlineKeyboardButton(text="✅ Проверить подключение", callback_data="help_check")],
+        [InlineKeyboardButton(text="🆘 Не работает", callback_data="help_trouble")],
+        [InlineKeyboardButton(text="🔑 Мой ключ", callback_data="profile")],
+        [InlineKeyboardButton(text="◀️ Другое устройство", callback_data="help_menu")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+INSTALL_INTRO = (
+    "📲 <b>Подключение VPN: пошагово</b>\n\n"
+    "Выбери своё устройство — покажу, что скачать и куда вставить ключ. "
+    "Займёт 2–3 минуты.\n\n"
+    "🔑 <i>Ключ уже у тебя: он в сообщении после оплаты и в разделе "
+    "«👤 Мой профиль» — там же кнопка «Скопировать ключ».</i>"
+)
+
+
+def install_text(platform: str) -> str:
+    """Пошаговая инструкция для устройства: ссылки, шаги и проверка результата."""
+    if platform == "ios":
+        return (
+            "📱 <b>iPhone / iPad — пошагово</b>\n\n"
+            "<b>Шаг 1. Установи приложение</b> (подойдёт любое):\n"
+            f"• {_a('streisand', 'Streisand')} — самый простой вариант, бесплатно;\n"
+            f"• {_a('foxray', 'FoXray')} — тоже бесплатно и просто;\n"
+            f"• {_a('v2box', 'V2Box')} — поддерживает VLESS и ссылки подписки;\n"
+            f"• {_a('happ', 'Happ')} — сайт разработчика (в российском App Store его нет, "
+            "понадобится зарубежный Apple ID).\n\n"
+            "<b>Шаг 2. Скопируй ключ</b>\n"
+            "Открой «👤 Мой профиль» → нажми на ключ <code>vless://…</code>, он скопируется в буфер.\n\n"
+            "<b>Шаг 3. Добавь ключ в приложение</b>\n"
+            "Открой приложение → «+» (плюс) → «Импорт из буфера обмена» / «Add from clipboard».\n"
+            "<i>Если пункта нет — выбери «Добавить вручную» → «Импорт из буфера».</i>\n\n"
+            "<b>Шаг 4. Подключись</b>\n"
+            "Выбери профиль → нажми кнопку подключения. iOS попросит разрешение "
+            "«Добавить конфигурацию VPN» → <b>Разрешить</b> и подтверди Face ID / паролем.\n\n"
+            "<b>Шаг 5. Проверь</b>\n"
+            f"Открой {_a('check_ip', '2ip.ru')} — страна должна быть Нидерланды или Германия, "
+            "а не твоя домашняя. Если так — всё работает. ✅"
+        )
+
+    if platform == "android":
+        return (
+            "🤖 <b>Android — пошагово</b>\n\n"
+            "<b>Шаг 1. Установи приложение</b> (подойдёт любое):\n"
+            f"• {_a('v2rayng_play', 'v2rayNG (Google Play)')} — самый популярный;\n"
+            f"• {_a('v2rayng', 'v2rayNG (APK с GitHub)')} — если Play недоступен;\n"
+            f"• {_a('happ', 'Happ')} — современный, простой интерфейс;\n"
+            f"• {_a('hiddify', 'Hiddify')} — поддерживает много протоколов.\n\n"
+            "<b>Шаг 2. Скопируй ключ</b>\n"
+            "«👤 Мой профиль» → нажми на ключ <code>vless://…</code> — он попадёт в буфер обмена.\n\n"
+            "<b>Шаг 3. Добавь ключ</b>\n"
+            "Открой приложение → «+» справа сверху → «Импорт профиля из буфера обмена».\n\n"
+            "<b>Шаг 4. Подключись</b>\n"
+            "Нажми круг со значком «V» внизу → Android спросит про VPN → <b>Разрешить/OK</b>.\n\n"
+            "<b>Шаг 5. Проверь</b>\n"
+            f"Открой {_a('check_ip', '2ip.ru')} — страна должна быть Нидерланды или Германия.\n\n"
+            "<i>Чтобы VPN не отключался в фоне: Настройки → Батарея → «Без ограничений» "
+            "для приложения, а в его настройках включи «Always-on VPN».</i>"
+        )
+
+    if platform == "windows":
+        return (
+            "💻 <b>Windows — пошагово</b>\n\n"
+            "<b>Шаг 1. Установи приложение</b> (любое из списка):\n"
+            f"• {_a('happ', 'Happ for Windows')} — скачай установщик с официального сайта "
+            f"(или {_a('happ_desktop', 'выпуски на GitHub')});\n"
+            f"• {_a('v2rayn', 'v2rayN')} — классика, открытый код (GitHub Releases, файл "
+            "<code>v2rayN-windows-64.zip</code>);\n"
+            f"• {_a('hiddify', 'Hiddify')} — простой интерфейс.\n\n"
+            "<b>Шаг 2. Скопируй ключ</b>\n"
+            "В боте: «👤 Мой профиль» → нажми на ключ <code>vless://…</code>. "
+            "Либо выдели ключ мышкой и скопируй (Ctrl+C).\n\n"
+            "<b>Шаг 3. Добавь ключ</b>\n"
+            "Happ: открой приложение → «Добавить» → «Импорт из буфера обмена».\n"
+            "v2rayN: меню «Серверы» → «Импорт из буфера обмена» (или Ctrl+V на главном окне).\n\n"
+            "<b>Шаг 4. Подключись</b>\n"
+            "v2rayN: правый клик по серверу → «Установить как активный» → включи "
+            "«Режим системного прокси» (или TUN) в меню «Настройки»/«Режим».\n"
+            "Happ: нажми большую кнопку подключения.\n\n"
+            "<b>Шаг 5. Проверь</b>\n"
+            f"Открой в браузере {_a('check_ip', '2ip.ru')} — страна должна быть Нидерланды/Германия.\n\n"
+            "<i>Если сайты не открываются: проверь, что включён «Системный прокси» (v2rayN) "
+            "или режим TUN, и что антивирус/брандмауэр не блокирует приложение.</i>"
+        )
+
+    if platform == "macos":
+        return (
+            "🍎 <b>macOS — пошагово</b>\n\n"
+            "<b>Шаг 1. Установи приложение</b>:\n"
+            f"• {_a('happ', 'Happ для macOS')} — с официального сайта;\n"
+            f"• {_a('v2box', 'V2Box (App Store)')};\n"
+            f"• {_a('foxray', 'FoXray (App Store)')};\n"
+            f"• {_a('v2rayn', 'v2rayN')} — для Apple Silicon и Intel.\n\n"
+            "<b>Шаг 2. Скопируй ключ</b>\n"
+            "«👤 Мой профиль» → нажми на ключ <code>vless://…</code>.\n\n"
+            "<b>Шаг 3. Добавь ключ</b>\n"
+            "Открой приложение → «+» → «Импорт из буфера обмена» / «Add from clipboard».\n\n"
+            "<b>Шаг 4. Подключись</b>\n"
+            "Нажми «Подключить». macOS спросит: «Разрешить добавление конфигурации VPN?» → "
+            "Разрешить, затем System Settings → ввести пароль/Touch ID.\n\n"
+            "<b>Шаг 5. Проверь</b>\n"
+            f"Открой {_a('check_ip', '2ip.ru')} — страна должна быть Нидерланды/Германия.\n\n"
+            "<i>Если macOS жалуется на «неопознанного разработчика»: правый клик по приложению → "
+            "«Открыть» → «Открыть всё равно» (это про подпись, а не про безопасность).</i>"
+        )
+
+    # Android TV / приставка
+    return (
+        "📺 <b>Android TV / приставка — пошагово</b>\n\n"
+        "<b>Шаг 1. Установи приложение</b>:\n"
+        f"• {_a('v2rayng', 'v2rayNG (APK)')} — установи через USB-флешку или приложение "
+        "«Downloader» (его можно поставить из Google Play на телевизоре);\n"
+        f"• {_a('hiddify', 'Hiddify')} — есть сборка для Android TV.\n\n"
+        "<b>Шаг 2. Возьми ключ</b>\n"
+        "Проще всего: «👤 Мой профиль» → кнопка «Скопировать ключ», а затем переслать ключ "
+        "себе в Telegram на телевизоре (или ввести вручную пультом — ссылка длинная, лучше "
+        "через буфер).\n\n"
+        "<b>Шаг 3. Добавь ключ</b>\n"
+        "v2rayNG → «+» → «Импорт профиля из буфера обмена».\n\n"
+        "<b>Шаг 4. Подключись и проверь</b>\n"
+        "Нажми «V» → Разрешить VPN → открой браузер на телевизоре и зайди на "
+        f"{_a('check_ip', '2ip.ru')}.\n\n"
+        "<i>Пульт без мыши? Подключи USB-мышь — с ней настройка занимает минуту.</i>"
+    )
+
+
+def install_check_text() -> str:
+    """Как убедиться, что VPN реально работает."""
+    return (
+        "✅ <b>Проверка подключения</b>\n\n"
+        "1. Убедись, что VPN включён: в приложении горит «Подключено», "
+        "а в шторке телефона/трее есть значок ключа или VPN.\n"
+        f"2. Открой {_a('check_ip', '2ip.ru')} — страна должна смениться на "
+        "Нидерланды или Германию.\n"
+        f"3. Для строгой проверки — {_a('whoer', 'whoer.net')}: там видно и IP, и "
+        "утечки DNS.\n"
+        "4. Открой сайт, который раньше не грузился (например, YouTube или Instagram) — "
+        "он должен открыться.\n\n"
+        "<b>Нормальные признаки:</b>\n"
+        "• скорость немного ниже, чем без VPN, — это нормально;\n"
+        "• первый сайт открывается 1–2 секунды дольше — тоже нормально.\n\n"
+        "Если IP не сменился — вернись в инструкцию своего устройства: "
+        "чаще всего ключ добавлен, но кнопка «Подключить» не нажата."
+    )
+
+
+def install_trouble_text() -> str:
+    """Что делать, если не работает — чек-лист от частого к редкому."""
+    return (
+        "🆘 <b>Не работает? Идём по порядку</b>\n\n"
+        "1️⃣ <b>Ключ добавлен, но не подключается.</b> Нажми «Подключить» в приложении "
+        "и разреши создание VPN-подключения (системное окно). Без разрешения туннель не встанет.\n"
+        "2️⃣ <b>Пишет «ошибка» или «таймаут».</b> Выключи VPN → включи режим полёта на 5 секунд → "
+        "выключи → подключись снова. Помогает в 8 случаях из 10.\n"
+        "3️⃣ <b>Работает на мобильном интернете, но не на Wi-Fi.</b> Значит, Wi-Fi сеть блокирует "
+        "VPN — попробуй другую сеть или мобильный интернет.\n"
+        "4️⃣ <b>Подключено, но сайты не открываются.</b> Проверь, что в приложении включён "
+        "режим «VPN/TUN» (не «прокси только для выбранных приложений»), и выключи "
+        "другие VPN/антивирусные прокси.\n"
+        "5️⃣ <b>Отключается в фоне (Android).</b> Настройки → Приложения → твой клиент → "
+        "Батарея → «Без ограничений»; в клиенте включи «Always-on VPN».\n"
+        "6️⃣ <b>Истёк срок подписки.</b> Проверь «👤 Мой профиль» — если дата прошла, "
+        "продли в «💰 Тарифы» (ключ придёт сразу после оплаты).\n"
+        "7️⃣ <b>Ничего не помогло.</b> Напиши в поддержку: приложи скриншот экрана приложения "
+        "с ошибкой и свой Telegram ID (команда /myid).\n\n"
+        "💡 Переустановка ключа: «👤 Мой профиль» → «🔄 Сбросить и получить заново» — "
+        "выдам свежий ключ."
+    )
+
+
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -3349,7 +4141,9 @@ def main_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="💰 Тарифы", callback_data="tariffs"),
                 InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile"),
             ],
-            [InlineKeyboardButton(text="📋 Инструкция по настройке", callback_data="activation")],
+            [InlineKeyboardButton(text="📲 Как подключиться (пошагово)", callback_data="help_menu")],
+            [InlineKeyboardButton(text=f"🎁 Пригласить друга — +{REFERRAL_BONUS_DAYS} "
+                                        f"{days_word(REFERRAL_BONUS_DAYS)}", callback_data="invite")],
             [InlineKeyboardButton(text="💬 Поддержка", callback_data="support")],
         ]
     )
@@ -3379,8 +4173,9 @@ def back_kb() -> InlineKeyboardMarkup:
 def key_actions_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="📲 Как подключиться (пошагово)", callback_data="help_menu")],
+            [InlineKeyboardButton(text="🔑 Мой ключ и подписка", callback_data="profile")],
             [InlineKeyboardButton(text="🔄 Сбросить и получить заново", callback_data="reset_my_vpn")],
-            [InlineKeyboardButton(text="📋 Инструкция по подключению", callback_data="activation")],
             [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
         ]
     )
@@ -3392,15 +4187,22 @@ def key_actions_kb() -> InlineKeyboardMarkup:
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
+    referral_store.touch_user(message.from_user.id)
     text = (
         "👋 <b>Добро пожаловать в быстрый и надёжный VPN!</b>\n\n"
         "Мы используем современный протокол <b>VLESS Reality</b>, "
         "который неотличим от обычного интернет-трафика и работает стабильно.\n\n"
         "🎁 Бесплатный тестовый доступ на 24 часа — команда /test_vpn.\n"
         "💰 Платные тарифы — раздел «Тарифы» (оплата и моментальная выдача ключа).\n"
+        "📲 Подключение по шагам (со ссылками на приложения) — /help.\n"
         "👤 Статус подписки и продление — /profile."
     )
     await message.answer(text, reply_markup=main_menu_kb(), parse_mode="HTML")
+
+    # Переход по реферальной ссылке: t.me/<бот>?start=ref_12345
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) > 1:
+        await handle_referral_start(message, parts[1])
 
 
 @dp.message(Command("myid"))
@@ -3552,14 +4354,8 @@ async def cmd_test_vpn(message: Message):
             f"🔑 <b>Твой VLESS-ключ (нажми на него, чтобы скопировать):</b>\n"
             f"<code>{escape(link)}</code>\n"
             f"{sub_text}\n"
-            "<b>Как подключиться за 1 минуту:</b>\n"
-            "1. Скопируй ключ выше (одно нажатие).\n"
-            "2. Установи приложение на телефон/ПК:\n"
-            "   • <b>iPhone/iPad:</b> Happ, Streisand, FoXray, V2Box\n"
-            "   • <b>Android:</b> v2rayNG, Happ, V2Box\n"
-            "   • <b>Windows/Mac:</b> Happ, v2rayN, V2Box\n"
-            "3. Открой приложение → нажми <b>«+»</b> → <b>«Импорт из буфера обмена»</b>.\n"
-            "4. Нажми <b>Подключить</b>."
+            "📲 <b>Дальше по шагам:</b> нажми «Как подключиться» под этим сообщением — "
+            "покажу, какое приложение скачать на твоё устройство и куда вставить ключ."
             f"{group_note}"
             f"{auto_note}"
             f"{admin_note}"
@@ -4571,27 +5367,60 @@ async def cmd_profile(message: Message):
     await send_profile(message, message.from_user.id)
 
 
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    """Пошаговая инструкция по подключению: устройство → приложение → ключ → проверка."""
+    await message.answer(INSTALL_INTRO, reply_markup=install_menu_kb(), parse_mode="HTML")
+
+
+@dp.message(Command("install"))
+async def cmd_install(message: Message):
+    """Псевдоним /help — многие ищут инструкцию словом «install»."""
+    await cmd_help(message)
+
+
+@dp.callback_query(F.data == "help_menu")
+async def cb_help_menu(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        await cb.message.edit_text(INSTALL_INTRO, reply_markup=install_menu_kb(), parse_mode="HTML")
+    except Exception:
+        await cb.message.answer(INSTALL_INTRO, reply_markup=install_menu_kb(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("help_"))
+async def cb_help_platform(cb: CallbackQuery):
+    """Инструкция для выбранного устройства (help_ios, help_android, help_check, ...)."""
+    key = cb.data.removeprefix("help_")
+    if key == "check":
+        await cb.answer("Показываю проверку подключения…")
+        text, kb = install_check_text(), install_step_kb(key)
+    elif key == "trouble":
+        await cb.answer("Открываю чек-лист…")
+        text, kb = install_trouble_text(), install_step_kb(key)
+    elif key in PLATFORM_TITLES:
+        await cb.answer()
+        text, kb = install_text(key), install_step_kb(key)
+    else:
+        await cb.answer()
+        text, kb = INSTALL_INTRO, install_menu_kb()
+
+    try:
+        await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML",
+                                   disable_web_page_preview=True)
+    except Exception:
+        await cb.message.answer(text, reply_markup=kb, parse_mode="HTML",
+                                disable_web_page_preview=True)
+
+
 @dp.callback_query(F.data == "activation")
 async def cb_activation(cb: CallbackQuery):
+    """Старая кнопка «Инструкция по настройке» — открывает новое меню устройств."""
     await cb.answer()
-    text = (
-        "📋 <b>Инструкция по настройке VPN</b>\n\n"
-        "<b>🍎 iOS (iPhone / iPad)</b>\n"
-        "1. Установи <b>Happ</b>, <b>Streisand</b> или <b>FoXray</b> из App Store.\n"
-        "2. Скопируй ключ (команда /test_vpn).\n"
-        "3. Открой приложение → нажми «+» → «Импорт из буфера».\n"
-        "4. Выбери сервер и нажми «Подключить».\n\n"
-        "<b>🤖 Android</b>\n"
-        "1. Установи <b>v2rayNG</b> или <b>Happ</b> из Google Play.\n"
-        "2. Скопируй ключ из бота.\n"
-        "3. Открой v2rayNG → нажми «+» → «Импорт профиля из буфера обмена».\n"
-        "4. Нажми кнопку подключения (круг со значком «V» снизу).\n\n"
-        "<b>💻 Windows / macOS</b>\n"
-        "1. Скачай <b>Happ</b> или <b>v2rayN</b>.\n"
-        "2. Добавь ссылку через буфер обмена (Ctrl+V или Add from clipboard).\n"
-        "3. Включи системный прокси (Set system proxy / Tun Mode)."
-    )
-    await cb.message.edit_text(text, reply_markup=back_kb(), parse_mode="HTML")
+    try:
+        await cb.message.edit_text(INSTALL_INTRO, reply_markup=install_menu_kb(), parse_mode="HTML")
+    except Exception:
+        await cb.message.answer(INSTALL_INTRO, reply_markup=install_menu_kb(), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "support")
@@ -4621,6 +5450,8 @@ async def on_startup():
             BotCommand(command="panel_debug", description="🔍 Диагностика панели"),
             BotCommand(command="totp", description="🔐 Код 2FA для входа в панель"),
             BotCommand(command="groups", description="🏷 Группы клиентов в 3x-ui"),
+            BotCommand(command="help", description="📲 Как подключиться (пошагово)"),
+            BotCommand(command="invite", description="🎁 Пригласить друга и получить дни"),
             BotCommand(command="profile", description="👤 Моя подписка и ключ"),
             BotCommand(command="payments", description="💳 Оплаты (для администратора)"),
             BotCommand(command="test_pay", description="🧪 Проверить выдачу ключа без оплаты"),
