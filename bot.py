@@ -3249,9 +3249,8 @@ def order_paid_message(order: dict, info: dict) -> str:
         f"📊 <b>Трафик:</b> {tariff['traffic']}\n"
         f"📱 <b>Устройств:</b> {tariff['ips']}\n"
         f"🌍 <b>Локации:</b> {tariff['locations']}\n\n"
-        f"🔑 <b>Твой ключ (нажми, чтобы скопировать):</b>\n<code>{escape(info['link'])}</code>\n"
-        + (f"\n🌐 <b>Ссылка подписки:</b> <code>{escape(info['sub_link'])}</code>\n" if info.get("sub_link") else "")
-        + "\n📲 <b>Как подключиться:</b> нажми кнопку под сообщением — покажу по шагам, "
+        f"🔑 <b>Твой ключ (нажми, чтобы скопировать):</b>\n<code>{escape(info['link'])}</code>\n\n"
+        "📲 <b>Как подключиться:</b> нажми кнопку под сообщением — покажу по шагам, "
         "что скачать и куда вставить ключ (инструкции для iPhone, Android, Windows и macOS)."
         + (info.get("group_note") or "")
     )
@@ -4637,10 +4636,8 @@ async def cmd_test_vpn(message: Message):
                 "Запиши его в Railway -> Variables -> <b>ADMIN_ID</b>."
             )
 
-        sub_text = ""
-        if sub_link:
-            sub_text = f"\n🌐 <b>Ссылка подписки:</b> <code>{escape(sub_link)}</code>\n"
-
+        # Ссылку подписки пользователю не показываем: клиенту достаточно самого
+        # VLESS-ключа, а адрес панели 3x-ui в переписке светить не нужно.
         msg_text = (
             f"{title}\n\n"
             f"⏳ <b>Срок:</b> 24 часа\n"
@@ -4648,8 +4645,7 @@ async def cmd_test_vpn(message: Message):
             f"📱 <b>Устройств:</b> 1\n"
             f"📡 <b>Подключение:</b> #{inbound_id} ({escape(inbound_remark)})\n\n"
             f"🔑 <b>Твой VLESS-ключ (нажми на него, чтобы скопировать):</b>\n"
-            f"<code>{escape(link)}</code>\n"
-            f"{sub_text}\n"
+            f"<code>{escape(link)}</code>\n\n"
             "📲 <b>Дальше по шагам:</b> нажми «Как подключиться» под этим сообщением — "
             "покажу, какое приложение скачать на твоё устройство и куда вставить ключ."
             f"{group_note}"

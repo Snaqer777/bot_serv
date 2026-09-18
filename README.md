@@ -626,7 +626,7 @@ python tests/test_production.py # боевой вид (ADMIN_TOOLS, TRIAL_PUBLIC
 python tests/test_referral.py   # реферальная программа: ссылка → друг → оплата → дни — 48 проверок
 python tests/test_groups.py     # группы клиентов 3x-ui 3.2+ — 45 проверок
 python tests/test_2fa.py        # 2FA (Google Authenticator) и вход в панель — 30 проверок
-python tests/test_e2e.py        # сквозной прогон всех функций бота целиком — 84 проверки
+python tests/test_e2e.py        # сквозной прогон всех функций бота целиком — 86 проверок
 ```
 
 Что проверяется в `tests/test_payments.py` (главное):

@@ -308,6 +308,9 @@ async def step_payment(bot):
           f"{days_left(client)} дн.")
     key_msg = last_text(ADMIN)
     check("ключ отправлен сообщением", "vless://" in key_msg)
+    check("в сообщении с ключом нет ссылки подписки и адреса панели",
+          "Ссылка подписки" not in key_msg and "/sub/" not in key_msg
+          and "XUI_URL" not in key_msg, key_msg[:70].replace("\n", " "))
     check("в сообщении есть тариф, срок и дата",
           "Базовый" in key_msg and "Действует до" in key_msg)
     check("кнопки после оплаты: инструкция, ключ, главное меню",
@@ -334,6 +337,8 @@ async def step_trial_key(bot):
     trial = trial_client(ADMIN)
     check("тестовый клиент создан в панели (tg-test-*)", trial is not None)
     check("тестовый ключ отправлен", "vless://" in last_text(ADMIN))
+    check("в тестовом ключе тоже нет ссылки подписки",
+          "Ссылка подписки" not in last_text(ADMIN) and "/sub/" not in last_text(ADMIN))
     check("в сообщении срок 24 часа и трафик 1 ГиБ",
           "24 часа" in last_text(ADMIN) and "1 ГиБ" in last_text(ADMIN))
     check("кнопки под тестовым ключом",
