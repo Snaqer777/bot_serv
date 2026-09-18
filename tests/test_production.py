@@ -123,6 +123,7 @@ def load(env=None):
         "TEST_TOOLS": env.get("test_tools"),
         "ADMIN_TOOLS": env.get("admin_tools"),
         "TRIAL_PUBLIC": env.get("trial_public"),
+        "TRIAL_BUTTON": env.get("trial_button"),
         "SERVICE_NAME": env.get("service_name"),
         "SUPPORT_USERNAME": env.get("support_username"),
         "TERMS_OPERATOR": env.get("terms_operator"),
@@ -202,8 +203,8 @@ async def test_production_look():
     user_menu = callbacks_of(bot.main_menu_kb(555))
     check("у обычного пользователя нет кнопки тестового доступа",
           "get_test_key_btn" not in user_menu, str(user_menu))
-    check("у администратора кнопка теста остаётся",
-          "get_test_key_btn" in callbacks_of(bot.main_menu_kb(ADMIN_ID)))
+    check("кнопки теста нет и у администратора (TRIAL_BUTTON=0 по умолчанию)",
+          "get_test_key_btn" not in callbacks_of(bot.main_menu_kb(ADMIN_ID)))
     user_key = callbacks_of(bot.key_actions_kb(555))
     check("обычному пользователю не предлагают сброс ключа (это админ-операция)",
           "reset_my_vpn" not in user_key and "support" in user_key, str(user_key))
@@ -300,8 +301,10 @@ async def test_trial_visibility():
     closed = load({})
     check("по умолчанию тест доступен только администратору",
           closed.trial_available_for(555) is False and closed.trial_available_for(ADMIN_ID) is True)
-    check("админу тест разрешён и его кнопка на месте",
-          "get_test_key_btn" in callbacks_of(closed.main_menu_kb(ADMIN_ID)))
+    check("админу тест разрешён (право), но кнопки по умолчанию скрыты",
+          closed.trial_available_for(ADMIN_ID) is True
+          and closed.trial_button_visible(ADMIN_ID) is False
+          and "get_test_key_btn" not in callbacks_of(closed.main_menu_kb(ADMIN_ID)))
 
     start = FakeMsg(uid=555, text="/start")
     await closed.cmd_start(start)
@@ -321,7 +324,8 @@ async def test_trial_visibility():
     user_tariffs = callbacks_of(_last_markup(tariffs))
     check("и кнопки buy_trial у него нет", "buy_trial" not in user_tariffs, str(user_tariffs))
     admin_tariffs = callbacks_of(closed.tariffs_kb(ADMIN_ID))
-    check("у администратора тестовый пункт в тарифах остался", "buy_trial" in admin_tariffs)
+    check("у администратора тестового пункта в тарифах тоже нет",
+          "buy_trial" not in admin_tariffs, str(admin_tariffs))
 
     trial_click = FakeCallback("buy_trial", FakeMsg(uid=555), uid=555)
     await closed.cb_buy(trial_click)
@@ -338,18 +342,62 @@ async def test_trial_visibility():
     check("соглашение для обычного пользователя не обещает бесплатный тест",
           "Бесплатный тестовый доступ" not in closed.terms_text())
 
-    open_bot = load({"trial_public": "1"})
-    check("TRIAL_PUBLIC=1 открывает тест всем", open_bot.trial_available_for(555) is True)
+    open_bot = load({"trial_public": "1", "trial_button": "1"})
+    check("TRIAL_PUBLIC=1 + TRIAL_BUTTON=1 открывают тест всем",
+          open_bot.trial_available_for(555) is True and open_bot.trial_button_visible(555) is True)
     opened_start = FakeMsg(uid=555, text="/start")
     await open_bot.cmd_start(opened_start)
     check("и /start снова обещает бесплатный тест",
           "Бесплатный тестовый доступ" in opened_start.last)
     check("кнопка теста есть в меню у всех",
           "get_test_key_btn" in callbacks_of(open_bot.main_menu_kb(555)))
-    check("при TRIAL_PUBLIC=1 тестовый пункт вернулся и в тарифы",
+    check("при TRIAL_PUBLIC=1 и TRIAL_BUTTON=1 тестовый пункт вернулся и в тарифы",
           "buy_trial" in callbacks_of(open_bot.tariffs_kb(555)))
     check("и соглашение снова упоминает бесплатный тест",
           "Бесплатный тестовый доступ" in open_bot.terms_text())
+
+    # TRIAL_BUTTON: вид кнопок отдельно от права на тест
+    hidden = load({"trial_public": "1"})
+    check("TRIAL_PUBLIC=1 без TRIAL_BUTTON: право есть, кнопок нет",
+          hidden.trial_available_for(555) is True and hidden.trial_button_visible(555) is False)
+    hidden_start = FakeMsg(uid=555, text="/start")
+    await hidden.cmd_start(hidden_start)
+    check("в приветствии нет строки про кнопку теста",
+          "Бесплатный тестовый доступ" not in hidden_start.last)
+    hidden_tariffs = FakeCallback("tariffs", FakeMsg(uid=555), uid=555)
+    await hidden.cb_tariffs(hidden_tariffs)
+    check("в тарифах остались только платные пункты",
+          "Тестовый период" not in hidden_tariffs.message.last
+          and "Школьник" in hidden_tariffs.message.last)
+    profile = FakeMsg(uid=555, text="/profile")
+    await hidden.send_profile(profile, 555)
+    check("в профиле кнопки теста нет",
+          "get_test_key_btn" not in callbacks_of(_last_markup(profile)),
+          str(callbacks_of(_last_markup(profile))))
+    check("в меню Telegram команды /test_vpn нет",
+          "test_vpn" not in [c.command for c in hidden.bot_commands()],
+          str([c.command for c in hidden.bot_commands()]))
+
+    # /myid у админа: подсказка, что тестовый ключ доступен командой
+    # (важно сделать до следующей загрузки bot.py — модуль в тестах переиспользуется)
+    myid = FakeMsg(uid=ADMIN_ID, text="/myid")
+    await hidden.cmd_myid(myid)
+    check("админу /myid напоминает, что тестовый ключ доступен командой",
+          "TRIAL_BUTTON=0" in myid.last and "/test_vpn" in myid.last, myid.last[:80])
+
+    admin_bot = load({"trial_button": "1", "admin_tools": "1"})
+    check("TRIAL_BUTTON=1 возвращает кнопку админу",
+          admin_bot.trial_button_visible(ADMIN_ID) is True
+          and "get_test_key_btn" in callbacks_of(admin_bot.main_menu_kb(ADMIN_ID)))
+    check("и тестовый пункт в его тарифах", "buy_trial" in callbacks_of(admin_bot.tariffs_kb(ADMIN_ID)))
+    check("и команду /test_vpn в меню Telegram",
+          "test_vpn" in [c.command for c in admin_bot.bot_commands()],
+          str([c.command for c in admin_bot.bot_commands()]))
+
+    no_button = load({"admin_tools": "1"})
+    check("TRIAL_BUTTON=0 убирает /test_vpn даже из меню команд админа",
+          "test_vpn" not in [c.command for c in no_button.bot_commands()],
+          str([c.command for c in no_button.bot_commands()]))
 
 
 async def test_terms_in_bot():

@@ -105,6 +105,7 @@ def e2e_bot(store_file, ref_file, admins=None, secret=TOTP_SECRET, **overrides):
         "STARS_RUB_RATE": "1.6",
         "XUI_2FA_SECRET": secret,
         "TERMS_ACCEPT": "1",          # экран соглашения при первом запуске — как в бою
+        "TRIAL_BUTTON": "0",          # кнопки теста скрыты: бот выглядит боевым
         "TERMS_STORE_FILE": os.path.join(os.path.dirname(store_file),
                                           "terms-" + os.path.basename(store_file)),
     }
@@ -209,13 +210,18 @@ async def step_start(bot):
           "Пользовательское соглашение" not in text and "Добро пожаловать" in text)
     check("приветствие показывает протокол и тарифы",
           "VLESS Reality" in text and "Тарифы" in text)
-    check("меню админа: тестовый ключ на месте (TRIAL_PUBLIC=0)",
-          "get_test_key_btn" in menu, str(menu))
+    check("кнопки тестового VPN нет даже у админа (TRIAL_BUTTON=0)",
+          "get_test_key_btn" not in menu, str(menu))
     check("меню: тарифы, профиль, инструкция, приглашения, поддержка, соглашение",
           {"tariffs", "profile", "help_menu", "invite", "support", "terms"} <= set(menu), str(menu))
+    check("в приветствии нет строки про кнопку теста",
+          "Бесплатный тестовый доступ" not in text)
 
     check("обычному пользователю тестовый ключ не предлагают",
           "get_test_key_btn" not in buttons_from(bot.main_menu_kb(STRANGER)))
+    check("и /test_vpn не заявлен в меню команд Telegram",
+          "test_vpn" not in [c.command for c in bot.bot_commands()],
+          str([c.command for c in bot.bot_commands()]))
 
     # Обычный пользователь проходит тот же путь
     fp.TG["calls"].clear()
@@ -285,9 +291,12 @@ async def step_payment(bot):
     await bot.cb_tariffs(click(bot, "tariffs", uid=ADMIN))
     tariffs = last_edit(ADMIN)
     tariffs_text = tariffs.get("text", "")
-    check("в тарифах видны все 4 платных и тестовый (админ)",
-          all(word in tariffs_text for word in ("Школьник", "Базовый", "Семейный", "Премиум", "Тестовый период")),
-          " | ".join(w for w in ("Школьник", "Базовый", "Семейный", "Премиум", "Тестовый период") if w not in tariffs_text))
+    check("в тарифах видны все 4 платных, а тестового пункта нет",
+          all(word in tariffs_text for word in ("Школьник", "Базовый", "Семейный", "Премиум"))
+          and "Тестовый период" not in tariffs_text,
+          " | ".join(w for w in ("Школьник", "Базовый", "Семейный", "Премиум") if w not in tariffs_text))
+    check("в кнопках тарифов нет buy_trial",
+          "buy_trial" not in buttons(last_edit(ADMIN)), str(buttons(last_edit(ADMIN))))
     check("есть напоминание про условия сервиса", "/terms" in tariffs_text)
     check("сказано, что оплата в крипте и ключ придёт сразу",
           "CryptoBot" in tariffs_text and "сразу после оплаты" in tariffs_text)
@@ -309,15 +318,17 @@ async def step_payment(bot):
     profile = last_text(ADMIN)
     check("/profile показывает активную подписку", "Активна" in profile)
     check("/profile показывает срок и ключ", "Действует до" in profile and "vless://" in profile)
-    check("в профиле админа есть тестовый ключ и тарифы",
-          {"tariffs", "get_test_key_btn"} <= set(buttons(last_sent(ADMIN))))
+    check("в профиле остались тарифы, а кнопки теста нет",
+          {"tariffs", "main_menu"} <= set(buttons(last_sent(ADMIN)))
+          and "get_test_key_btn" not in buttons(last_sent(ADMIN)),
+          str(buttons(last_sent(ADMIN))))
 
     check("заказ записан как оплаченный",
           (bot.payment_store.orders[order_id]["status"] == "paid"))
 
 
 async def step_trial_key(bot):
-    print("\n▶ 4. Тестовый ключ: выдача, повтор, сброс")
+    print("\n▶ 4. Тестовый ключ: кнопок нет, команда работает")
     fp.TG["calls"].clear()
     await bot.cmd_test_vpn(make_message(bot, ADMIN, "/test_vpn"))
     trial = trial_client(ADMIN)
@@ -486,7 +497,7 @@ async def step_admin_tools(bot):
 async def step_production_bot(store_file, ref_file):
     print("\n▶ 7. Боевой вид: без ADMIN_TOOLS служебных команд нет")
     bot = e2e_bot(store_file, ref_file, ADMIN_TOOLS=None, TRIAL_PUBLIC=None,
-                  PAYMENTS_ALLOW_TEST_PAY=None)
+                  PAYMENTS_ALLOW_TEST_PAY=None, TRIAL_BUTTON="1")
     handlers = {getattr(h.callback, "__name__", "") for h in bot.dp.message.handlers}
     check("служебные команды не зарегистрированы",
           not ({"cmd_payments", "cmd_panel_debug", "cmd_totp", "cmd_groups",
@@ -506,6 +517,9 @@ async def step_production_bot(store_file, ref_file):
     check("админу /myid подсказывает, как вернуть команды", "ADMIN_TOOLS=1" in last_text(ADMIN))
 
     await bot.cb_accept_terms(click(bot, "accept_terms", uid=STRANGER))
+    check("с TRIAL_BUTTON=1 кнопка теста возвращается админу (и только ему)",
+          "get_test_key_btn" in buttons_from(bot.main_menu_kb(ADMIN))
+          and "get_test_key_btn" not in buttons_from(bot.main_menu_kb(STRANGER)))
     await bot.cmd_profile(make_message(bot, STRANGER, "/profile"))
     check("в профиле пользователя нет кнопки тестового ключа",
           "get_test_key_btn" not in buttons(last_sent(STRANGER)),

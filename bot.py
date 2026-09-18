@@ -329,6 +329,12 @@ ADMIN_TOOLS = (os.getenv("ADMIN_TOOLS") or "0").strip().lower() in ("1", "true",
 #   1 — тест доступен всем: кнопка есть в меню у каждого, ключ выдаётся на 24 часа.
 TRIAL_PUBLIC = (os.getenv("TRIAL_PUBLIC") or "0").strip().lower() in ("1", "true", "yes", "on")
 
+# Показывать ли кнопки и пункт бесплатного теста (главное меню, профиль, тарифы).
+#   0 (по умолчанию) — кнопок теста нет ни у кого, даже у администратора: бот
+#       выглядит полностью боевым. Сам ключ остаётся доступен админу командой /test_vpn.
+#   1 — кнопки показываются тем, кому доступен тест (см. TRIAL_PUBLIC).
+TRIAL_BUTTON = (os.getenv("TRIAL_BUTTON") or "0").strip().lower() in ("1", "true", "yes", "on")
+
 # Сколько рублей в одной единице валюты (курс фиксируется вручную).
 # Если не задан — бот берёт курс у Crypto Pay (getExchangeRates).
 CRYPTOBOT_RUB_RATE = float((os.getenv("CRYPTOBOT_RUB_RATE") or "0").replace(",", "."))
@@ -2479,6 +2485,17 @@ def trial_available_for(user_id: int | None) -> bool:
     return is_admin(user_id)
 
 
+def trial_button_visible(user_id: int | None) -> bool:
+    """
+    Показывать ли кнопки/пункт бесплатного теста этому пользователю.
+
+    Право на тест (TRIAL_PUBLIC) и вид кнопок (TRIAL_BUTTON) разделены: при
+    TRIAL_BUTTON=0 кнопок нет ни у кого, включая администратора, но команда
+    /test_vpn для админа продолжает работать.
+    """
+    return TRIAL_BUTTON and trial_available_for(user_id)
+
+
 def test_tools_enabled() -> bool:
     """
     Показывать ли тестовые команды (/test_pay, /crypto_check) и их кнопки.
@@ -4337,11 +4354,12 @@ def main_menu_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
     """
     Главное меню.
 
-    Кнопка бесплатного теста показывается только тем, кому тест действительно доступен
-    (TRIAL_PUBLIC=1 или администратор) — чтобы пользователь не упирался в отказ.
+    Кнопка бесплатного теста показывается только тем, кому тест доступен и включён
+    показ кнопок (TRIAL_BUTTON=1 + TRIAL_PUBLIC=1 или администратор) — чтобы
+    пользователь не упирался в отказ.
     """
     rows = []
-    if trial_available_for(tg_id):
+    if trial_button_visible(tg_id):
         rows.append([InlineKeyboardButton(text="🔑 Получить тестовый VPN (24 часа)",
                                           callback_data="get_test_key_btn")])
     rows += [
@@ -4364,13 +4382,13 @@ def tariffs_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
     """
     Кнопки тарифов.
 
-    Бесплатный тестовый пункт показываем только тем, кому тест реально доступен
-    (TRIAL_PUBLIC=1 или администратор) — иначе пользователь нажмёт «Бесплатно»
-    и получит отказ.
+    Бесплатный тестовый пункт показываем только тем, кому тест доступен и включён
+    показ кнопок (TRIAL_BUTTON=1) — иначе пользователь нажмёт «Бесплатно» и получит
+    отказ, а бот выглядит не как рабочий сервис.
     """
     buttons = []
     for key, data in TARIFFS.items():
-        if data["price"] <= 0 and not trial_available_for(tg_id):
+        if data["price"] <= 0 and not trial_button_visible(tg_id):
             continue
         buttons.append([
             InlineKeyboardButton(
@@ -4444,7 +4462,7 @@ def welcome_text(tg_id: int) -> str:
     """Приветствие /start: показывается после принятия соглашения и по кнопке «Меню»."""
     trial_line = (
         "🎁 Бесплатный тестовый доступ на 24 часа — кнопка ниже.\n"
-        if trial_available_for(tg_id) else ""
+        if trial_button_visible(tg_id) else ""
     )
     return (
         "👋 <b>Добро пожаловать в быстрый и надёжный VPN!</b>\n\n"
@@ -4488,6 +4506,12 @@ async def cmd_myid(message: Message):
                 "Нужны /payments, /panel_debug, /groups, /totp? Поставь в Railway → Variables "
                 "<b>ADMIN_TOOLS=1</b> и подожди 1–2 минуты (перезапуск). Обратно — "
                 "<code>ADMIN_TOOLS=0</code> или удалить переменную."
+            )
+        if trial_available_for(user_id) and not trial_button_visible(user_id):
+            status_text += (
+                "\n\n🔑 Кнопки тестового ключа скрыты (<code>TRIAL_BUTTON=0</code>), "
+                "но команда /test_vpn работает: 24 часа, 1 ГиБ. "
+                "Вернуть кнопки в меню и тарифы — <code>TRIAL_BUTTON=1</code>."
             )
     else:
         status_text = (
@@ -5066,7 +5090,7 @@ async def cb_tariffs(cb: CallbackQuery):
         return
     text = "💰 <b>Тарифные планы:</b>\n\n"
     for key, data in TARIFFS.items():
-        if data["price"] <= 0 and not trial_available_for(cb.from_user.id):
+        if data["price"] <= 0 and not trial_button_visible(cb.from_user.id):
             continue          # бесплатный тест — только тем, кому он доступен
         text += (
             f"• <b>{data['name']}</b> — <b>{tariff_price_label(data)}</b>\n"
@@ -5623,7 +5647,7 @@ async def send_profile(message: Message, user_id: int):
 
     profile_rows = [[InlineKeyboardButton(text="💰 Продлить / сменить тариф", callback_data="tariffs")]]
     # Бесплатный тест предлагаем только тем, кому он доступен (TRIAL_PUBLIC=1 или админ).
-    if trial_available_for(user_id):
+    if trial_button_visible(user_id):
         profile_rows.append([InlineKeyboardButton(text="🔑 Тестовый ключ (24 ч)",
                                                   callback_data="get_test_key_btn")])
     profile_rows.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
@@ -5934,39 +5958,47 @@ if test_tools_enabled():
 # ЗАПУСК БОТА
 # =========================
 
+def bot_commands() -> list[BotCommand]:
+    """
+    Список команд для меню Telegram — собирается по переменным ADMIN_TOOLS,
+    TRIAL_PUBLIC, TRIAL_BUTTON и TEST_TOOLS.
+    """
+    # Пользовательские команды — всегда.
+    commands = [BotCommand(command="start", description="🏠 Главное меню")]
+    if TRIAL_PUBLIC and TRIAL_BUTTON:
+        commands.append(BotCommand(command="test_vpn", description="🔑 Бесплатный доступ на 24 часа"))
+    commands += [
+        BotCommand(command="profile", description="👤 Моя подписка и ключ"),
+        BotCommand(command="help", description="📲 Как подключиться (пошагово)"),
+        BotCommand(command="invite", description="🎁 Пригласить друга и получить дни"),
+        BotCommand(command="terms", description="📄 Условия сервиса"),
+        BotCommand(command="myid", description="👤 Узнать свой Telegram ID"),
+    ]
+    # Служебные команды — только при ADMIN_TOOLS=1; в боевом виде их в меню нет.
+    if admin_tools_enabled():
+        commands += [
+            BotCommand(command="payments", description="💳 Оплаты (для администратора)"),
+            BotCommand(command="panel_debug", description="🔍 Диагностика панели"),
+            BotCommand(command="groups", description="🏷 Группы клиентов в 3x-ui"),
+            BotCommand(command="inbounds", description="📡 Список подключений 3x-ui"),
+            BotCommand(command="totp", description="🔐 Код 2FA для входа в панель"),
+            BotCommand(command="reset_vpn", description="🔄 Сбросить тестовый ключ"),
+        ]
+        if TRIAL_BUTTON and not TRIAL_PUBLIC:
+            commands.insert(1, BotCommand(command="test_vpn", description="🔑 Тестовый ключ (24 часа)"))
+    # Тестовые команды проверки оплаты — отдельный флаг TEST_TOOLS.
+    if test_tools_enabled():
+        commands += [
+            BotCommand(command="test_pay", description="🧪 Проверить выдачу ключа без оплаты"),
+            BotCommand(command="crypto_check", description="🔍 Проверить Crypto Pay без денег"),
+        ]
+    return commands
+
+
 async def on_startup():
     """Регистрирует подсказки команд в меню Telegram."""
     try:
-        # Пользовательские команды — всегда.
-        commands = [BotCommand(command="start", description="🏠 Главное меню")]
-        if TRIAL_PUBLIC:
-            commands.append(BotCommand(command="test_vpn", description="🔑 Бесплатный доступ на 24 часа"))
-        commands += [
-            BotCommand(command="profile", description="👤 Моя подписка и ключ"),
-            BotCommand(command="help", description="📲 Как подключиться (пошагово)"),
-            BotCommand(command="invite", description="🎁 Пригласить друга и получить дни"),
-            BotCommand(command="terms", description="📄 Условия сервиса"),
-            BotCommand(command="myid", description="👤 Узнать свой Telegram ID"),
-        ]
-        # Служебные команды — только при ADMIN_TOOLS=1; в боевом виде их в меню нет.
-        if admin_tools_enabled():
-            commands += [
-                BotCommand(command="payments", description="💳 Оплаты (для администратора)"),
-                BotCommand(command="panel_debug", description="🔍 Диагностика панели"),
-                BotCommand(command="groups", description="🏷 Группы клиентов в 3x-ui"),
-                BotCommand(command="inbounds", description="📡 Список подключений 3x-ui"),
-                BotCommand(command="totp", description="🔐 Код 2FA для входа в панель"),
-                BotCommand(command="reset_vpn", description="🔄 Сбросить тестовый ключ"),
-            ]
-            if not TRIAL_PUBLIC:
-                commands.insert(1, BotCommand(command="test_vpn", description="🔑 Тестовый ключ (24 часа)"))
-        # Тестовые команды проверки оплаты — отдельный флаг TEST_TOOLS.
-        if test_tools_enabled():
-            commands += [
-                BotCommand(command="test_pay", description="🧪 Проверить выдачу ключа без оплаты"),
-                BotCommand(command="crypto_check", description="🔍 Проверить Crypto Pay без денег"),
-            ]
-        await bot.set_my_commands(commands)
+        await bot.set_my_commands(bot_commands())
     except Exception as exc:
         logger.warning("Не удалось зарегистрировать команды в меню: %s", exc)
 
