@@ -5854,6 +5854,18 @@ if test_tools_enabled():
     dp.callback_query.register(cb_testpay_run, F.data.startswith("testpay_run_"))
     dp.callback_query.register(cb_testpay_del, F.data.startswith("testpay_del_"))
     dp.callback_query.register(cb_freekassa_check, F.data == "freekassa_check")
+    logger.info(
+        "Проверки оплаты включены: /test_pay, /freekassa_check (режим %s).", PAYMENTS_MODE
+    )
+else:
+    # Тишина в ответ на /test_pay и /freekassa_check — это не поломка, а флаг ниже.
+    # Пишем в лог, что именно мешает: так видно в Railway → Deployments → Logs.
+    logger.info(
+        "Проверки оплаты скрыты: /test_pay и /freekassa_check не зарегистрированы. "
+        "Включить: ADMIN_TOOLS=1 и (FREEKASSA_TEST=1 или PAYMENTS_ALLOW_TEST_PAY=1 или TEST_TOOLS=1). "
+        "Сейчас: ADMIN_TOOLS=%s, TEST_TOOLS=%r, режим оплаты %s.",
+        int(ADMIN_TOOLS), TEST_TOOLS_RAW or "авто", PAYMENTS_MODE,
+    )
 
 
 # =========================

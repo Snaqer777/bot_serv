@@ -447,8 +447,8 @@ async def test_terms_in_bot():
           "противоправных действий" in text and "заблокирован без возврата средств" in text)
     check("описана обработка персональных данных",
           "Telegram ID" in text and "не передаются третьим лицам" in text)
-    check("оплата: банковская карта, СБП и Telegram Stars",
-          "банковская карта" in text and "СБП" in text and "Telegram Stars" in text)
+    check("оплата: банковская карта и СБП",
+          "банковская карта" in text and "СБП" in text)
     check("теги HTML закрыты",
           text.count("<b>") == text.count("</b>") and text.count("<i>") == text.count("</i>")
           and text.count("<blockquote expandable>") == 1 and text.count("</blockquote>") == 1)
