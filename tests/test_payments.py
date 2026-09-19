@@ -1,10 +1,10 @@
 """
-Тесты оплаты подписок: Telegram Stars, карта через BotFather, ЮKassa и крипта (Crypto Pay).
+Тесты оплаты подписок: Telegram Stars, карта через BotFather, ЮKassa и FreeKassa.
 
 Каждый сценарий гоняется целиком, без моков внутри логики бота:
   • фейковая панель 3x-ui (panel.py) — куда реально выдаётся ключ;
   • фейковый Telegram Bot API — куда реально уходят счета и сообщения;
-  • фейковый API ЮKassa и фейковый Crypto Pay API;
+  • фейковый API ЮKassa и эмуляция уведомлений FreeKassa;
   • настоящий HTTP-сервер вебхуков бота (run_webhook_server).
 
 Главная проверка: ключ выдаётся ТОЛЬКО по подтверждённой оплате и ровно один раз.
@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import uuid
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aiohttp import web
@@ -32,11 +33,13 @@ PANEL_PORT = 8744
 TG_PORT = 8745
 YK_PORT = 8746
 WEBHOOK_PORT = 8747
-CRYPTO_PORT = 8748
 TG_TG_ID = 4242
 SHOP_ID = "123456"
 SECRET_KEY = "test_secret_key_abc"
-CRYPTO_TOKEN = "12345:TESTCRYPTO"
+FK_MERCHANT_ID = "14248"
+FK_SECRET1 = "secret_word_one"
+FK_SECRET2 = "secret_word_two"
+FK_ALLOWED_IP = "10.0.0.7"
 
 FAILURES = []
 
@@ -201,118 +204,75 @@ def yk_succeed(payment_id, amount=None, metadata=None):
     return payment
 
 
-# ---------------- фейковый Crypto Pay API (@CryptoBot) ----------------
+# ---------------- FreeKassa: подписи, ссылка и уведомления ----------------
+# Повторяем то, что делает сама FreeKassa: считаем подписи независимо от бота
+# (своими формулами из документации) и шлём уведомления на вебхук бота.
 
-CRYPTO = {"invoices": {}, "calls": [], "token": CRYPTO_TOKEN, "rates": {"USDT": "95.5"},
-          "token_broken": False, "deleted": []}
-
-
-def make_crypto_app():
-    app = web.Application()
-
-    async def api(request):
-        method = request.match_info["method"]
-        token = request.headers.get("Crypto-Pay-API-Token", "")
-        try:
-            params = await request.json()
-        except Exception:
-            params = {}
-        CRYPTO["calls"].append((method, token, params))
-
-        if CRYPTO["token_broken"] or token != CRYPTO["token"]:
-            return web.json_response({"ok": False, "error": {"code": 401, "name": "UNAUTHORIZED"}}, status=401)
-
-        if method == "getMe":
-            return web.json_response({"ok": True, "result": {
-                "app_id": 777, "name": "VPN Shop", "payment_processing_bot_username": "CryptoBot",
-            }})
-
-        if method == "getExchangeRates":
-            items = [
-                {"is_valid": True, "source": asset, "target": "RUB", "rate": rate}
-                for asset, rate in CRYPTO["rates"].items()
-            ]
-            return web.json_response({"ok": True, "result": items})
-
-        if method == "createInvoice":
-            invoice_id = len(CRYPTO["invoices"]) + 1
-            invoice = {
-                "invoice_id": invoice_id,
-                "hash": f"hash{invoice_id}",
-                "status": "active",
-                "asset": params.get("asset"),
-                "amount": params.get("amount"),
-                "payload": params.get("payload"),
-                "description": params.get("description", ""),
-                "created_at": "2026-09-17T12:00:00.000Z",
-                "bot_invoice_url": f"https://t.me/CryptoBot?start=IV{invoice_id}",
-                "pay_url": f"https://t.me/CryptoBot?start=IV{invoice_id}",
-                "mini_app_invoice_url": f"https://t.me/CryptoBot/app?startapp=IV{invoice_id}",
-            }
-            CRYPTO["invoices"][str(invoice_id)] = invoice
-            return web.json_response({"ok": True, "result": invoice})
-
-        if method == "deleteInvoice":
-            invoice_id = str(params.get("invoice_id"))
-            removed = CRYPTO["invoices"].pop(invoice_id, None)
-            if removed is None:
-                return web.json_response({"ok": False, "error": {"code": 400, "name": "INVOICE_NOT_FOUND"}}, status=400)
-            CRYPTO["deleted"].append(invoice_id)
-            return web.json_response({"ok": True, "result": True})
-
-        if method == "getInvoices":
-            ids = str(params.get("invoice_ids") or "")
-            status = params.get("status")
-            items = list(CRYPTO["invoices"].values())
-            if ids:
-                wanted = {i.strip() for i in ids.split(",")}
-                items = [i for i in items if str(i["invoice_id"]) in wanted]
-            if status:
-                items = [i for i in items if i["status"] == status]
-            return web.json_response({"ok": True, "result": {"count": len(items), "items": items}})
-
-        return web.json_response({"ok": False, "error": {"code": 404, "name": "METHOD_NOT_FOUND"}}, status=404)
-
-    app.router.add_post("/api/{method}", api)
-    app.router.add_post("/testnet/api/{method}", api)
-    return app
+def fk_amount(value) -> str:
+    """Сумма в том виде, в каком её передаёт бот: без лишних нулей."""
+    price = float(value)
+    return str(int(price)) if price == int(price) else f"{price:.2f}".rstrip("0").rstrip(".")
 
 
-def crypto_pay(invoice_id, status="paid", amount=None, asset=None):
-    """Помечает счёт в фейковом Crypto Pay оплаченным."""
-    invoice = CRYPTO["invoices"][str(invoice_id)]
-    invoice["status"] = status
-    if amount:
-        invoice["amount"] = amount
-    if asset:
-        invoice["asset"] = asset
-    return invoice
+def fk_sign_form(order_id, amount, *, merchant=FK_MERCHANT_ID, secret=FK_SECRET1,
+                 currency="RUB", variant="currency") -> str:
+    """Подпись ссылки на оплату — первым секретным словом (формула из документации FK)."""
+    parts = [merchant, amount]
+    if variant == "plain":
+        parts.append(secret)
+    else:
+        parts += [secret, currency]
+    parts.append(order_id)
+    return hashlib.md5(":".join(parts).encode()).hexdigest()
 
 
-def crypto_signature(body: bytes, token: str = "") -> str:
-    """Подпись вебхука так, как её считает Crypto Pay: HMAC-SHA256(SHA256(token), тело)."""
-    secret = hashlib.sha256((token or CRYPTO["token"]).encode()).digest()
-    return hmac.new(secret, body, hashlib.sha256).hexdigest()
+def fk_sign_notify(order_id, amount, *, merchant=FK_MERCHANT_ID, secret=FK_SECRET2) -> str:
+    """Подпись уведомления — вторым секретным словом: md5(магазин:сумма:секрет2:заказ)."""
+    return hashlib.md5(f"{merchant}:{amount}:{secret}:{order_id}".encode()).hexdigest()
 
 
-async def post_crypto_webhook(invoice: dict, *, signature="auto", token="", event="invoice_paid"):
+def fk_params(order_id, amount, *, merchant=FK_MERCHANT_ID, secret=FK_SECRET2, intid="987654",
+              extra=None) -> dict:
+    """Параметры уведомления FreeKassa о платеже (как их шлёт сама FK)."""
+    amount = fk_amount(amount)
+    params = {
+        "MERCHANT_ID": merchant,
+        "AMOUNT": amount,
+        "intid": intid,
+        "MERCHANT_ORDER_ID": order_id,
+        "P_EMAIL": "buyer@example.com",
+        "P_PHONE": "79990001122",
+        "CUR_ID": "1",
+        "payer_account": "411111xxxxxx1111",
+        "commission": "0",
+        "us_tg": str(TG_TG_ID),
+    }
+    params.update(extra or {})
+    params["SIGN"] = fk_sign_notify(order_id, amount, merchant=merchant, secret=secret)
+    return params
+
+
+async def post_fk_notification(order_id, amount, *, method="get", merchant=FK_MERCHANT_ID,
+                               secret=FK_SECRET2, sign=None, intid="987654", extra=None,
+                               headers=None):
+    """Отправляет уведомление FreeKassa на вебхук бота и возвращает (статус, ответ)."""
     import aiohttp
-    body = json.dumps({
-        "update_id": 1, "update_type": event,
-        "request_date": "2026-09-17T12:00:00.000Z", "payload": invoice,
-    }).encode()
-    sig = crypto_signature(body, token) if signature == "auto" else signature
+    params = fk_params(order_id, amount, merchant=merchant, secret=secret, intid=intid, extra=extra)
+    if sign is not None:
+        params["SIGN"] = sign
+    url = f"http://127.0.0.1:{WEBHOOK_PORT}/freekassa/webhook"
     async with aiohttp.ClientSession() as s:
-        async with s.post(
-            f"http://127.0.0.1:{WEBHOOK_PORT}/cryptobot/webhook",
-            data=body,
-            headers={"crypto-pay-api-signature": sig, "Content-Type": "application/json"},
-        ) as resp:
+        if method == "post":
+            async with s.post(url, data=params, headers=headers or {}) as resp:
+                return resp.status, await resp.text()
+        async with s.get(url, params=params, headers=headers or {}) as resp:
             return resp.status, await resp.text()
 
 
-def crypto_invoice_of(invoice_id):
-    return CRYPTO["invoices"][str(invoice_id)]
+def fk_link_params(pay_url) -> dict:
+    """Разбирает ссылку на оплату, которую бот отдал пользователю."""
+    query = urlsplit(pay_url).query
+    return {key: values[0] for key, values in parse_qs(query).items()}
 
 
 # ---------------- инфраструктура ----------------
@@ -330,15 +290,18 @@ def new_bot(env, store_file, admins=None):
         "YOOKASSA_API_URL": env.get("api_url") or f"http://127.0.0.1:{YK_PORT}/v3",
         "YOOKASSA_TEST": "1",
         "YOOKASSA_VAT_CODE": env.get("vat", "1"),
-        "CRYPTOBOT_TOKEN": env.get("crypto_token", CRYPTO_TOKEN),
-        "CRYPTOBOT_API_URL": env.get("crypto_api_url") or f"http://127.0.0.1:{CRYPTO_PORT}/api",
-        "CRYPTOBOT_ASSET": env.get("crypto_asset", "USDT"),
-        "CRYPTOBOT_RUB_RATE": env.get("crypto_rate"),
-        "CRYPTOBOT_TEST": env.get("crypto_testnet"),
-        "CRYPTOBOT_INVOICE_TTL": env.get("crypto_ttl", "3600"),
-        "CRYPTOBOT_POLL_INTERVAL": env.get("crypto_poll", "60"),
+        "FREEKASSA_MERCHANT_ID": env.get("merchant", FK_MERCHANT_ID),
+        "FREEKASSA_SECRET1": env.get("secret1", FK_SECRET1),
+        "FREEKASSA_SECRET2": env.get("secret2", FK_SECRET2),
+        "FREEKASSA_PAY_URL": env.get("pay_url") or "https://pay.freekassa.ru/",
+        "FREEKASSA_CURRENCY": env.get("currency") or "RUB",
+        "FREEKASSA_SIGN_VARIANT": env.get("sign_variant"),
+        "FREEKASSA_TEST": env.get("fk_test"),
+        "FREEKASSA_CHECK_IP": env.get("check_ip"),
+        "FREEKASSA_ALLOWED_IPS": env.get("allowed_ips"),
         "PUBLIC_BASE_URL": f"http://127.0.0.1:{WEBHOOK_PORT}",
         "PAYMENTS_ALLOW_TEST_PAY": env.get("allow_test_pay"),
+        "ADMIN_TOOLS": env.get("admin_tools"),
         "PAYMENT_STORE_FILE": store_file,
         "PORT": str(WEBHOOK_PORT),
         "STARS_RUB_RATE": "1.6",
@@ -408,15 +371,6 @@ def reset_all():
     YK["by_idem"].clear()
     YK["status_override"] = None
     YK["break_auth"] = False
-    CRYPTO["invoices"].clear()
-    CRYPTO["calls"].clear()
-    CRYPTO["rates"] = {"USDT": "95.5"}
-    CRYPTO["token_broken"] = False
-    CRYPTO["deleted"].clear()
-
-
-def crypto_calls(method):
-    return [c for c in CRYPTO["calls"] if c[0] == method]
 
 
 # ---------------- сценарии: общие ----------------
@@ -424,7 +378,7 @@ def crypto_calls(method):
 async def test_mode_detection(store_file):
     print("\n▶ 1. Определение режима оплаты по переменным окружения")
     bot = new_bot({"mode": None, "provider_token": None, "shop_id": None, "secret_key": None,
-                   "crypto_token": None}, store_file)
+                   "merchant": None, "secret1": None, "secret2": None}, store_file)
     check("по умолчанию — Telegram Stars", bot.PAYMENTS_MODE == "stars" and bot.payments_enabled())
 
     bot = new_bot({"mode": None, "provider_token": "381764678:TEST:12345", "shop_id": None, "secret_key": None}, store_file)
@@ -434,9 +388,9 @@ async def test_mode_detection(store_file):
     check("ключи ЮKassa без PAYMENTS_MODE → режим yookassa", bot.PAYMENTS_MODE == "yookassa")
     check("test_-ключ распознан как тестовый магазин", bot.YOOKASSA_TEST is True)
 
-    bot = new_bot({"mode": None, "provider_token": None, "shop_id": None, "secret_key": None,
-                   "crypto_token": CRYPTO_TOKEN}, store_file)
-    check("токен Crypto Pay без PAYMENTS_MODE → режим crypto", bot.PAYMENTS_MODE == "crypto")
+    bot = new_bot({"mode": None, "provider_token": None, "shop_id": None, "secret_key": None}, store_file)
+    check("магазин FreeKassa без PAYMENTS_MODE → режим freekassa", bot.PAYMENTS_MODE == "freekassa")
+    check("FreeKassa распознана как настроенная", bot.freekassa_configured() is True)
 
     bot = new_bot({"mode": "off", "provider_token": "x", "shop_id": SHOP_ID, "secret_key": SECRET_KEY}, store_file)
     check("PAYMENTS_MODE=off выключает оплату", not bot.payments_enabled())
@@ -444,9 +398,8 @@ async def test_mode_detection(store_file):
     bot = new_bot({"mode": "stars", "provider_token": None, "shop_id": SHOP_ID, "secret_key": SECRET_KEY}, store_file)
     check("явный PAYMENTS_MODE=stars приоритетнее ключей ЮKassa", bot.PAYMENTS_MODE == "stars")
 
-    bot = new_bot({"mode": "crypto", "provider_token": None, "shop_id": None, "secret_key": None,
-                   "crypto_token": CRYPTO_TOKEN}, store_file)
-    check("явный PAYMENTS_MODE=crypto выбран", bot.PAYMENTS_MODE == "crypto")
+    bot = new_bot({"mode": "freekassa", "provider_token": None, "shop_id": None, "secret_key": None}, store_file)
+    check("явный PAYMENTS_MODE=freekassa выбран", bot.PAYMENTS_MODE == "freekassa")
 
 
 async def test_stars_flow(store_file):
@@ -813,338 +766,339 @@ async def test_yookassa_oauth_webhook(store_file):
             await runner.cleanup()
 
 
-# ---------------- сценарии: крипта (Crypto Pay) ----------------
+# ---------------- сценарии: FreeKassa ----------------
 
-async def test_crypto_rates():
-    print("\n▶ 6. Крипта: пересчёт цены и точность округления")
-    store_file = os.path.join(tempfile.mkdtemp(prefix="crypto-rate-"), "payments.json")
+async def test_freekassa_signatures():
+    print("\n▶ 6. FreeKassa: подписи, ссылка на оплату и сверка суммы")
+    store_file = os.path.join(tempfile.mkdtemp(prefix="fk-sign-"), "payments.json")
     reset_all()
-    bot = new_bot({"mode": "crypto"}, store_file)
+    bot = new_bot({"mode": "freekassa"}, store_file)
 
-    check("149 ₽ при курсе 95 → 1.57 USDT (округление вверх)",
-          bot.crypto_amount_for_rub(149, 95, "USDT") == "1.57",
-          bot.crypto_amount_for_rub(149, 95, "USDT"))
-    check("149 ₽ при курсе 149 → ровно 1.00 USDT",
-          bot.crypto_amount_for_rub(149, 149, "USDT") == "1.00")
-    check("TON округляется до 2 знаков: 149 ₽ при 300 ₽/TON → 0.50",
-          bot.crypto_amount_for_rub(149, 300, "TON") == "0.50")
-    check("BTC округляется до 6 знаков",
-          bot.crypto_amount_for_rub(149, 9_000_000, "BTC") == "0.000017",
-          bot.crypto_amount_for_rub(149, 9_000_000, "BTC"))
-    check("нулевой курс → понятная ошибка", _raises(
-        lambda: bot.crypto_amount_for_rub(149, 0, "USDT"), bot.PaymentError))
-    check("курс приходит из Crypto Pay", await bot.cryptobot_rate(client=bot.CryptoPayClient()) == 95.5)
+    check("режим FreeKassa и магазин из переменных",
+          bot.PAYMENTS_MODE == "freekassa" and bot.freekassa_configured() is True)
 
-    reset_all()
-    bot = new_bot({"mode": "crypto", "crypto_rate": "100"}, store_file)
-    check("курс из CRYPTOBOT_RUB_RATE имеет приоритет",
-          await bot.cryptobot_rate(client=bot.CryptoPayClient()) == 100.0)
+    order = bot.new_order(TG_TG_ID, "basic")
+    price = bot.TARIFFS["basic"]["price"]
+    link = bot.freekassa_payment_url(order)
+    params = fk_link_params(link)
+    check("ссылка ведёт на платёжную страницу FreeKassa", link.startswith(bot.FREEKASSA_PAY_URL + "/?"))
+    check("в ссылке есть магазин, номер заказа, сумма и валюта",
+          params.get("m") == FK_MERCHANT_ID and params.get("o") == order["id"]
+          and params.get("oa") == str(price) and params.get("currency") == "RUB", str(params))
+    check("подпись ссылки совпадает с формулой FreeKassa (md5(m:oa:секрет1:валюта:o))",
+          params.get("s") == fk_sign_form(order["id"], str(price)))
+    check("в ссылке передан telegram_id (вернётся в уведомлении)",
+          params.get("us_tg") == str(TG_TG_ID))
+    check("язык страницы оплаты — русский", params.get("lang") == "ru")
 
     reset_all()
-    CRYPTO["rates"] = {}
-    bot = new_bot({"mode": "crypto"}, store_file)
-    try:
-        await bot.cryptobot_rate(client=bot.CryptoPayClient())
-        check("без курса и без переменной — ошибка с подсказкой", False)
-    except bot.PaymentError as exc:
-        check("без курса и без переменной — ошибка с подсказкой", "CRYPTOBOT_RUB_RATE" in str(exc))
+    bot_plain = new_bot({"mode": "freekassa", "sign_variant": "plain"}, store_file)
+    order_plain = bot_plain.new_order(TG_TG_ID, "basic")
+    plain_params = fk_link_params(bot_plain.freekassa_payment_url(order_plain))
+    check("старая формула (без валюты) тоже поддерживается",
+          plain_params.get("s") == fk_sign_form(order_plain["id"], str(price), variant="plain"))
+
+    probe = {"MERCHANT_ID": FK_MERCHANT_ID, "AMOUNT": "249", "MERCHANT_ORDER_ID": "basic-1-2-ab12cd"}
+    check("подпись уведомления = md5(магазин:сумма:секрет2:заказ)",
+          bot.freekassa_sign_notify(probe) == fk_sign_notify("basic-1-2-ab12cd", 249))
+    check("подпись уведомления не совпадает с чужой подписью",
+          bot.freekassa_sign_notify(probe) != fk_sign_notify("basic-1-2-ab12cd", 249, secret="чужой"))
+    check("подписи ссылки и уведомления считаются разными словами",
+          bot.freekassa_sign_form(order) != bot.freekassa_sign_notify(
+              {"MERCHANT_ID": FK_MERCHANT_ID, "AMOUNT": str(price), "MERCHANT_ORDER_ID": order["id"]}))
+
+    check("целая сумма передаётся без лишних нулей", bot.freekassa_amount({"amount_rub": 249}) == "249")
+    check("дробная сумма передаётся без хвостовых нулей",
+          bot.freekassa_amount({"amount_rub": 150.50}) == "150.5")
+    check("сумма из уведомления сверяется в копейках",
+          bot.freekassa_amount_matches(order, "249.00") is True)
+    check("другая сумма не проходит", bot.freekassa_amount_matches(order, "1") is False)
+    check("мусор вместо суммы не проходит", bot.freekassa_amount_matches(order, "abc") is False)
 
 
-async def test_crypto_flow(store_file):
-    print("\n▶ 7. Крипта: счёт в @CryptoBot → оплата → выдача ключа")
+async def test_freekassa_flow(store_file):
+    print("\n▶ 7. FreeKassa: ссылка на оплату → уведомление → выдача ключа")
     reset_all()
-    bot = new_bot({"mode": "crypto"}, store_file)
+    bot = new_bot({"mode": "freekassa"}, store_file)
     runner = await bot.run_webhook_server()
     email = f"tg-paid-{TG_TG_ID}"
 
     try:
         await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
-        created = crypto_calls("createInvoice")
-        check("счёт создан через Crypto Pay API", len(created) == 1)
-        _, token, params = created[-1]
-        check("запрос подписан токеном приложения", token == CRYPTO_TOKEN)
-        check("валюта счёта — USDT", params.get("asset") == "USDT")
         basic_price = bot.TARIFFS["basic"]["price"]
-        expected_amount = bot.crypto_amount_for_rub(basic_price, 95.5, "USDT")
-        check(f"сумма счёта посчитана по курсу: {basic_price} ₽ / 95.5 → {expected_amount}",
-              params.get("amount") == expected_amount, str(params.get("amount")))
-        check("payload счёта = id заказа", str(params.get("payload", "")).startswith("basic-"))
-        check("задан срок жизни счёта (expires_in)", params.get("expires_in") == 3600)
-        check("в описании счёта видно тариф и срок",
-              "Базовый" in params.get("description", "") or "30" in params.get("description", ""),
-              params.get("description", ""))
-
-        order_id = params.get("payload")
-        order = await bot.payment_store.get(order_id)
-        check("заказ сохранён с номером счёта и суммой в крипте",
-              order.get("invoice_id") == 1 and order.get("amount_asset") == expected_amount
-              and order.get("asset") == "USDT")
-        check("курс зафиксирован в заказе", float(order.get("rate_rub")) == 95.5)
-
         message = [m for m in tg_calls("sendMessage") if "Оплата тарифа" in m["params"].get("text", "")][-1]["params"]
         markup = json.dumps(message["reply_markup"], ensure_ascii=False)
-        check("кнопка «Оплатить» ведёт на счёт в @CryptoBot", "https://t.me/CryptoBot" in markup)
+        check("кнопка «Оплатить» ведёт на страницу FreeKassa", "pay.freekassa.ru" in markup)
         check("есть кнопка «Проверить оплату»", "checkpay_" in markup)
-        check("в сообщении видна сумма в крипте и в рублях",
-              f"{expected_amount} USDT" in message.get("text", "")
-              and f"{basic_price} ₽" in message.get("text", ""))
+        check(f"в сообщении видна сумма ({basic_price} ₽)", f"{basic_price} ₽" in message.get("text", ""))
+
+        order = [o for o in bot.payment_store.orders.values()][-1]
+        order_id = order["id"]
+        check("заказ сохранён со ссылкой на оплату и валютой RUB",
+              order["payment_url"].startswith(bot.FREEKASSA_PAY_URL) and order["currency"] == "RUB")
         check("ключ до оплаты не выдан", panel_client(email) is None)
 
-        # Вебхук до оплаты: счёт ещё active
-        status, body = await post_crypto_webhook(crypto_invoice_of(1))
-        check("вебхук по неоплаченному счёту выдачи не даёт",
-              status == 200 and panel_client(email) is None, body[:60])
+        # Уведомление с поддельной подписью
+        status, body = await post_fk_notification(order_id, basic_price, sign="deadbeef")
+        check("уведомление с неверной подписью не подтверждается",
+              status == 200 and body.strip() == "no", body[:40])
+        check("поддельное уведомление ключ не выдало", panel_client(email) is None)
 
-        # Реальная оплата
-        crypto_pay(1)
-        status, _ = await post_crypto_webhook(crypto_invoice_of(1))
-        check("вебхук invoice_paid принят (200)", status == 200)
+        # Уведомление по неизвестному заказу
+        status, body = await post_fk_notification("unknown-order-777", basic_price)
+        check("уведомление по неизвестному заказу отклонено", body.strip() == "no")
+
+        # Настоящая оплата (метод GET, как по умолчанию в кабинете FK)
+        status, body = await post_fk_notification(order_id, basic_price, intid="555111")
+        check("уведомление FreeKassa принято и подтверждено «YES»",
+              status == 200 and body.strip() == "YES", body[:40])
         client = panel_client(email)
         check("ключ выдан после подтверждённой оплаты", client is not None)
         check("срок 30 дней", client and 29 <= days_left(client) <= 30,
               f"{days_left(client) if client else '—'} дн.")
-        check("счёт перепроверен через getInvoices", bool(crypto_calls("getInvoices")))
+        check("в комментарии клиента — номер операции FreeKassa",
+              client and "fk-555111" in str(client.get("comment")), str((client or {}).get("comment")))
+        saved = await bot.payment_store.get(order_id)
+        check("заказ помечен оплаченным, сохранён intid",
+              saved["status"] == "paid" and saved.get("intid") == "555111")
+        check("номер операции записан как платёж заказа",
+              bot.order_charge_id(saved) == "fk-555111", bot.order_charge_id(saved))
 
-        # Дубль вебхука
-        await post_crypto_webhook(crypto_invoice_of(1))
-        check("дубль вебхука не продлевает подписку", 29 <= days_left(panel_client(email)) <= 30)
-        check("дубль вебхука не создаёт второго клиента",
+        # Дубль уведомления (FK повторяет, пока не получит YES)
+        status, body = await post_fk_notification(order_id, basic_price, intid="555111")
+        check("повтор уведомления снова подтверждается «YES»", body.strip() == "YES")
+        check("повтор не продлевает подписку", 29 <= days_left(panel_client(email)) <= 30)
+        check("повтор не создаёт второго клиента",
               len([e for e in PANEL["clients"] if e == email]) == 1)
 
-        # Подделка подписи
-        expiry_before = int(panel_client(email)["expiryTime"])
+        # Вторая оплата — методом POST (в кабинете FK переключается одной галочкой)
+        expiry_first = int(panel_client(email)["expiryTime"])
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "family")
+        order2 = [o for o in bot.payment_store.orders.values()][-1]
+        status, body = await post_fk_notification(
+            order2["id"], bot.TARIFFS["family"]["price"], method="post", intid="555222")
+        check("уведомление методом POST обрабатывается так же", body.strip() == "YES")
+        family_days = bot.TARIFFS["family"]["days"]
+        added = round((int(panel_client(email)["expiryTime"]) - expiry_first) / 86_400_000, 1)
+        check(f"вторая оплата продлила подписку на {family_days} дней", added == family_days, f"+{added} дн.")
+
+        # Подмена суммы и чужой магазин
         await bot.start_checkout(TG_TG_ID, TG_TG_ID, "premium")
-        order2 = crypto_calls("createInvoice")[-1][2]["payload"]
-        invoice2_id = (await bot.payment_store.get(order2))["invoice_id"]
-        crypto_pay(invoice2_id)
-        status, _ = await post_crypto_webhook(crypto_invoice_of(invoice2_id), signature="deadbeef")
-        check("вебхук с неверной подписью отклонён (401)", status == 401)
-        check("поддельный вебхук ключ не выдал",
+        order3 = [o for o in bot.payment_store.orders.values()][-1]
+        expiry_before = int(panel_client(email)["expiryTime"])
+        status, body = await post_fk_notification(order3["id"], 1)
+        check("подмена суммы → ключ не выдан и «no»",
+              body.strip() == "no" and int(panel_client(email)["expiryTime"]) == expiry_before)
+        status, body = await post_fk_notification(order3["id"], bot.TARIFFS["premium"]["price"],
+                                                 merchant="999999")
+        check("уведомление другого магазина отклонено", body.strip() == "no")
+        status, body = await post_fk_notification(order3["id"], bot.TARIFFS["premium"]["price"],
+                                                 secret="чужое_секретное_слово")
+        check("подпись чужим секретным словом отклонена", body.strip() == "no")
+        check("подписка после подделок не изменилась",
               int(panel_client(email)["expiryTime"]) == expiry_before)
 
-        status, _ = await post_crypto_webhook(crypto_invoice_of(invoice2_id), token="999:ЧУЖОЙ")
-        check("вебхук, подписанный не нашим токеном, отклонён", status == 401)
-
-        # Чужой счёт с подменённой суммой
-        crypto_pay(invoice2_id, amount="0.01")
-        status, body = await post_crypto_webhook(crypto_invoice_of(invoice2_id))
-        check("подмена суммы в счёте → ключ не выдан",
-              int(panel_client(email)["expiryTime"]) == expiry_before, body[:40])
-
-        # Неизвестный заказ
-        crypto_pay(invoice2_id, amount="6.25")
-        forged = dict(crypto_invoice_of(invoice2_id), payload="unknown-order-777")
-        status, body = await post_crypto_webhook(forged)
-        check("вебхук по неизвестному заказу не ломает сервис",
-              status == 200 and "unknown_order" in body)
-
-        # Чужой тип события
-        status, body = await post_crypto_webhook(crypto_invoice_of(invoice2_id), event="invoice_created")
-        check("другие события игнорируются", status == 200 and "ignored" in body)
-
-        # Кнопка «Проверить оплату»: оплаченный счёт, вебхук «потерялся»
-        expected_amount = (await bot.payment_store.get(order2))["amount_asset"]
-        crypto_pay(invoice2_id, amount=expected_amount)
-        cb = _FakeCallback(bot, f"checkpay_{order2}")
+        # Кнопка «Проверить оплату»: у FreeKassa нет запроса статуса — ждём уведомление
+        cb = _FakeCallback(bot, f"checkpay_{order3['id']}")
         await bot.cb_check_payment(cb)
-        check("кнопка «Проверить оплату» выдаёт ключ без вебхука",
-              31 <= days_left(panel_client(email)) <= 395, f"{days_left(panel_client(email))} дн.")
-        check("кнопка сообщила о начале проверки",
-              "Проверяю оплату" in json.dumps(cb.answers, ensure_ascii=False) or bool(cb.message.sent))
-        check("после ручной проверки заказ помечен оплаченным",
-              (await bot.payment_store.get(order2))["status"] == "paid")
-        cb_again = _FakeCallback(bot, f"checkpay_{order2}")
-        await bot.cb_check_payment(cb_again)
-        check("повторное нажатие не продлевает подписку",
-              31 <= days_left(panel_client(email)) <= 395)
-        check("повторное нажатие отвечает «оплата уже подтверждена»",
-              any("уже подтверждена" in t for t in cb_again.answers))
+        check("кнопка объясняет, что статус приходит уведомлением",
+              any("FreeKassa" in t and "уведомлени" in t.lower() for t in cb.message.sent),
+              json.dumps(cb.message.sent, ensure_ascii=False)[:80])
+        check("кнопка не выдала ключ вместо оплаты",
+              int(panel_client(email)["expiryTime"]) == expiry_before)
+
+        # Оплата третьего заказа всё же проходит и продлевает подписку
+        status, body = await post_fk_notification(order3["id"], bot.TARIFFS["premium"]["price"],
+                                                 intid="555333")
+        check("оплата третьего заказа подтверждена", body.strip() == "YES")
+        premium_days = bot.TARIFFS["premium"]["days"]
+        added = round((int(panel_client(email)["expiryTime"]) - expiry_before) / 86_400_000, 1)
+        check(f"третья оплата продлила подписку на {premium_days} дней", added == premium_days, f"+{added} дн.")
     finally:
         if runner is not None:
             await runner.cleanup()
 
 
-async def test_crypto_poller_and_button(store_file):
-    print("\n▶ 8. Крипта: резервный опрос API, истёкший счёт и повторная выдача")
+async def test_freekassa_ip_check_and_errors(store_file):
+    print("\n▶ 8. FreeKassa: проверка IP уведомлений и понятные ошибки")
     reset_all()
-    bot = new_bot({"mode": "crypto"}, store_file)
+    bot = new_bot({"mode": "freekassa"}, store_file)
+    runner = await bot.run_webhook_server()
     email = f"tg-paid-{TG_TG_ID}"
 
-    # Оплата без вебхука: клиент оплатил, вебхук не пришёл — срабатывает опрос
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
-    order_id = crypto_calls("createInvoice")[-1][2]["payload"]
-    invoice_id = (await bot.payment_store.get(order_id))["invoice_id"]
-    crypto_pay(invoice_id)
+    try:
+        check("по умолчанию проверка IP выключена (Railway прячет IP за прокси)",
+              bot.FREEKASSA_CHECK_IP is False)
+        check("белый список IP FreeKassa задан",
+              "168.119.157.136" in bot.FREEKASSA_ALLOWED_IPS and "136.243.38.147" in bot.FREEKASSA_ALLOWED_IPS)
 
-    issued = await bot.crypto_poll_once()
-    check("опрос API выдал ключ по оплаченному счёту", issued == 1 and panel_client(email) is not None)
-    check("срок подписки 30 дней", 29 <= days_left(panel_client(email)) <= 30)
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        order = [o for o in bot.payment_store.orders.values()][-1]
+        status, body = await post_fk_notification(
+            order["id"], bot.TARIFFS["basic"]["price"], headers={"X-Real-IP": "8.8.8.8"})
+        check("без проверки IP уведомление принимается с любого адреса", body.strip() == "YES")
+        check("ключ выдан", panel_client(email) is not None)
+    finally:
+        await runner.cleanup()
 
-    again = await bot.crypto_poll_once()
-    check("повторный опрос ничего не продлевает", again == 0 and 29 <= days_left(panel_client(email)) <= 30)
-
-    # Истёкший счёт
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "family")
-    order2 = crypto_calls("createInvoice")[-1][2]["payload"]
-    invoice2 = (await bot.payment_store.get(order2))["invoice_id"]
-    cb = _FakeCallback(bot, f"checkpay_{order2}")
-    await bot.cb_check_payment(cb)
-    check("неоплаченный счёт: кнопка сообщает, что оплата не завершена",
-          any("не завершена" in t for t in cb.message.sent))
-
-    crypto_pay(invoice2, status="expired")
-    cb = _FakeCallback(bot, f"checkpay_{order2}")
-    await bot.cb_check_payment(cb)
-    check("истёкший счёт помечен canceled", (await bot.payment_store.get(order2))["status"] == "canceled")
-    check("истёкший счёт ключ не выдал", days_left(panel_client(email)) < 31)
-
-    # Кнопка на чужом заказе
-    cb = _FakeCallback(bot, f"checkpay_{order2}", uid=999)
-    await bot.cb_check_payment(cb)
-    check("чужой заказ не отдаётся по кнопке", any("не найден" in t for t in cb.answers))
-
-    # Опрос при выключенном крипто-режиме ничего не делает
+    # Проверка IP включена: доверяем только белым адресам
     reset_all()
-    bot_stars = new_bot({"mode": "stars"}, store_file)
-    check("опрос не трогает заказы других режимов", await bot_stars.crypto_poll_once() == 0)
+    ip_store = os.path.join(tempfile.mkdtemp(prefix="fk-ip-"), "payments.json")
+    bot2 = new_bot({"mode": "freekassa", "check_ip": "1",
+                    "allowed_ips": f"{FK_ALLOWED_IP},168.119.157.136"}, ip_store)
+    runner2 = await bot2.run_webhook_server()
+    try:
+        check("проверка IP включается переменной", bot2.FREEKASSA_CHECK_IP is True)
+        await bot2.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        order2 = [o for o in bot2.payment_store.orders.values()][-1]
+        status, body = await post_fk_notification(
+            order2["id"], bot2.TARIFFS["basic"]["price"], headers={"X-Real-IP": "8.8.8.8"})
+        check("уведомление с чужого IP отклонено (403)", status == 403 and body.startswith("no"), body[:30])
+        check("с чужого IP ключ не выдан", panel_client(email) is None)
+        status, body = await post_fk_notification(
+            order2["id"], bot2.TARIFFS["basic"]["price"],
+            headers={"X-Forwarded-For": f"{FK_ALLOWED_IP}, 172.16.0.1"}, intid="556677")
+        check("уведомление с разрешённого IP принято (берём X-Forwarded-For)",
+              body.strip() == "YES", body[:30])
+        check("ключ выдан после уведомления с белого IP", panel_client(email) is not None)
+    finally:
+        await runner2.cleanup()
 
-
-async def test_crypto_testnet_and_diagnostics(store_file):
-    print("\n▶ 8б. Крипта: тестовая сеть, диагностика, статистика")
+    # Без магазина и секретных слов ссылка не формируется — вместо трейсбека понятный текст
     reset_all()
-    bot = new_bot({"mode": "crypto", "crypto_testnet": "1", "crypto_asset": "TON", "crypto_rate": "300",
-                   "crypto_api_url": f"http://127.0.0.1:{CRYPTO_PORT}/testnet/api"}, store_file)
-    check("тестовая сеть распознана", bot.CRYPTOBOT_TESTNET is True)
-    check("валюта счёта берётся из переменной", bot.CRYPTOBOT_ASSET == "TON")
+    bot3 = new_bot({"mode": "freekassa", "merchant": None, "secret1": None, "secret2": None}, store_file)
+    try:
+        await bot3.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        check("без ключей магазина ссылка не выдаётся", False)
+    except bot3.PaymentError as exc:
+        text = str(exc)
+        check("подсказано, какие переменные задать",
+              all(name in text for name in ("FREEKASSA_MERCHANT_ID", "FREEKASSA_SECRET1", "FREEKASSA_SECRET2")),
+              " ".join(text.split())[:80])
+        check("подсказана команда проверки настроек", "/freekassa_check" in text)
 
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
-    params = crypto_calls("createInvoice")[-1][2]
-    check("счёт выставлен в TON", params.get("asset") == "TON")
-    ton_price = bot.TARIFFS["basic"]["price"]
-    ton_amount = bot.crypto_amount_for_rub(ton_price, 300, "TON")
-    check(f"сумма по курсу 300 ₽/TON: {ton_price} ₽ → {ton_amount}",
-          params.get("amount") == ton_amount, str(params.get("amount")))
-    text = [m["params"].get("text", "") for m in tg_calls("sendMessage")][-1]
-    check("в счёте есть пометка тестовой сети", "Тестовая сеть" in text)
-
-    order_id = params["payload"]
-    invoice_id = (await bot.payment_store.get(order_id))["invoice_id"]
-    crypto_pay(invoice_id)
-    check("в тестовой сети ключ тоже выдаётся",
-          await bot.crypto_poll_once() == 1 and panel_client(f"tg-paid-{TG_TG_ID}") is not None)
-
-    stats = bot.payment_store.stats()
-    check("статистика считает крипту отдельно", stats["crypto"] == {"TON": float(ton_amount)},
-          str(stats["crypto"]))
-    check("выручка в рублёвом эквиваленте учтена", stats["crypto_rub"] == ton_price)
-
-    msg = make_message(bot, text="/panel_debug")
-    await bot.cmd_panel_debug(msg)
-    diag = _last_api_text()
-    check("/panel_debug: показана тестовая сеть", "тестовая сеть" in diag)
-    check("/panel_debug: показана валюта счёта", "TON" in diag)
-    check("/panel_debug: показан вебхук", "cryptobot/webhook" in diag)
-    check("/panel_debug: показан опрос API", "Опрос API" in diag)
-    check("/panel_debug: показано приложение Crypto Pay", "VPN Shop" in diag)
-
-    msg = make_message(bot, text="/payments")
-    await bot.cmd_payments(msg)
-    payments_text = _last_api_text()
-    check("/payments: режим крипты", "CryptoBot" in payments_text or "крипт" in payments_text.lower())
-    check("/payments: выручка в крипте", "TON" in payments_text)
-
-
-async def test_crypto_errors(store_file):
-    print("\n▶ 8в. Крипта: понятные ошибки вместо трейсбеков")
     reset_all()
-    bot = new_bot({"mode": "crypto", "crypto_token": None}, store_file)
+    bot4 = new_bot({"mode": "freekassa", "secret2": None}, store_file)
+    answer, note = await bot4.process_freekassa_notification(
+        {"MERCHANT_ID": FK_MERCHANT_ID, "AMOUNT": "249", "MERCHANT_ORDER_ID": "basic-1-2-ab12cd",
+         "SIGN": fk_sign_notify("basic-1-2-ab12cd", 249)})
+    check("без второго секретного слова уведомление честно не подтверждается",
+          answer == "no" and "FREEKASSA_SECRET2" in note, note)
+
+
+async def test_freekassa_test_mode_and_diagnostics(store_file):
+    print("\n▶ 8б. FreeKassa: тестовый режим и диагностика")
+    reset_all()
+    bot = new_bot({"mode": "freekassa", "fk_test": "1", "admin_tools": "1"}, store_file)
+    check("тестовый режим распознан", bot.FREEKASSA_TEST is True)
+    check("в тестовом режиме проверочные команды включаются сами", bot.test_pay_enabled() is True)
+
+    runner = await bot.run_webhook_server()
     try:
         await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
-        check("без CRYPTOBOT_TOKEN счёт не создаётся", False)
-    except bot.PaymentError as exc:
-        check("без CRYPTOBOT_TOKEN подсказан @CryptoBot → /pay",
-              "CRYPTOBOT_TOKEN" in str(exc) and "/pay" in str(exc))
+        text = [m["params"].get("text", "") for m in tg_calls("sendMessage")][-1]
+        check("в счёте есть пометка тестового режима", "Тестовый режим FreeKassa" in text, text[-90:])
 
-    reset_all()
-    CRYPTO["token_broken"] = True
-    bot = new_bot({"mode": "crypto"}, store_file)
-    try:
-        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
-        check("неверный токен обрабатывается", False)
-    except bot.PaymentError as exc:
-        check("ошибка 401 от Crypto Pay понятна пользователю",
-              "UNAUTHORIZED" in str(exc) and "CRYPTOBOT_TOKEN" in str(exc), " ".join(str(exc).split())[:70])
-    CRYPTO["token_broken"] = False
+        order = [o for o in bot.payment_store.orders.values()][-1]
+        status, body = await post_fk_notification(order["id"], order["amount_rub"], intid="700001")
+        check("в тестовом режиме ключ тоже выдаётся",
+              body.strip() == "YES" and panel_client(f"tg-paid-{TG_TG_ID}") is not None)
 
-    reset_all()
-    bot = new_bot({"mode": "crypto", "api_url": None}, store_file)
-    bot.CRYPTOBOT_API_URL = "http://127.0.0.1:9/api"
-    try:
-        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
-        check("недоступность Crypto Pay обрабатывается", False)
-    except bot.PaymentError as exc:
-        check("недоступность Crypto Pay → понятная ошибка", "недоступен" in str(exc))
+        stats = bot.payment_store.stats()
+        check("оплата FreeKassa попала в рублёвую выручку",
+              stats["paid_count"] == 1 and stats["rub"] == order["amount_rub"], str(stats))
+
+        msg = make_message(bot, text="/panel_debug")
+        await bot.cmd_panel_debug(msg)
+        diag = _last_api_text()
+        check("/panel_debug: показан магазин FK", FK_MERCHANT_ID in diag)
+        check("/panel_debug: показан тестовый режим", "тестовый режим" in diag)
+        check("/panel_debug: показан адрес уведомлений", "/freekassa/webhook" in diag)
+        check("/panel_debug: показана валюта и формула подписи", "RUB" in diag and "currency" in diag)
+        check("/panel_debug: подсказана проверка без оплаты", "/freekassa_check" in diag)
+
+        msg = make_message(bot, text="/payments")
+        await bot.cmd_payments(msg)
+        payments_text = _last_api_text()
+        check("/payments: показан режим FreeKassa", "FreeKassa" in payments_text)
+        check("/payments: показан магазин", FK_MERCHANT_ID in payments_text)
+        check("/payments: показана выручка в рублях", "Выручка" in payments_text)
+    finally:
+        await runner.cleanup()
 
 
 async def test_duplicate_guard(store_file):
     print("\n▶ 7б. Защита от повторной выдачи по комментарию клиента")
     reset_all()
-    bot = new_bot({"mode": "crypto"}, store_file)
+    bot = new_bot({"mode": "freekassa"}, store_file)
 
-    comment = "basic до 17.10.2026 | cryptobot-1"
+    comment = "basic до 17.10.2026 | fk-123456"
     check("полный ref из комментария распознаётся",
-          bot.comment_has_payment_ref(comment, "cryptobot-1") is True)
-    check("короткий номер счёта не совпадает с цифрами даты (баг «2» в «17.10.2026»)",
+          bot.comment_has_payment_ref(comment, "fk-123456") is True)
+    check("короткий номер операции не совпадает с цифрами даты (баг «2» в «17.10.2026»)",
           bot.comment_has_payment_ref(comment, "2") is False)
     check("пустой ref не считается совпадением", bot.comment_has_payment_ref(comment, "") is False)
-    check("пустой комментарий не считается совпадением", bot.comment_has_payment_ref(None, "cryptobot-1") is False)
+    check("пустой комментарий не считается совпадением", bot.comment_has_payment_ref(None, "fk-123456") is False)
     check("старый формат комментария (без «|») тоже проверяется",
           bot.comment_has_payment_ref("tg-charge-1", "tg-charge-1") is True)
 
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
-    order_id = crypto_calls("createInvoice")[-1][2]["payload"]
-    invoice_id = (await bot.payment_store.get(order_id))["invoice_id"]
-    crypto_pay(invoice_id)
-    check("опрос API выдал ключ по первой оплате", await bot.crypto_poll_once() == 1)
-    check("первая оплата выдала ключ", panel_client(f"tg-paid-{TG_TG_ID}") is not None)
+    runner = await bot.run_webhook_server()
+    email = f"tg-paid-{TG_TG_ID}"
+    try:
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        order = [o for o in bot.payment_store.orders.values()][-1]
+        await post_fk_notification(order["id"], order["amount_rub"], intid="123456")
+        check("первая оплата выдала ключ", panel_client(email) is not None)
 
-    expiry_after_first = int(panel_client(f"tg-paid-{TG_TG_ID}")["expiryTime"])
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "family")
-    order2 = crypto_calls("createInvoice")[-1][2]["payload"]
-    invoice2 = (await bot.payment_store.get(order2))["invoice_id"]
-    crypto_pay(invoice2, amount=(await bot.payment_store.get(order2))["amount_asset"])
-    cb = _FakeCallback(bot, f"checkpay_{order2}")
-    await bot.cb_check_payment(cb)
-    extended = int(panel_client(f"tg-paid-{TG_TG_ID}")["expiryTime"])
-    family_days = bot.TARIFFS["family"]["days"]
-    check(f"кнопка «Проверить оплату» продлевает подписку на {family_days} дней",
-          round((extended - expiry_after_first) / 86_400_000, 1) == family_days,
-          f"прибавка {round((extended - expiry_after_first) / 86_400_000, 1)} дн.")
-    check("в комментарии клиента — полный id платежа",
-          "cryptobot-" in panel_client(f"tg-paid-{TG_TG_ID}")["comment"])
+        expiry_after_first = int(panel_client(email)["expiryTime"])
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "family")
+        order2 = [o for o in bot.payment_store.orders.values()][-1]
+
+        cb = _FakeCallback(bot, f"checkpay_{order2['id']}")
+        await bot.cb_check_payment(cb)
+        check("без уведомления оплата не подтверждается",
+              int(panel_client(email)["expiryTime"]) == expiry_after_first)
+
+        await post_fk_notification(order2["id"], order2["amount_rub"], intid="123457")
+        extended = int(panel_client(email)["expiryTime"])
+        family_days = bot.TARIFFS["family"]["days"]
+        check(f"уведомление продлевает подписку на {family_days} дней",
+              round((extended - expiry_after_first) / 86_400_000, 1) == family_days,
+              f"прибавка {round((extended - expiry_after_first) / 86_400_000, 1)} дн.")
+        check("в комментарии клиента — номер последней операции FreeKassa",
+              "fk-123457" in str(panel_client(email)["comment"]), str(panel_client(email)["comment"]))
+    finally:
+        await runner.cleanup()
 
 
-async def test_crypto_stats_and_labels(store_file):
-    print("\n▶ 8г. Крипта: подписи тарифов и журнал заказов")
+async def test_freekassa_stats_and_labels(store_file):
+    print("\n▶ 8г. FreeKassa: подписи тарифов и журнал заказов")
     reset_all()
-    bot = new_bot({"mode": "crypto", "crypto_rate": "100"}, store_file)
-    label = bot.tariff_price_label(bot.TARIFFS["premium"])
-    check("при известном курсе цена показывается в рублях и крипте", "₽" in label, label)
-    check("в крипто-режиме бесплатный тариф остаётся бесплатным",
+    bot = new_bot({"mode": "freekassa"}, store_file)
+    premium_price = bot.TARIFFS["premium"]["price"]
+    check("цена тарифа показывается в рублях",
+          bot.tariff_price_label(bot.TARIFFS["premium"]) == f"{premium_price} ₽",
+          bot.tariff_price_label(bot.TARIFFS["premium"]))
+    check("бесплатный тариф остаётся бесплатным",
           bot.tariff_price_label(bot.TARIFFS["trial"]) == "Бесплатно")
 
     await bot.start_checkout(TG_TG_ID, TG_TG_ID, "premium")
-    order_id = crypto_calls("createInvoice")[-1][2]["payload"]
-    store_file_path = (await bot.payment_store.get(order_id))
+    order = [o for o in bot.payment_store.orders.values()][-1]
     check("заказ сохранён на диск", os.path.exists(store_file))
-    premium_amount = bot.crypto_amount_for_rub(bot.TARIFFS["premium"]["price"], 100.0, "USDT")
-    check("в заказе есть валюта, сумма и курс",
-          store_file_path.get("currency") == "USDT" and store_file_path.get("amount_asset") == premium_amount
-          and float(store_file_path.get("rate_rub")) == 100.0, str(store_file_path.get("amount_asset")))
+    check("в заказе рублёвая валюта, режим freekassa и ссылка на оплату",
+          order["currency"] == "RUB" and order["mode"] == "freekassa"
+          and order["payment_url"].startswith(bot.FREEKASSA_PAY_URL))
 
-    # Неоплаченный заказ не попадает в выручку
     stats = bot.payment_store.stats()
-    check("неоплаченный заказ не в выручке", stats["paid_count"] == 0 and stats["crypto"] == {})
+    check("неоплаченный заказ не попадает в выручку",
+          stats["paid_count"] == 0 and stats["rub"] == 0, str(stats))
+
+    answer, _ = await bot.process_freekassa_notification(
+        fk_params(order["id"], premium_price, intid="321321"))
+    stats = bot.payment_store.stats()
+    check("оплаченный заказ попадает в рублёвую выручку",
+          answer == "YES" and stats["rub"] == premium_price and stats["paid_count"] == 1, str(stats))
+    check("в разбивке по тарифам учтён premium", stats["by_tariff"].get("premium") == 1, str(stats["by_tariff"]))
 
 
 # ---------------- сценарии: общие (продолжение) ----------------
@@ -1337,22 +1291,21 @@ async def test_simulated_payment(store_file):
     email = f"tg-paid-{TG_TG_ID}"
 
     # По умолчанию (боевой режим) проверка выключена
-    bot = new_bot({"mode": "crypto", "allow_test_pay": None}, store_file)
+    bot = new_bot({"mode": "freekassa", "allow_test_pay": None}, store_file)
     check("в боевом режиме проверка без оплаты по умолчанию выключена", bot.test_pay_enabled() is False)
     msg = make_message(bot, text="/test_pay basic")
     await bot.cmd_test_pay(msg)
     check("выключенная проверка подсказывает переменную",
           "PAYMENTS_ALLOW_TEST_PAY=1" in _last_api_text() and panel_client(email) is None)
 
-    # В тестовой сети Crypto Pay включается автоматически
+    # В тестовом режиме FreeKassa включается автоматически
     reset_all()
-    bot = new_bot({"mode": "crypto", "crypto_testnet": "1",
-                   "crypto_api_url": f"http://127.0.0.1:{CRYPTO_PORT}/testnet/api"}, store_file)
-    check("в тестовой сети Crypto Pay проверка включается сама", bot.test_pay_enabled() is True)
+    bot = new_bot({"mode": "freekassa", "fk_test": "1"}, store_file)
+    check("в тестовом режиме FreeKassa проверка включается сама", bot.test_pay_enabled() is True)
 
     # Включённая проверка: полный путь выдачи без денег
     reset_all()
-    bot = new_bot({"mode": "crypto", "allow_test_pay": "1"}, store_file)
+    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1"}, store_file)
     check("проверка включена переменной PAYMENTS_ALLOW_TEST_PAY", bot.test_pay_enabled() is True)
 
     msg = make_message(bot, text="/test_pay")
@@ -1384,14 +1337,11 @@ async def test_simulated_payment(store_file):
     check("заказ помечен тестовым", len(orders) == 1 and orders[0]["mode"] == "test")
     stats = bot.payment_store.stats()
     check("тестовая выдача НЕ попала в выручку",
-          stats["paid_count"] == 0 and stats["rub"] == 0 and stats["stars"] == 0 and stats["crypto"] == {},
+          stats["paid_count"] == 0 and stats["rub"] == 0 and stats["stars"] == 0,
           f"paid_count={stats['paid_count']}")
 
-    check("счёт в Crypto Pay не создавался (денег не нужно)",
-          not crypto_calls("createInvoice") and not crypto_calls("getInvoices"))
-
-    issued = await bot.crypto_poll_once()
-    check("опрос оплат не трогает тестовый заказ", issued == 0)
+    check("ссылка на оплату в FreeKassa не создавалась (денег не нужно)",
+          not [o for o in bot.payment_store.orders.values() if o.get("payment_url")])
 
     # Кнопка выбора тарифа: пока тестовый ключ на месте — проверка отказывается его портить
     cb = _FakeCallback(bot, "testpay_run_family")
@@ -1420,7 +1370,7 @@ async def test_simulated_payment(store_file):
 
     # Защита: обычный пользователь не может ни выдать, ни удалить
     reset_all()
-    bot = new_bot({"mode": "crypto", "allow_test_pay": "1"}, store_file)
+    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1"}, store_file)
     other = make_message(bot, uid=777, text="/test_pay basic")
     await bot.cmd_test_pay(other)
     check("обычному пользователю /test_pay недоступна",
@@ -1432,7 +1382,7 @@ async def test_simulated_payment(store_file):
           cb.answers and "Только для администратора" in cb.answers[0])
 
     await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
-    order_real = crypto_calls("createInvoice")[-1][2]["payload"]
+    order_real = [o for o in bot.payment_store.orders.values()][-1]["id"]
     cb = _FakeCallback(bot, f"testpay_del_{order_real}")
     await bot.cb_testpay_del(cb)
     check("кнопка удаления не трогает настоящие (не тестовые) заказы",
@@ -1440,13 +1390,13 @@ async def test_simulated_payment(store_file):
 
     # Настоящую подписку проверочная выдача не трогает
     reset_all()
-    bot = new_bot({"mode": "crypto", "allow_test_pay": "1"}, store_file)
+    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1"}, store_file)
     await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
-    real_order = crypto_calls("createInvoice")[-1][2]["payload"]
-    real_invoice = (await bot.payment_store.get(real_order))["invoice_id"]
-    crypto_pay(real_invoice)
-    await bot.crypto_poll_once()
-    check("для проверки защиты настоящая оплата прошла", panel_client(email) is not None)
+    real_order = [o for o in bot.payment_store.orders.values()][-1]
+    answer, _ = await bot.process_freekassa_notification(
+        fk_params(real_order["id"], real_order["amount_rub"], intid="909090"))
+    check("для проверки защиты настоящая оплата прошла",
+          answer == "YES" and panel_client(email) is not None)
     real_expiry = int(panel_client(email)["expiryTime"])
 
     simulated_before = len([o for o in bot.payment_store.orders.values() if o.get("simulated")])
@@ -1472,13 +1422,13 @@ async def test_admin_access(store_file):
     reset_all()
 
     # Один админ
-    bot = new_bot({"mode": "crypto", "allow_test_pay": "1", "admin_id": str(TG_TG_ID)}, store_file)
+    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1", "admin_id": str(TG_TG_ID)}, store_file)
     check("один ID: владелец — админ", bot.is_admin(TG_TG_ID) is True)
     check("один ID: чужой — не админ", bot.is_admin(777) is False)
 
     # Несколько админов через запятую
     reset_all()
-    bot = new_bot({"mode": "crypto", "allow_test_pay": "1", "admin_id": f"{TG_TG_ID}, 777"}, store_file)
+    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1", "admin_id": f"{TG_TG_ID}, 777"}, store_file)
     check("список ID: первый админ", bot.is_admin(TG_TG_ID) is True)
     check("список ID: второй админ", bot.is_admin(777) is True)
     check("список ID: посторонний не админ", bot.is_admin(999) is False)
@@ -1486,28 +1436,28 @@ async def test_admin_access(store_file):
 
     # Странности формата
     reset_all()
-    bot = new_bot({"mode": "crypto", "admin_id": f" +{TG_TG_ID} ; 777 ", "allow_test_pay": "1"}, store_file)
+    bot = new_bot({"mode": "freekassa", "admin_id": f" +{TG_TG_ID} ; 777 ", "allow_test_pay": "1"}, store_file)
     check("плюс, точка с запятой и пробелы не мешают", bot.ADMIN_IDS == [TG_TG_ID, 777], str(bot.ADMIN_IDS))
 
     reset_all()
-    bot = new_bot({"mode": "crypto", "admin_id": "@username", "allow_test_pay": "1"}, store_file)
+    bot = new_bot({"mode": "freekassa", "admin_id": "@username", "allow_test_pay": "1"}, store_file)
     check("мусорный ADMIN_ID: не блокирует владельца (команды открыты), как и у старых команд",
           bot.is_admin(TG_TG_ID) is True and bot.ADMIN_IDS == [])
 
     reset_all()
-    bot = new_bot({"mode": "crypto", "admin_id": "", "allow_test_pay": "1"}, store_file)
+    bot = new_bot({"mode": "freekassa", "admin_id": "", "allow_test_pay": "1"}, store_file)
     check("пустой ADMIN_ID: команды открыты всем (бот предупредит при старте)", bot.is_admin(777) is True)
 
     # Второй админ из списка может работать с командой
     reset_all()
-    bot = new_bot({"mode": "crypto", "allow_test_pay": "1", "admin_id": f"{TG_TG_ID},777"}, store_file)
+    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1", "admin_id": f"{TG_TG_ID},777"}, store_file)
     msg = make_message(bot, uid=777, text="/test_pay basic")
     await bot.cmd_test_pay(msg)
     check("второй админ из списка получил ключ через /test_pay", panel_client("tg-paid-777") is not None)
 
     # Отказ содержит диагностику
     reset_all()
-    bot = new_bot({"mode": "crypto", "allow_test_pay": "1", "admin_id": str(TG_TG_ID)}, store_file)
+    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1", "admin_id": str(TG_TG_ID)}, store_file)
     msg = make_message(bot, uid=555, text="/test_pay basic")
     await bot.cmd_test_pay(msg)
     text = _last_api_text()
@@ -1519,7 +1469,7 @@ async def test_admin_access(store_file):
     # Некорректный ADMIN_ID (@username вместо ID): владельца не блокируем,
     # но честно говорим об этом в /myid — иначе легко решить, что «бот меня не признал»
     reset_all()
-    bot = new_bot({"mode": "crypto", "allow_test_pay": "1", "admin_id": "@username"}, store_file)
+    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1", "admin_id": "@username"}, store_file)
     check("мусорный ADMIN_ID не блокирует админ-команды (нельзя запереть себя вне бота)",
           bot.is_admin(555) is True)
     msg = make_message(bot, uid=555, text="/myid")
@@ -1530,14 +1480,14 @@ async def test_admin_access(store_file):
     check("/myid подсказывает формат списка админов", "111,222" in text)
 
     reset_all()
-    bot = new_bot({"mode": "crypto", "allow_test_pay": "1", "admin_id": ""}, store_file)
+    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1", "admin_id": ""}, store_file)
     msg = make_message(bot, uid=555, text="/myid")
     await bot.cmd_myid(msg)
     check("/myid отдельно сообщает, что ADMIN_ID не задана", "не задана" in _last_api_text())
 
     # /myid отвечает всем и объясняет статус
     reset_all()
-    bot = new_bot({"mode": "crypto", "admin_id": str(TG_TG_ID)}, store_file)
+    bot = new_bot({"mode": "freekassa", "admin_id": str(TG_TG_ID)}, store_file)
     msg = make_message(bot, uid=555, text="/myid")
     await bot.cmd_myid(msg)
     text = _last_api_text()
@@ -1555,61 +1505,45 @@ async def test_admin_access(store_file):
           "ADMIN_ID" in _last_api_text() and str(TG_TG_ID) in _last_api_text())
 
 
-async def test_crypto_self_check(store_file):
-    print("\n▶ 14. Проверка связки с Crypto Pay без денег (/crypto_check)")
+async def test_freekassa_self_check(store_file):
+    print("\n▶ 14. Проверка настроек FreeKassa без денег (/freekassa_check)")
     reset_all()
-    bot = new_bot({"mode": "crypto"}, store_file)
-
-    text = await bot.crypto_self_check()
-    check("в отчёте есть название приложения", "VPN Shop" in text)
-    check("в отчёте есть обрабатывающий бот", "CryptoBot" in text)
-    check("в отчёте есть курс", "95.5" in text, "курс из фейкового API")
-    check("счёт создан и сразу удалён", len(crypto_calls("createInvoice")) == 1 and bool(crypto_calls("deleteInvoice")))
-    created_id = str(CRYPTO["invoices"] and "" or "") or "1"
-    check("счёт проверки удалён именно тот, что создан", CRYPTO["deleted"] == [created_id],
-          f"удалено: {CRYPTO['deleted']}")
-    check("отчёт объясняет, что платить не нужно", "платить" in text.lower())
-    check("отчёт подсказывает /test_pay", "/test_pay" in text)
-    params = crypto_calls("createInvoice")[-1][2]
-    min_price = min(t["price"] for t in bot.TARIFFS.values() if t["price"] > 0)
-    min_amount = bot.crypto_amount_for_rub(min_price, 95.5, "USDT")
-    check(f"проверочный счёт — на минимальный платный тариф ({min_price} ₽ → {min_amount})",
-          params.get("amount") == min_amount, f"amount={params.get('amount')}")
-
-    msg = make_message(bot, text="/crypto_check")
-    await bot.cmd_crypto_check(msg)
-    check("команда /crypto_check присылает отчёт", "Проверка Crypto Pay" in _last_api_text())
-
-    other = make_message(bot, uid=777, text="/crypto_check")
-    await bot.cmd_crypto_check(other)
-    check("обычному пользователю /crypto_check недоступна", "только администратору" in _last_api_text())
+    bot = new_bot({"mode": "freekassa", "merchant": None, "secret1": None, "secret2": None}, store_file)
+    text = await bot.freekassa_self_check()
+    check("без ключей отчёт объясняет, где их взять",
+          "FREEKASSA_MERCHANT_ID" in text and "Настройки магазина" in text)
 
     reset_all()
-    CRYPTO["token_broken"] = True
-    bot = new_bot({"mode": "crypto"}, store_file)
-    text = await bot.crypto_self_check()
-    check("неверный токен: понятная ошибка с подсказкой", "UNAUTHORIZED" in text and "CRYPTOBOT_TOKEN" in text)
-    CRYPTO["token_broken"] = False
+    bot = new_bot({"mode": "freekassa"}, store_file)
+    runner = await bot.run_webhook_server()
+    try:
+        text = await bot.freekassa_self_check()
+        check("отчёт показывает магазин", FK_MERCHANT_ID in text)
+        check("отчёт подтверждает обе подписи", text.count("✅") >= 2, f"✅ ×{text.count('✅')}")
+        check("отчёт показывает URL оповещения для кабинета FK",
+              f"http://127.0.0.1:{WEBHOOK_PORT}/freekassa/webhook" in text)
+        check("отчёт показывает адрес возврата на бота", "t.me/" in text)
+        check("отчёт напоминает про «Подтверждение заявки»", "Подтверждение заявки" in text)
+        check("отчёт подсказывает следующий шаг /test_pay", "/test_pay" in text)
+        check("самопроверка сервера прошла (healthz отвечает)", "Самопроверка сервера: ✅" in text, text[-200:])
+
+        msg = make_message(bot, text="/freekassa_check")
+        await bot.cmd_freekassa_check(msg)
+        check("команда /freekassa_check присылает отчёт", "Проверка FreeKassa" in _last_api_text())
+
+        other = make_message(bot, uid=777, text="/freekassa_check")
+        await bot.cmd_freekassa_check(other)
+        check("обычному пользователю /freekassa_check недоступна",
+              "только администратору" in _last_api_text())
+    finally:
+        await runner.cleanup()
 
     reset_all()
-    bot = new_bot({"mode": "crypto", "crypto_token": None}, store_file)
-    text = await bot.crypto_self_check()
-    check("без токена отчёт объясняет, где его взять", "/pay" in text and "CRYPTOBOT_TOKEN" in text)
-
-    reset_all()
-    bot = new_bot({"mode": "crypto", "crypto_asset": "TON", "crypto_rate": "300"}, store_file)
-    text = await bot.crypto_self_check()
-    min_price_ton = min(t["price"] for t in bot.TARIFFS.values() if t["price"] > 0)
-    min_amount_ton = bot.crypto_amount_for_rub(min_price_ton, 300, "TON")
-    check("проверка работает для другой валюты (TON)",
-          "TON" in text and min_amount_ton in text, text[:120])
-
-    reset_all()
-    bot = new_bot({"mode": "stars"}, store_file)
-    msg = make_message(bot, text="/crypto_check")
-    await bot.cmd_crypto_check(msg)
+    bot_stars = new_bot({"mode": "stars"}, store_file)
+    msg = make_message(bot_stars, text="/freekassa_check")
+    await bot_stars.cmd_freekassa_check(msg)
     check("в другом режиме команда честно говорит, что не нужна",
-          "только для режима крипты" in _last_api_text())
+          "режим оплаты" in _last_api_text())
 
 
 async def test_panel_debug(store_file):
@@ -1687,7 +1621,7 @@ async def _get_healthz():
 async def main():
     runners = []
     for port, app in ((PANEL_PORT, make_app()), (TG_PORT, make_tg_app()),
-                      (YK_PORT, make_yk_app()), (CRYPTO_PORT, make_crypto_app())):
+                      (YK_PORT, make_yk_app())):
         runner = web.AppRunner(app)
         await runner.setup()
         await web.TCPSite(runner, "127.0.0.1", port).start()
@@ -1708,19 +1642,18 @@ async def main():
         await test_yookassa_flow(store_for("yookassa"))
         await test_receipt_optional(store_for("yookassa_vat"))
         await test_yookassa_oauth_webhook(store_for("yookassa_oauth"))
-        await test_crypto_rates()
-        await test_crypto_flow(store_for("crypto"))
-        await test_duplicate_guard(store_for("crypto_dup"))
-        await test_crypto_poller_and_button(store_for("crypto_poll"))
-        await test_crypto_testnet_and_diagnostics(store_for("crypto_testnet"))
-        await test_crypto_errors(store_for("crypto_errors"))
-        await test_crypto_stats_and_labels(store_for("crypto_stats"))
+        await test_freekassa_signatures()
+        await test_freekassa_flow(store_for("freekassa"))
+        await test_duplicate_guard(store_for("freekassa_dup"))
+        await test_freekassa_ip_check_and_errors(store_for("freekassa_ip"))
+        await test_freekassa_test_mode_and_diagnostics(store_for("freekassa_test"))
+        await test_freekassa_stats_and_labels(store_for("freekassa_stats"))
         await test_yookassa_button_and_revoke(store_for("yookassa_btn"))
         await test_persistence_and_off(store_for("persist"))
         await test_diagnostics(store_for("diag"))
         await test_panel_debug(store_for("debug"))
         await test_simulated_payment(store_for("simulate"))
-        await test_crypto_self_check(store_for("selfcheck"))
+        await test_freekassa_self_check(store_for("selfcheck"))
         await test_admin_access(store_for("admin"))
     finally:
         for runner in runners:
