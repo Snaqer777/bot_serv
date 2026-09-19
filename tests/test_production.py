@@ -447,7 +447,8 @@ async def test_terms_in_bot():
           "противоправных действий" in text and "заблокирован без возврата средств" in text)
     check("описана обработка персональных данных",
           "Telegram ID" in text and "не передаются третьим лицам" in text)
-    check("оплата: CryptoBot и Telegram Stars", "CryptoBot" in text and "Telegram Stars" in text)
+    check("оплата: банковская карта, СБП и Telegram Stars",
+          "банковская карта" in text and "СБП" in text and "Telegram Stars" in text)
     check("теги HTML закрыты",
           text.count("<b>") == text.count("</b>") and text.count("<i>") == text.count("</i>")
           and text.count("<blockquote expandable>") == 1 and text.count("</blockquote>") == 1)
@@ -504,6 +505,11 @@ async def test_terms_file_matches_bot():
     check("ключевые обещания бота и документа совпадают",
           "акцепт оферты" in bot_text and "акцепт оферты" in doc
           and "24 часов" in bot_text and "24 часов" in doc)
+    check("способы оплаты в соглашении названы актуально (карта, СБП, Stars)",
+          "банковская карта" in bot_text and "СБП" in bot_text
+          and "банковская карта" in doc and "СБП" in doc)
+    check("в соглашении не осталось старых платёжных систем (CryptoBot)",
+          "CryptoBot" not in bot_text and "CryptoBot" not in doc)
 
 
 async def test_terms_gate():

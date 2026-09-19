@@ -646,7 +646,7 @@ pip install -r requirements.txt pyotp
 
 python tests/test_payments.py   # оплата: Stars, BotFather, ЮKassa, FreeKassa — 283 проверки
 python tests/test_help.py       # пошаговая инструкция подключения и её кнопки — 74 проверки
-python tests/test_production.py # боевой вид (ADMIN_TOOLS, TRIAL_PUBLIC, TRIAL_BUTTON, TERMS_ACCEPT) — 113 проверок
+python tests/test_production.py # боевой вид (ADMIN_TOOLS, TRIAL_PUBLIC, TRIAL_BUTTON, TERMS_ACCEPT) — 115 проверок
 python tests/test_referral.py   # реферальная программа: ссылка → друг → оплата → дни — 48 проверок
 python tests/test_groups.py     # группы клиентов 3x-ui 3.2+ — 45 проверок
 python tests/test_2fa.py        # 2FA (Google Authenticator) и вход в панель — 30 проверок
