@@ -2536,6 +2536,58 @@ def payments_mode_title() -> str:
     }.get(PAYMENTS_MODE, PAYMENTS_MODE)
 
 
+def payments_diag_text() -> str:
+    """
+    Короткая диагностика оплаты для /myid: что настроено и почему молчат проверки.
+
+    /myid доступна всегда, даже при ADMIN_TOOLS=0, поэтому именно здесь видно,
+    из-за какой переменной /test_pay и /freekassa_check не отвечают.
+    """
+    lines = [f"💳 <b>Оплата:</b> {escape(payments_mode_title())} (<code>{PAYMENTS_MODE}</code>)"]
+
+    if PAYMENTS_MODE == "freekassa":
+        shop = FREEKASSA_MERCHANT_ID or "не задан ❌"
+        secrets = "заданы ✅" if (FREEKASSA_SECRET1 and FREEKASSA_SECRET2) else "НЕ заданы ❌"
+        lines.append(f"• Магазин FK: <code>{escape(shop)}</code>, секретные слова: {secrets}")
+        if FREEKASSA_TEST:
+            lines.append("• Тестовый режим FK: включён 🧪 (реальные деньги не списываются)")
+        if PUBLIC_BASE_URL:
+            lines.append(f"• URL оповещения: <code>{escape(PUBLIC_BASE_URL + '/freekassa/webhook')}</code>")
+        else:
+            lines.append(
+                "• URL оповещения: ⚠️ нет публичного адреса — Railway → Settings → "
+                "Networking → <b>Generate Domain</b> (или задай <code>PUBLIC_BASE_URL</code>)"
+            )
+    elif PAYMENTS_MODE == "stars":
+        lines.append(f"• Цена в звёздах: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (меняется <code>STARS_RUB_RATE</code>)")
+    elif PAYMENTS_MODE == "yookassa":
+        lines.append(f"• Магазин ЮKassa: <code>{escape(YOOKASSA_SHOP_ID or 'не задан')}</code>, "
+                     f"ключ {'задан ✅' if YOOKASSA_SECRET_KEY else 'НЕ задан ❌'}")
+    elif PAYMENTS_MODE == "provider":
+        lines.append(f"• Токен BotFather: {'задан ✅' if PAYMENT_PROVIDER_TOKEN else 'НЕ задан ❌'}")
+
+    if test_tools_enabled():
+        lines.append("• Проверки оплаты: <b>включены</b> ✅ — /test_pay, /freekassa_check")
+    else:
+        need = []
+        if not ADMIN_TOOLS:
+            need.append("<code>ADMIN_TOOLS=1</code>")
+        if TEST_TOOLS_RAW in ("0", "false", "no", "off"):
+            need.append("<code>TEST_TOOLS=1</code> или убрать эту переменную")
+        elif not test_pay_enabled():
+            need.append("<code>FREEKASSA_TEST=1</code> (или <code>PAYMENTS_ALLOW_TEST_PAY=1</code>)")
+        lines.append(
+            "• Проверки оплаты: <b>скрыты</b> — /test_pay и /freekassa_check не отвечают.\n"
+            "  Чтобы включить, поставь в Railway → Variables: " + ", ".join(need) + "."
+        )
+    if not ADMIN_TOOLS:
+        lines.append(
+            "• Служебные команды (/payments, /panel_debug, /groups): скрыты "
+            "(<code>ADMIN_TOOLS=0</code>)"
+        )
+    return "\n".join(lines)
+
+
 def format_date(timestamp_ms: int) -> str:
     """Дата окончания подписки в часовом поясе бота."""
     return datetime.fromtimestamp(timestamp_ms / 1000, tz=LOCAL_TZ).strftime("%d.%m.%Y")
@@ -4372,6 +4424,9 @@ async def cmd_myid(message: Message):
                 "но команда /test_vpn работает: 24 часа, 1 ГиБ. "
                 "Вернуть кнопки в меню и тарифы — <code>TRIAL_BUTTON=1</code>."
             )
+        # Владельцу видно состояние оплаты: именно тут понятно, почему /test_pay
+        # и /freekassa_check молчат или что не хватает для приёма денег.
+        status_text += "\n\n" + payments_diag_text()
     else:
         status_text = (
             f"ℹ️ Ты не в списке администраторов. Сейчас там: {admins}.\n"

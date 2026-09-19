@@ -288,7 +288,7 @@ FreeKassa — самый быстрый способ принимать рубл
   Нужен `PAYMENTS_ALLOW_TEST_PAY=1` (в тестовом режиме FreeKassa включается сам).
 - `/freekassa_check` — проверка настроек FreeKassa без денег: магазин, оба секретных слова,
   подписи, адрес вебхука, доступность сервера и памятка с полями для кабинета FK.
-- `python tests/test_payments.py` — полный прогон оплаты на фейковых API (283 проверки).
+- `python tests/test_payments.py` — полный прогон оплаты на фейковых API (296 проверок).
 
 ### Что происходит после оплаты
 
@@ -555,7 +555,7 @@ FreeKassa — самый быстрый способ принимать рубл
 | `/profile` | Все | Показывает подписку: статус, срок, трафик, действующий ключ |
 | `/payments` | Админ | Статистика оплат: режим, выручка, последние заказы |
 | `/revoke <telegram_id>` | Админ | Удаляет платную подписку из панели (возврат/блокировка) |
-| `/myid` | Все | Показывает ваш Telegram ID для настройки `ADMIN_ID` |
+| `/myid` | Все | Показывает ваш Telegram ID; администратору — ещё и состояние оплаты: режим, магазин FK, URL оповещения и почему скрыты проверки (`/test_pay`, `/freekassa_check`) |
 | `/test_pay [тариф]` | Админ | Проверяет выдачу ключа без оплаты (нужен `PAYMENTS_ALLOW_TEST_PAY=1`, в тестовом режиме FK включён сам) |
 | `/freekassa_check` | Админ | Проверяет настройки FreeKassa без денег: магазин, подписи, адрес вебхука, памятка по кабинету FK |
 
@@ -644,9 +644,9 @@ FreeKassa — самый быстрый способ принимать рубл
 ```bash
 pip install -r requirements.txt pyotp
 
-python tests/test_payments.py   # оплата: Stars, BotFather, ЮKassa, FreeKassa — 283 проверки
+python tests/test_payments.py   # оплата: Stars, BotFather, ЮKassa, FreeKassa — 296 проверок
 python tests/test_help.py       # пошаговая инструкция подключения и её кнопки — 74 проверки
-python tests/test_production.py # боевой вид (ADMIN_TOOLS, TRIAL_PUBLIC, TRIAL_BUTTON, TERMS_ACCEPT) — 115 проверок
+python tests/test_production.py # боевой вид (ADMIN_TOOLS, TRIAL_PUBLIC, TRIAL_BUTTON, TERMS_ACCEPT) — 116 проверок
 python tests/test_referral.py   # реферальная программа: ссылка → друг → оплата → дни — 48 проверок
 python tests/test_groups.py     # группы клиентов 3x-ui 3.2+ — 45 проверок
 python tests/test_2fa.py        # 2FA (Google Authenticator) и вход в панель — 30 проверок

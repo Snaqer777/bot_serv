@@ -204,7 +204,11 @@ async def test_production_look():
 
     myid = FakeMsg(uid=ADMIN_ID, text="/myid")
     await bot.cmd_myid(myid)
-    check("админ-подсказка /myid не отправляет в /test_pay", "/test_pay" not in myid.last)
+    # Владельцу /myid честно показывает, что проверки оплаты скрыты и какой переменной
+    # их вернуть — иначе молчание /test_pay выглядит как поломка бота.
+    check("админ-подсказка /myid говорит, что проверки оплаты скрыты",
+          "Проверки оплаты: <b>скрыты</b>" in myid.last and "/test_pay" in myid.last)
+    check("/myid называет причину: ADMIN_TOOLS=0", "ADMIN_TOOLS=1" in myid.last)
     check("/myid объясняет, как вернуть служебные команды",
           "ADMIN_TOOLS=1" in myid.last and "скрыты" in myid.last)
 
