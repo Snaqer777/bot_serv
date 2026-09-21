@@ -303,6 +303,7 @@ def new_bot(env, store_file, admins=None):
         "PAYMENTS_ALLOW_TEST_PAY": env.get("allow_test_pay"),
         "PROMO_ENABLED": env.get("promo_enabled"),
         "PROMO_ONCE": env.get("promo_once"),
+        "SUPPORT_USERNAME": env.get("support_username"),
         "SUB_URL_BASE": env.get("sub_url_base"),
         "SUB_PORT": env.get("sub_port"),
         "SUB_PATH": env.get("sub_path"),
@@ -1629,6 +1630,19 @@ async def test_myid_payments_diag(store_file):
     await bot.cmd_myid(make_message(bot, text="/myid"))
     text = _last_api_text()
     check("/myid: видно, что магазин не задан", "не задан ❌" in text)
+
+    # Контакт поддержки из переменной перекрывает стандартный — видно в /myid и в разделе
+    reset_all()
+    bot = new_bot({"mode": "freekassa", "admin_tools": "1",
+                   "support_username": "@Support_Test"}, store_file)
+    await bot.cmd_myid(make_message(bot, text="/myid"))
+    text = _last_api_text()
+    check("/myid: показан контакт из переменной SUPPORT_USERNAME",
+          "@Support_Test" in text and "из переменной" in text,
+          text[-140:].replace("\n", " | "))
+    check("собака в SUPPORT_USERNAME не мешает (лишний @ срезается)",
+          bot.SUPPORT_USERNAME == "Support_Test"
+          and bot.support_link() == "https://t.me/Support_Test", bot.support_link())
 
     # Обычному пользователю диагностика оплаты не показывается
     reset_all()

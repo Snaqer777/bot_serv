@@ -48,7 +48,7 @@
 
 ## 6. Контакты поддержки
 
-6.1. Служба поддержки работает через Telegram: [@Suppr_XYZ](https://t.me/Suppr_XYZ) — переменная `SUPPORT_USERNAME`.
+6.1. Служба поддержки работает через Telegram: [@Darktier_support](https://t.me/Darktier_support) — переменная `SUPPORT_USERNAME`.
 
 6.2. Электронная почта: [darktier.online@gmail.com](mailto:darktier.online@gmail.com) — переменная `SUPPORT_EMAIL`.
 

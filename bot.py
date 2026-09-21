@@ -405,8 +405,10 @@ BOT_USERNAME = (os.getenv("BOT_USERNAME") or "").strip().lstrip("@")
 # --- Сервис и документы ---
 # Название сервиса — подставляется в тексты (например, в соглашение).
 SERVICE_NAME = (os.getenv("SERVICE_NAME") or "VPN-сервис").strip()
-# Username поддержки без @ — куда писать пользователю. Используется и в соглашении.
-SUPPORT_USERNAME = (os.getenv("SUPPORT_USERNAME") or "Suppr_XYZ").strip().lstrip("@")
+# Username поддержки без @ — куда писать пользователю. Используется и в соглашении,
+# в разделе «Поддержка» и в кнопке «💬 Поддержка». Переменная SUPPORT_USERNAME
+# в Railway имеет приоритет: если она задана, в боте будет она, а не значение ниже.
+SUPPORT_USERNAME = (os.getenv("SUPPORT_USERNAME") or "Darktier_support").strip().lstrip("@")
 # Email поддержки — указывается в соглашении (раздел «Контакты поддержки») и в разделе «Поддержка».
 SUPPORT_EMAIL = (os.getenv("SUPPORT_EMAIL") or "darktier.online@gmail.com").strip()
 # Кто оказывает услугу (для соглашения): ИП/ООО/самозанятый и город.
@@ -4885,6 +4887,17 @@ async def cmd_myid(message: Message):
         # Владельцу видно состояние оплаты: именно тут понятно, почему /test_pay
         # и /freekassa_check молчат или что не хватает для приёма денег.
         status_text += "\n\n" + payments_diag_text()
+        # И какой контакт поддержки видят клиенты: переменная перекрывает стандартный.
+        support_source = (
+            "из переменной <code>SUPPORT_USERNAME</code>"
+            if (os.getenv("SUPPORT_USERNAME") or "").strip()
+            else "стандартный, переменная не задана"
+        )
+        status_text += (
+            f"\n\n💬 <b>Поддержка для клиентов:</b> "
+            f"<a href=\"{support_link()}\">@{escape(SUPPORT_USERNAME)}</a> "
+            f"— {support_source}."
+        )
     else:
         status_text = (
             f"ℹ️ Ты не в списке администраторов. Сейчас там: {admins}.\n"

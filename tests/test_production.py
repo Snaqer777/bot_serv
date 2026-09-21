@@ -531,6 +531,22 @@ async def test_terms_in_bot():
     check("поддержка берёт username из переменной SUPPORT_USERNAME",
           "@my_support" in sup.message.last and "Suppr_XYZ" not in sup.message.last)
 
+    # Без переменной поддержка должна вести на боевой контакт сервиса
+    plain = load_bot(8742, admins=str(ADMIN_ID), env={"SUPPORT_USERNAME": None})
+    check("стандартный контакт поддержки — @Darktier_support",
+          plain.SUPPORT_USERNAME == "Darktier_support"
+          and plain.support_link() == "https://t.me/Darktier_support",
+          f"{plain.SUPPORT_USERNAME} / {plain.support_link()}")
+    check("стандартный контакт виден в соглашении", "@Darktier_support" in plain.terms_text())
+    plain_sup = FakeCallback("support", FakeMsg())
+    await plain.cb_support(plain_sup)
+    check("стандартный контакт виден в разделе «Поддержка»",
+          "@Darktier_support" in plain_sup.message.last,
+          plain_sup.message.last[:90].replace("\n", " "))
+    check("кнопка «Поддержка» на экране соглашения ведёт на стандартный контакт",
+          "https://t.me/Darktier_support" in str(plain.terms_kb(ADMIN_ID).inline_keyboard),
+          str(plain.terms_kb(ADMIN_ID).inline_keyboard)[-160:])
+
     tariffs = FakeCallback("tariffs", FakeMsg())
     await bot.cb_tariffs(tariffs)
     check("на экране тарифов есть напоминание про условия", "/terms" in tariffs.message.last)
