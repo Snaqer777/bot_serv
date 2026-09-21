@@ -834,6 +834,7 @@ async def test_freekassa_flow(store_file):
               "pay.freekassa.ru//?" not in markup and "ru/?m=" in markup,
               markup[markup.find("pay.freekassa.ru"):][:48])
         check("есть кнопка «Проверить оплату»", "checkpay_" in markup)
+        check("есть кнопка «Отменить заказ»", "cancelorder_" in markup)
         check(f"в сообщении видна сумма ({basic_price} ₽)", f"{basic_price} ₽" in message.get("text", ""))
 
         order = [o for o in bot.payment_store.orders.values()][-1]
@@ -1661,6 +1662,63 @@ async def test_production_handlers(store_file):
           "тестовый режим" in _last_api_text())
 
 
+async def test_cancel_order(store_file):
+    print("\n▶ 14г. Отмена заказа: статус, проверка оплаты и позднее поступление денег")
+    reset_all()
+    bot = new_bot({"mode": "freekassa"}, store_file)
+    runner = await bot.run_webhook_server()
+    email = f"tg-paid-{TG_TG_ID}"
+
+    try:
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        order = [o for o in bot.payment_store.orders.values()][-1]
+        order_id = order["id"]
+        check("свежий заказ ждёт оплаты", order["status"] == "pending")
+
+        # Чужой пользователь отменить заказ не может
+        stranger = _FakeCallback(bot, f"cancelorder_{order_id}", uid=777)
+        await bot.cb_cancel_order(stranger)
+        check("чужой пользователь заказ не отменяет",
+              (await bot.payment_store.get(order_id))["status"] == "pending")
+        check("чужому пользователю сказано, что заказ не найден",
+              any("не найден" in a.lower() for a in stranger.answers))
+
+        cb = _FakeCallback(bot, f"cancelorder_{order_id}")
+        await bot.cb_cancel_order(cb)
+        check("заказ переведён в статус «отменён»",
+              (await bot.payment_store.get(order_id))["status"] == "canceled")
+        check("клиент увидел подтверждение отмены", "отменён" in " ".join(cb.answers).lower()
+              or any("отменён" in t.lower() for t in cb.message.sent))
+        check("в сообщении об отмене убрана ссылка на оплату",
+              "Оплатить" not in " ".join(cb.message.sent))
+
+        # Повторная отмена — без изменений
+        cb2 = _FakeCallback(bot, f"cancelorder_{order_id}")
+        await bot.cb_cancel_order(cb2)
+        check("повторная отмена сообщает, что заказ уже отменён",
+              any("уже отменён" in a.lower() for a in cb2.answers))
+
+        # «Проверить оплату» по отменённому заказу
+        cb3 = _FakeCallback(bot, f"checkpay_{order_id}")
+        await bot.cb_check_payment(cb3)
+        check("по отменённому заказу оплату не ищем",
+              any("отменён" in a.lower() for a in cb3.answers))
+
+        # Клиент всё-таки оплатил по старой ссылке — деньги не должны пропасть
+        status, body = await post_fk_notification(order_id, order["amount_rub"])
+        check("уведомление по отменённому заказу принято (YES)", body == "YES", body)
+        paid = await bot.payment_store.get(order_id)
+        check("заказ снова стал оплаченным", paid["status"] == "paid")
+        check("ключ выдан, несмотря на отмену", panel_client(email) is not None)
+        check("в заказе отмечено, что оплата пришла после отмены", paid.get("canceled_then_paid") is True)
+        notice = [c for c in tg_calls("sendMessage")
+                  if "отменён" in c["params"].get("text", "").lower()
+                  and "Оплата пришла" in c["params"].get("text", "")]
+        check("клиент предупреждён об оплате отменённого заказа", bool(notice))
+    finally:
+        await runner.cleanup()
+
+
 async def test_panel_debug(store_file):
     print("\n▶ 12. /panel_debug показывает состояние оплаты")
     reset_all()
@@ -1771,6 +1829,7 @@ async def main():
         await test_freekassa_self_check(store_for("selfcheck"))
         await test_myid_payments_diag(store_for("myid"))
         await test_production_handlers(store_for("prodhandlers"))
+        await test_cancel_order(store_for("cancelorder"))
         await test_admin_access(store_for("admin"))
     finally:
         for runner in runners:

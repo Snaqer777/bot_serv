@@ -2968,6 +2968,15 @@ async def process_freekassa_notification(params: dict) -> tuple[str, str]:
         return "no", "сумма платежа не совпадает с заказом"
 
     intid = str(params.get("intid") or "")
+    was_canceled = order.get("status") == "canceled"
+    if was_canceled:
+        # Клиент отменил заказ, но всё-таки оплатил по старой ссылке: деньги списаны,
+        # поэтому ключ выдаём, а не отказываем. Предупредим и клиента, и админа в логах.
+        logger.warning(
+            "FreeKassa: оплата по отменённому заказу %s — принимаю деньги и выдаю ключ "
+            "(при необходимости верните оплату в кабинете FK и снимите подписку /revoke).",
+            order["id"],
+        )
     if order.get("status") == "paid":
         # FK может повторить уведомление — ключ уже выдан, просто подтверждаем.
         logger.info("FreeKassa: повторное уведомление по заказу %s — уже оплачен", order["id"])
@@ -2989,6 +2998,20 @@ async def process_freekassa_notification(params: dict) -> tuple[str, str]:
     except Exception as exc:
         logger.error("FreeKassa: выдача по заказу %s не удалась: %s — ждём повтор уведомления", order["id"], exc)
         return "no", f"выдача ключа не удалась: {exc}"
+
+    if was_canceled:
+        await payment_store.update(order["id"], canceled_then_paid=True)
+        try:
+            await bot.send_message(
+                order["tg_id"],
+                "⚠️ <b>Оплата пришла по заказу, который был отменён.</b>\n\n"
+                "Деньги списаны, поэтому ключ выдан — доступ уже работает.\n"
+                f"<i>Номер заказа: <code>{escape(order['id'])}</code></i>\n\n"
+                "Если подписка не нужна, напиши в поддержку: оформим возврат.",
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.warning("Не удалось предупредить об оплате отменённого заказа %s: %s", order["id"], exc)
 
     return "YES", "оплата принята, ключ выдан"
 
@@ -3751,6 +3774,7 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
             inline_keyboard=[
                 [InlineKeyboardButton(text=f"💳 Оплатить {tariff['price']} ₽", url=pay_url)],
                 [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"checkpay_{order['id']}")],
+                [InlineKeyboardButton(text="❌ Отменить заказ", callback_data=f"cancelorder_{order['id']}")],
                 [InlineKeyboardButton(text="◀️ К тарифам", callback_data="tariffs")],
             ]
         )
@@ -3788,6 +3812,7 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
         inline_keyboard=[
             [InlineKeyboardButton(text=f"💳 Оплатить {tariff['price']} ₽", url=confirmation_url)],
             [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"checkpay_{order['id']}")],
+            [InlineKeyboardButton(text="❌ Отменить заказ", callback_data=f"cancelorder_{order['id']}")],
             [InlineKeyboardButton(text="◀️ К тарифам", callback_data="tariffs")],
         ]
     )
@@ -5172,6 +5197,57 @@ async def on_successful_payment(message: Message):
     logger.info("Заказ %s оплачен и выдан (режим %s).", order["id"], order["mode"])
 
 
+@dp.callback_query(F.data.startswith("cancelorder_"))
+async def cb_cancel_order(cb: CallbackQuery):
+    """
+    Отмена неоплаченного заказа.
+
+    Заказ получает статус canceled и пропадает из ожидающих: клиенту больше не нужно
+    ничего оплачивать, а ссылка в сообщении убирается, чтобы не заплатил случайно.
+    Важно: платёжную страницу FreeKassa это не «закрывает». Если клиент всё-таки
+    оплатит по старой ссылке, деньги списываются — в этом случае бот выдаст ключ
+    (см. process_freekassa_notification), чтобы оплата не пропала.
+    """
+    order_id = cb.data.removeprefix("cancelorder_")
+    order = await payment_store.get(order_id)
+
+    if order is None or order["tg_id"] != cb.from_user.id:
+        await cb.answer("Заказ не найден.", show_alert=True)
+        return
+    if order.get("status") == "paid":
+        await cb.answer("Заказ уже оплачен — отменить его нельзя.", show_alert=True)
+        return
+    if order.get("status") == "canceled":
+        await cb.answer("Заказ уже отменён.", show_alert=True)
+        return
+
+    await payment_store.update(order_id, status="canceled", canceled_at=int(time.time()))
+    logger.info("Заказ %s отменён пользователем %s", order_id, cb.from_user.id)
+    await cb.answer("Заказ отменён")
+
+    text = (
+        "❌ <b>Заказ отменён</b>\n\n"
+        "Оплачивать его больше не нужно — если деньги ещё не списаны, ничего не произойдёт.\n"
+        f"<i>Номер заказа: <code>{escape(order_id)}</code></i>\n\n"
+        "Захочешь вернуться — выбери тариф заново."
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💰 Тарифы", callback_data="tariffs")],
+            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
+        ]
+    )
+    try:
+        await cb.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    except Exception as exc:
+        # Сообщение могло быть уже удалено или быть старше 48 часов — тогда просто пишем новое.
+        logger.info("Не удалось отредактировать сообщение заказа %s: %s", order_id, exc)
+        try:
+            await cb.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+        except Exception:
+            pass
+
+
 @dp.callback_query(F.data.startswith("checkpay_"))
 async def cb_check_payment(cb: CallbackQuery):
     """
@@ -5189,6 +5265,10 @@ async def cb_check_payment(cb: CallbackQuery):
 
     if order.get("status") == "paid":
         await cb.answer("Оплата уже подтверждена ✅", show_alert=True)
+        return
+
+    if order.get("status") == "canceled":
+        await cb.answer("Заказ отменён — оплата по нему не нужна.", show_alert=True)
         return
 
     await cb.answer("Проверяю оплату...")
