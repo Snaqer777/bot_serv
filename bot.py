@@ -297,7 +297,11 @@ FREEKASSA_SECRET2 = (os.getenv("FREEKASSA_SECRET2") or "").strip()
 # Адрес платёжной страницы: ровно тот, что открывается у вашего магазина.
 #   • https://pay.freekassa.ru/ — российская франшиза (рубли);
 #   • https://pay.fk.money/     — международная версия.
-FREEKASSA_PAY_URL = (os.getenv("FREEKASSA_PAY_URL") or "").strip().rstrip("/") or "https://pay.freekassa.ru/"
+FREEKASSA_PAY_URL = (
+    os.getenv("FREEKASSA_PAY_URL") or ""
+).strip().rstrip("/") or "https://pay.freekassa.ru"
+# Домен хранится без хвостового слэша: ссылка собирается как FREEKASSA_PAY_URL + "/?…",
+# иначе в адресе получалось «pay.freekassa.ru//?…» (некоторые кассы такой адрес отвергают).
 
 # Валюта счёта: RUB (по умолчанию), USD, EUR, UAH, KZT.
 FREEKASSA_CURRENCY = (os.getenv("FREEKASSA_CURRENCY") or "RUB").strip().upper()
@@ -3593,9 +3597,12 @@ async def freekassa_self_check() -> str:
                     f"• Доступность страницы оплаты: отвечает ✅ (HTTP {resp.status})"
                 )
     except Exception as exc:
+        reason = _snip(str(exc), 90) or type(exc).__name__
+        if isinstance(exc, asyncio.TimeoutError):
+            reason = "превышено время ожидания (6 секунд) — домен не ответил"
         lines.append(
             "• Доступность страницы оплаты: ⚠️ "
-            f"<code>{escape(_snip(str(exc), 90))}</code>\n"
+            f"<code>{escape(reason)}</code>\n"
             "  С сервера бота домен не отвечает — у клиентов ссылка тоже не откроется. "
             "Варианты: зеркало <code>FREEKASSA_PAY_URL=https://pay.kassa.shop/</code> "
             "(та же касса и подписи) или <code>https://pay.fk.money/</code> "
@@ -3613,8 +3620,11 @@ async def freekassa_self_check() -> str:
         f"• URL возврата в случае неудачи: <code>{escape(back_url)}</code>",
         "",
         "<b>Осталось сделать в кабинете FK:</b>",
-        "1. Включить <b>«Подтверждение заявки»</b> (обратись в поддержку FK): бот отвечает "
-        "<code>YES</code>, и FK повторяет уведомление, пока не получит ответ.",
+        "1. Включить галочку <b>«Подтверждение платежа»</b> в этом же блоке настроек "
+        "(если галочки нет — попросить поддержку FK включить функцию): бот отвечает "
+        "<code>YES</code>, и FK повторяет уведомление, пока не получит ответ. "
+        "Кнопка <b>«Проверить статус»</b> рядом с URL покажет, что обработчик отвечает "
+        "(ожидаемый ответ — 200).",
         "2. Если магазин под бота — попросить поддержку разрешить URL оповещения на своём домене.",
         (
             "3. Тестовый режим включён: галочка в кабинете FK и <code>FREEKASSA_TEST=1</code>. "

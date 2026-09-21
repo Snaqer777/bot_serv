@@ -830,6 +830,9 @@ async def test_freekassa_flow(store_file):
         message = [m for m in tg_calls("sendMessage") if "Оплата тарифа" in m["params"].get("text", "")][-1]["params"]
         markup = json.dumps(message["reply_markup"], ensure_ascii=False)
         check("кнопка «Оплатить» ведёт на страницу FreeKassa", "pay.freekassa.ru" in markup)
+        check("в ссылке нет двойного слэша перед параметрами",
+              "pay.freekassa.ru//?" not in markup and "ru/?m=" in markup,
+              markup[markup.find("pay.freekassa.ru"):][:48])
         check("есть кнопка «Проверить оплату»", "checkpay_" in markup)
         check(f"в сообщении видна сумма ({basic_price} ₽)", f"{basic_price} ₽" in message.get("text", ""))
 
@@ -1524,12 +1527,26 @@ async def test_freekassa_self_check(store_file):
         check("отчёт показывает URL оповещения для кабинета FK",
               f"http://127.0.0.1:{WEBHOOK_PORT}/freekassa/webhook" in text)
         check("отчёт показывает адрес возврата на бота", "t.me/" in text)
-        check("отчёт напоминает про «Подтверждение заявки»", "Подтверждение заявки" in text)
+        check("отчёт напоминает про галочку «Подтверждение платежа»",
+              "Подтверждение платежа" in text)
+        check("отчёт подсказывает кнопку «Проверить статус»", "Проверить статус" in text)
         check("отчёт проверяет доступность страницы оплаты",
               "Доступность страницы оплаты" in text)
         check("если домен не отвечает — подсказано зеркало pay.kassa.shop",
               "Доступность страницы оплаты: отвечает ✅" in text
               or "pay.kassa.shop" in text, text[-260:])
+        # Домен из переменной может быть с хвостовым слэшем или без — ссылка одинаково верная
+        reset_all()
+        mirror = new_bot({"mode": "freekassa", "pay_url": "https://pay.kassa.shop"}, store_file)
+        probe = {"id": "probe-1", "tg_id": 0, "amount_rub": 99, "currency": "RUB"}
+        url_no_slash = mirror.freekassa_payment_url(probe)
+        check("домен без хвостового слэша даёт ссылку вида /?m=",
+              url_no_slash.startswith("https://pay.kassa.shop/?m="), url_no_slash[:60])
+        reset_all()
+        mirror_slash = new_bot({"mode": "freekassa", "pay_url": "https://pay.kassa.shop/"}, store_file)
+        check("домен с хвостовым слэшем не даёт «//»",
+              mirror_slash.freekassa_payment_url(probe).startswith("https://pay.kassa.shop/?m="))
+
         check("отчёт ведёт к первой настоящей оплате",
               "первая настоящая оплата" in text and "PAYMENTS_ALLOW_TEST_PAY=1" in text)
         check("самопроверка сервера прошла (healthz отвечает)", "Самопроверка сервера: ✅" in text, text[-200:])
