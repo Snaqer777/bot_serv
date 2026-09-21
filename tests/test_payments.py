@@ -1699,9 +1699,16 @@ async def test_promo_tariff(store_file):
           and bot.payment_store.stats()["rub"] == 0
           and bot.payment_store.stats()["promo_count"] == 1)
 
+    diag = bot.payments_diag_text()
+    check("в /myid видно состояние промо", "Промо-доступ: включён" in diag, diag[-160:].replace("\n", " "))
     text = _last_api_text()
     check("ключ отправлен с пометкой промо", "Промо-доступ активирован" in text, text[:80])
     check("в сообщении про промо нет слова «оплата»", "оплата" not in text.lower())
+
+    await bot.cmd_payments(make_message(bot, text="/payments"))
+    panel_text = _last_api_text()
+    check("в /payments есть счётчик промо", "Промо-доступов выдано" in panel_text,
+          panel_text[-160:].replace("\n", " "))
 
     # Повторно — нельзя
     check("после активации промо скрыт из тарифов", bot.promo_visible(TG_TG_ID) is False)

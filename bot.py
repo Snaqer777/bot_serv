@@ -2601,6 +2601,15 @@ def payments_diag_text() -> str:
     """
     lines = [f"💳 <b>Оплата:</b> {escape(payments_mode_title())} (<code>{PAYMENTS_MODE}</code>)"]
 
+    promo_tariff = TARIFFS.get(PROMO_KEY) or {}
+    if promo_enabled():
+        lines.append(
+            f"• Промо-доступ: включён 🎉 {escape(promo_tariff.get('name', ''))} — "
+            + ("один раз на аккаунт" if PROMO_ONCE else "без ограничения (PROMO_ONCE=0)")
+        )
+    else:
+        lines.append("• Промо-доступ: выключен (<code>PROMO_ENABLED=0</code> или тариф удалён)")
+
     if PAYMENTS_MODE == "freekassa":
         shop = FREEKASSA_MERCHANT_ID or "не задан ❌"
         secrets = "заданы ✅" if (FREEKASSA_SECRET1 and FREEKASSA_SECRET2) else "НЕ заданы ❌"
