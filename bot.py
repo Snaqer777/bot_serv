@@ -357,6 +357,13 @@ TEST_TOOLS_RAW = (os.getenv("TEST_TOOLS") or "").strip().lower()
 # как включить служебные команды обратно.
 ADMIN_TOOLS = (os.getenv("ADMIN_TOOLS") or "0").strip().lower() in ("1", "true", "yes", "on")
 
+# Промо-тариф (бесплатно 30 дней, 10 ГБ): виден всем, но выдаётся один раз на аккаунт.
+#   PROMO_ENABLED=0 — полностью убрать пункт из тарифов (промо закончилось);
+#   PROMO_ONCE=0    — разрешить получать промо повторно (для своих тестов).
+PROMO_KEY = "promo"
+PROMO_ENABLED = (os.getenv("PROMO_ENABLED") or "1").strip().lower() in ("1", "true", "yes", "on")
+PROMO_ONCE = (os.getenv("PROMO_ONCE") or "1").strip().lower() in ("1", "true", "yes", "on")
+
 # Доступен ли бесплатный тест на 24 часа обычным пользователям (/test_vpn).
 #   0 (по умолчанию) — тестовый доступ только у администратора (как было);
 #   1 — тест доступен всем: кнопка есть в меню у каждого, ключ выдаётся на 24 часа.
@@ -1803,9 +1810,12 @@ class PaymentStore:
         by_tariff: dict[str, int] = {}
         for order in paid:
             by_tariff[order.get("tariff", "?")] = by_tariff.get(order.get("tariff", "?"), 0) + 1
+        promo = [o for o in self.orders.values()
+                 if o.get("status") == "paid" and o.get("promo")]
         return {
             "orders_total": len(self.orders),
             "paid_count": len(paid),
+            "promo_count": len(promo),
             "rub": sum(int(o.get("amount_rub") or 0) for o in paid
                        if o.get("mode") in ("yookassa", "provider", "freekassa")),
             "stars": sum(int(o.get("amount_stars") or 0) for o in paid if o.get("currency") == "XTR"),
@@ -2493,6 +2503,48 @@ def test_pay_enabled() -> bool:
 def admin_tools_enabled() -> bool:
     """Показывать ли служебные команды администратора (ADMIN_TOOLS=1)."""
     return ADMIN_TOOLS
+
+
+def promo_enabled() -> bool:
+    """Включён ли промо-тариф (PROMO_ENABLED=1 и сам тариф на месте)."""
+    return PROMO_ENABLED and PROMO_KEY in TARIFFS
+
+
+def promo_used(tg_id: int | None) -> bool:
+    """
+    Пользовался ли этот аккаунт промо (по журналу заказов).
+
+    Промо выдаётся один раз: иначе бесплатные 30 дней можно оформлять бесконечно.
+    PROMO_ONCE=0 снимает ограничение — для проверок на своём аккаунте.
+    """
+    if not PROMO_ONCE or tg_id is None:
+        return False
+    payment_store.load()
+    for order in payment_store.orders.values():
+        if (order.get("tariff") == PROMO_KEY and order.get("status") == "paid"
+                and int(order.get("tg_id") or 0) == int(tg_id)):
+            return True
+    return False
+
+
+def promo_visible(tg_id: int | None) -> bool:
+    """Показывать ли промо-пункт в тарифах: включён и ещё не использован."""
+    return promo_enabled() and not promo_used(tg_id)
+
+
+def tariff_visible(tg_id: int | None, key: str, tariff: dict) -> bool:
+    """
+    Показывать ли тариф в списке.
+
+    Платные — всегда; бесплатные — по своим правилам: промо видно всем (но один раз
+    на аккаунт), а тестовые 24 часа — только тем, кому тест доступен и включён
+    показ кнопок (TRIAL_BUTTON=1).
+    """
+    if tariff["price"] > 0:
+        return True
+    if key == PROMO_KEY:
+        return promo_visible(tg_id)
+    return trial_button_visible(tg_id)
 
 
 def trial_available_for(user_id: int | None) -> bool:
@@ -3265,7 +3317,9 @@ def order_paid_message(order: dict, info: dict) -> str:
     )
     if info.get("already"):
         title = "✅ <b>Этот платёж уже учтён — подписка активна.</b>"
-    if order.get("simulated"):
+    if order.get("promo"):
+        title = "🎉 <b>Промо-доступ активирован — бесплатно!</b>"
+    elif order.get("simulated"):
         title = "🧪 <b>Проверка выдачи: подписка создана без оплаты.</b>"
 
     return (
@@ -3324,10 +3378,12 @@ async def notify_payment_success(order: dict, info: dict) -> bool:
         amount = (
             f"{order['amount_stars']} ⭐️" if order["currency"] == "XTR" else f"{order['amount_rub']} ₽"
         )
-        header = (
-            "🧪 <b>Тестовая выдача (оплата не производилась)</b>\n"
-            if order.get("simulated") else f"💰 <b>Новая оплата:</b> {amount}\n"
-        )
+        if order.get("promo"):
+            header = "🎁 <b>Промо-доступ выдан (бесплатно)</b>\n"
+        elif order.get("simulated"):
+            header = "🧪 <b>Тестовая выдача (оплата не производилась)</b>\n"
+        else:
+            header = f"💰 <b>Новая оплата:</b> {amount}\n"
         await notify_admins(
             header
             + f"• Тариф: {order['tariff_name']}\n"
@@ -3467,6 +3523,66 @@ def new_test_order(tg_id: int, tariff_key: str) -> dict:
     order["currency"] = "TEST"
     order["simulated"] = True
     return order
+
+
+def new_promo_order(tg_id: int) -> dict:
+    """
+    Заказ на промо-доступ: бесплатно, помечен promo и simulated.
+
+    simulated — чтобы промо не попало в выручку и не начисляло реферальные бонусы
+    (денег по нему не приходило), promo — чтобы сообщения и уведомления говорили
+    о промо, а не о «проверке выдачи».
+    """
+    order = new_order(tg_id, PROMO_KEY)
+    order["mode"] = "promo"
+    order["currency"] = "PROMO"
+    order["simulated"] = True
+    order["promo"] = True
+    return order
+
+
+async def grant_promo(chat_id: int, tg_id: int) -> dict:
+    """
+    Выдаёт промо-подписку (30 дней, 10 ГБ) бесплатно — один раз на аккаунт.
+
+    Идёт тем же путём, что платный тариф: клиент tg-paid-<id> в 3x-ui, ключ в чат,
+    срок и лимиты из тарифа. Отказы: промо выключено, уже активировано, у аккаунта
+    есть действующая подписка (иначе промо переписало бы её лимиты на 10 ГБ).
+    """
+    if not promo_enabled():
+        raise PaymentError(
+            "🎉 <b>Промо-доступ сейчас закрыт.</b>\n\n"
+            "Актуальные тарифы — в разделе «💰 Тарифы»."
+        )
+    if promo_used(tg_id):
+        raise PaymentError(
+            "🎉 <b>Промо-доступ уже активирован на этом аккаунте.</b>\n\n"
+            "Он даётся один раз. Продлить доступ можно платным тарифом — "
+            "дни промо при этом сохранятся."
+        )
+    existing = await get_paid_subscription(tg_id)
+    if existing:
+        now_ms = int(time.time() * 1000)
+        still_active = existing["expiry_ms"] > now_ms and existing["enable"]
+        if still_active:
+            raise PaymentError(
+                "🎉 <b>У тебя уже есть действующая подписка</b> — промо-доступ для новых аккаунтов.\n\n"
+                "Промо не активирую, чтобы не менять условия твоего текущего тарифа."
+            )
+        # Подписка была, но закончилась: промо тоже не выдаём — иначе у аккаунта
+        # с историей оплат сбрасывался бы лимит трафика на 10 ГБ.
+        raise PaymentError(
+            "🎉 <b>Промо-доступ даётся только новым пользователям.</b>\n\n"
+            "У этого аккаунта уже была подписка — она, кстати, приостановлена. "
+            "Продлить доступ можно в разделе «💰 Тарифы»."
+        )
+
+    order = await payment_store.create(new_promo_order(tg_id))
+    logger.info("Промо-доступ: заказ %s, пользователь %s", order["id"], tg_id)
+    result = await fulfill_order(order, charge_id=f"promo-{order['id']}")
+    if not result.get("info"):
+        logger.warning("Промо-заказ %s не потребовал новой выдачи (%s)", order["id"], list(result))
+    return result
 
 
 async def simulate_successful_payment(chat_id: int, tg_id: int, tariff_key: str) -> dict:
@@ -3691,6 +3807,11 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
 
     tariff = TARIFFS[tariff_key]
     if tariff["price"] <= 0:
+        if tariff_key == PROMO_KEY:
+            raise PaymentError(
+                "🎉 Промо-доступ бесплатный — он активируется кнопкой в разделе «💰 Тарифы».\n\n"
+                "Оплата для него не нужна."
+            )
         if trial_available_for(tg_id):
             raise PaymentError("Этот тариф бесплатный — просто получи тестовый ключ командой /test_vpn.")
         raise PaymentError("Этот тариф бесплатный и сейчас недоступен. Выбери платный тариф — ключ придёт сразу после оплаты.")
@@ -4039,6 +4160,16 @@ TARIFFS = {
         "ip_limit": 1,
         "locations": "Все локации",
     },
+    "promo": {
+        "name": "🎉 Промо-доступ (30 дней)",
+        "price": 0,
+        "days": 30,
+        "traffic": "10 ГБ",
+        "traffic_gb": 10,
+        "ips": 1,
+        "ip_limit": 1,
+        "locations": "Все локации",
+    },
     "school": {
         "name": "🎒 Школьник (1 месяц)",
         "price": 99,
@@ -4370,7 +4501,7 @@ def tariffs_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
     """
     buttons = []
     for key, data in TARIFFS.items():
-        if data["price"] <= 0 and not trial_button_visible(tg_id):
+        if not tariff_visible(tg_id, key, data):
             continue
         buttons.append([
             InlineKeyboardButton(
@@ -5068,8 +5199,8 @@ async def cb_tariffs(cb: CallbackQuery):
         return
     text = "💰 <b>Тарифные планы:</b>\n\n"
     for key, data in TARIFFS.items():
-        if data["price"] <= 0 and not trial_button_visible(cb.from_user.id):
-            continue          # бесплатный тест — только тем, кому он доступен
+        if not tariff_visible(cb.from_user.id, key, data):
+            continue          # бесплатные пункты — по своим правилам (см. tariff_visible)
         text += (
             f"• <b>{data['name']}</b> — <b>{tariff_price_label(data)}</b>\n"
             f"  📦 Трафик: {data['traffic']} | 📱 Устройств: {data['ips']} | 🌍 {data['locations']}\n\n"
@@ -5114,6 +5245,24 @@ async def cb_buy(cb: CallbackQuery):
             return
         await cb.answer()
         await cmd_test_vpn(cb.message)
+        return
+
+    if tariff_key == PROMO_KEY:
+        if not promo_enabled():
+            await cb.answer("Промо-доступ сейчас закрыт.", show_alert=True)
+            return
+        await cb.answer("Активирую промо-доступ...")
+        try:
+            await grant_promo(cb.message.chat.id, cb.from_user.id)
+        except PaymentError as exc:
+            await cb.message.answer(str(exc), parse_mode="HTML")
+        except Exception as exc:
+            logger.exception("Не удалось выдать промо-доступ: %s", exc)
+            await cb.message.answer(
+                "❌ Не получилось активировать промо-доступ. Попробуй ещё раз через минуту "
+                "или напиши в поддержку.",
+                parse_mode="HTML",
+            )
         return
 
     tariff = TARIFFS.get(tariff_key)
@@ -5363,6 +5512,15 @@ async def cmd_payments(message: Message):
 
     if PAYMENTS_MODE == "stars":
         lines.append(f"• Курс пересчёта: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (меняется через STARS_RUB_RATE)")
+    tariff = TARIFFS.get(PROMO_KEY) or {}
+    if promo_enabled():
+        lines.append(
+            f"• Промо-доступ: включён 🎉 {escape(tariff.get('name', ''))} — "
+            + ("один раз на аккаунт" if PROMO_ONCE else "без ограничения (PROMO_ONCE=0)")
+        )
+    else:
+        lines.append("• Промо-доступ: выключен (<code>PROMO_ENABLED=0</code> или тариф удалён)")
+
     if test_tools_enabled():
         lines.append("• Проверка без оплаты: /test_pay ✅ (ключ выдаётся тем же путём, что после оплаты)")
     elif PAYMENTS_MODE == "freekassa" and admin_tools_enabled():
@@ -5373,6 +5531,11 @@ async def cmd_payments(message: Message):
         f"• Заказов всего: <b>{stats['orders_total']}</b>, оплачено: <b>{stats['paid_count']}</b>",
         f"• Выручка: <b>{stats['rub']} ₽</b> / <b>{stats['stars']} ⭐️</b>",
     ]
+    if stats.get("promo_count"):
+        lines.append(
+            f"• Промо-доступов выдано: <b>{stats['promo_count']}</b> "
+            "(бесплатно, в выручку не входит)"
+        )
     if stats["by_tariff"]:
         breakdown = ", ".join(f"{TARIFFS.get(k, {}).get('name', k)}: {v}" for k, v in stats["by_tariff"].items())
         lines.append(f"• По тарифам: {escape(breakdown)}")
