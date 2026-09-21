@@ -306,6 +306,29 @@ FREEKASSA_PAY_URL = (
 # Валюта счёта: RUB (по умолчанию), USD, EUR, UAH, KZT.
 FREEKASSA_CURRENCY = (os.getenv("FREEKASSA_CURRENCY") or "RUB").strip().upper()
 
+# Какой способ оплаты предлагать клиенту первым (параметр i в ссылке на оплату).
+# Клиент всё равно может выбрать другой способ на странице FK, а без переменной
+# страница открывается со способом по умолчанию (часто это FKWallet — кошелёк,
+# для которого нужна регистрация; карта, СБП и МИР регистрации не требуют).
+# ID способов — из «Списка доступных валют» FreeKassa; можно указать числом.
+FREEKASSA_METHOD_ALIASES = {
+    "sbp": "42",          # СБП — самый быстрый путь с телефона, без регистрации
+    "сбп": "42",
+    "mir": "12",          # МИР
+    "мир": "12",
+    "visa": "4",
+    "mastercard": "8",
+    "yoomoney": "6",      # ЮMoney
+    "fkwallet": "1",      # FKWallet — требует регистрации в кошельке
+    "card": "36",         # Card RUB API
+    "usdt": "15",         # USDT TRC20
+    "bitcoin": "24",
+}
+FREEKASSA_METHOD_RAW = (os.getenv("FREEKASSA_METHOD") or "").strip().lower()
+FREEKASSA_METHOD = FREEKASSA_METHOD_ALIASES.get(FREEKASSA_METHOD_RAW, "")
+if not FREEKASSA_METHOD and FREEKASSA_METHOD_RAW.isdigit():
+    FREEKASSA_METHOD = FREEKASSA_METHOD_RAW
+
 # Формула подписи ссылки на оплату:
 #   currency (по умолчанию) — md5(магазин:сумма:секрет:валюта:заказ) — новая форма FK;
 #   plain                   — md5(магазин:сумма:секрет:заказ) — старая форма free-kassa.org.
@@ -2903,6 +2926,9 @@ def freekassa_payment_url(order: dict) -> str:
         # us_* вернётся в уведомлении — по нему видно, кто платил (для поддержки).
         "us_tg": str(order.get("tg_id") or ""),
     }
+    if FREEKASSA_METHOD:
+        # Предлагаемый способ оплаты (клиент может сменить его на странице FK).
+        params["i"] = FREEKASSA_METHOD
     return f"{FREEKASSA_PAY_URL}/?{urlencode(params)}"
 
 
@@ -3542,6 +3568,18 @@ async def freekassa_self_check() -> str:
     lines.append(f"• Секретное слово 2 (уведомления): {'задан ✅' if FREEKASSA_SECRET2 else 'НЕ задан ❌'}")
     lines.append(f"• Платёжная страница: <code>{escape(FREEKASSA_PAY_URL)}</code>")
     lines.append(f"• Валюта: <b>{escape(FREEKASSA_CURRENCY)}</b>, формула подписи: <code>{escape(FREEKASSA_SIGN_VARIANT)}</code>")
+    lines.append(
+        "• Предлагаемый способ оплаты: "
+        + (
+            f"<code>i={escape(FREEKASSA_METHOD)}</code> "
+            f"({escape(FREEKASSA_METHOD_RAW)}) — клиент может выбрать другой на странице FK"
+            if FREEKASSA_METHOD
+            else "не задан — страница откроется со способом по умолчанию "
+                 "(часто FKWallet, для него нужна регистрация в кошельке). "
+                 "Карта, СБП и МИР регистрации не требуют: "
+                 "<code>FREEKASSA_METHOD=sbp</code>"
+        )
+    )
     lines.append(
         "• Проверка IP уведомления: "
         + (
@@ -5356,6 +5394,8 @@ async def cmd_payments(message: Message):
         lines.append(f"• Секретные слова: {'заданы ✅' if freekassa_configured() else 'НЕ заданы ❌'}")
         lines.append(f"• Платёжная страница: <code>{escape(FREEKASSA_PAY_URL)}</code>, "
                      f"валюта {escape(FREEKASSA_CURRENCY)}")
+        if FREEKASSA_METHOD:
+            lines.append(f"• Предлагаемый способ оплаты: <code>i={escape(FREEKASSA_METHOD)}</code>")
         lines.append(f"• URL оповещения: <code>{escape(PUBLIC_BASE_URL + '/freekassa/webhook')}</code>"
                      if PUBLIC_BASE_URL else "• URL оповещения: ⚠️ PUBLIC_BASE_URL не задан")
         lines.append("• Проверка IP: "
