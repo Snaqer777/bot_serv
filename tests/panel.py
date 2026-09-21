@@ -33,6 +33,14 @@ PANEL = {
     "reject_msg": "invalid 2fa code",
     "login_attempts": [],         # коды 2FA, которые присылал бот
     "calls": [],                  # журнал вызовов API
+    # Настройки сервиса подписок (Settings -> Subscription в панели):
+    "sub": {
+        "enable": True,           # subEnable: выключённый сервис подписок
+        "port": None,             # subPort (None → порт самой панели, как в тестах)
+        "path": "/sub/",          # subPath
+        "domain": "",             # subDomain (публичный домен сервиса подписок)
+        "uri": "",                # subURI (готовый внешний адрес)
+    },
 }
 
 INBOUND = {
@@ -63,6 +71,7 @@ def reset(**kwargs):
         "groups": set(), "clients": {}, "pending": {}, "register_delay": 0,
         "reject_first_login": False, "reject_msg": "invalid 2fa code",
         "login_attempts": [], "calls": [],
+        "sub": {"enable": True, "port": None, "path": "/sub/", "domain": "", "uri": ""},
     })
     PANEL.update(kwargs)
     INBOUND["settings"] = json.dumps({"clients": [], "decryption": "none"})
@@ -221,6 +230,37 @@ async def groups_bulk_add(request):
     return web.json_response({"success": True, "obj": {"affected": affected, "group": group}})
 
 
+async def setting_all(request):
+    """Настройки панели (в реальной 3x-ui — POST /panel/api/setting/all)."""
+    PANEL["calls"].append(("setting/all",))
+    sub = PANEL["sub"]
+    return web.json_response({
+        "success": True,
+        "obj": {
+            "webPort": request.url.port,
+            "subEnable": sub["enable"],
+            "subPort": sub["port"] or request.url.port,
+            "subPath": sub["path"],
+            "subDomain": sub["domain"],
+            "subURI": sub["uri"],
+            "subEncrypt": True,
+            "subShowInfo": True,
+        },
+    })
+
+
+async def subscription(request):
+    """Сервис подписок: отдаёт конфигурацию клиента по его Sub ID."""
+    sub_id = request.match_info["sub_id"]
+    PANEL["calls"].append(("sub/get", sub_id))
+    if not PANEL["sub"]["enable"]:
+        return web.Response(status=404, text="404 page not found")
+    for email, client in PANEL["clients"].items():
+        if str(client.get("subId")) == sub_id:
+            return web.Response(text=f"dmxlc3M6Ly97emlwfQ=={email}", content_type="text/plain")
+    return web.Response(text="", content_type="text/plain")
+
+
 def make_app(old_panel=False):
     app = web.Application()
     app["old_panel"] = old_panel
@@ -235,6 +275,9 @@ def make_app(old_panel=False):
     app.router.add_post("/panel/api/clients/update/{email}", clients_update)
     app.router.add_get("/panel/api/clients/get/{email}", clients_get)
     app.router.add_post("/panel/api/clients/del/{email}", clients_delete)
+    app.router.add_post("/panel/api/setting/all", setting_all)
+    app.router.add_get("/panel/api/setting/all", setting_all)
+    app.router.add_get("/sub/{sub_id}", subscription)
     app.router.add_get("/panel/api/clients/groups", groups_list)
     app.router.add_post("/panel/api/clients/groups/bulkAdd", groups_bulk_add)
     return app

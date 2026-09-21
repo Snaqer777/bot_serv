@@ -303,6 +303,9 @@ def new_bot(env, store_file, admins=None):
         "PAYMENTS_ALLOW_TEST_PAY": env.get("allow_test_pay"),
         "PROMO_ENABLED": env.get("promo_enabled"),
         "PROMO_ONCE": env.get("promo_once"),
+        "SUB_URL_BASE": env.get("sub_url_base"),
+        "SUB_PORT": env.get("sub_port"),
+        "SUB_PATH": env.get("sub_path"),
         "ADMIN_TOOLS": env.get("admin_tools"),
         "TEST_TOOLS": env.get("test_tools"),
         "PAYMENT_STORE_FILE": store_file,
@@ -444,7 +447,9 @@ async def test_stars_flow(store_file):
     check("в комментарии — id тарифа и дата", client and client["comment"].startswith("basic до "))
     sent = [m for m in tg_calls("sendMessage") if str(m["params"].get("chat_id")) == str(TG_TG_ID)]
     key_text = sent[-1]["params"].get("text", "") if sent else ""
-    check("ключ отправлен пользователю", "<code>vless://" in key_text)
+    check("ссылка-подписка отправлена пользователю",
+          "<code>http" in key_text and "/sub/" in key_text, key_text[:80].replace("\n", " "))
+    check("вместо ключа клиент получает подписку", "vless://" not in key_text)
     check("в сообщении есть дата окончания подписки", "Действует до" in key_text)
 
     stats = bot.payment_store.stats()
@@ -464,8 +469,8 @@ async def test_stars_flow(store_file):
     check("первый клиент не тронут", panel_client("tg-paid-4242") is not None)
     check("админу ушло уведомление о продаже",
           any("Новая оплата" in m["params"].get("text", "") for m in tg_calls("sendMessage")))
-    check("ключ второму пользователю отправлен ему, а не админу",
-          any(m["params"].get("chat_id") == 5555 and "vless://" in m["params"].get("text", "")
+    check("подписка второму пользователю отправлена ему, а не админу",
+          any(m["params"].get("chat_id") == 5555 and "/sub/" in m["params"].get("text", "")
               for m in tg_calls("sendMessage")))
     return bot, order_id
 
@@ -1147,7 +1152,8 @@ async def test_yookassa_button_and_revoke(store_file):
         await bot.send_profile(msg, TG_TG_ID)
         profile_text = _last_api_text()
         check("в профиле видно активную подписку", "Активна" in profile_text and "Действует до" in profile_text)
-        check("в профиле есть ключ", "vless://" in profile_text)
+        check("в профиле есть ссылка-подписка", "/sub/" in profile_text,
+              profile_text[-120:].replace("\n", " "))
 
         adm = make_message(bot, text="/payments")
         await bot.cmd_payments(adm)
@@ -1284,8 +1290,8 @@ async def test_diagnostics(store_file):
         "currency": "XTR", "total_amount": bot5.TARIFFS["basic"]["stars"], "invoice_payload": order_id,
         "telegram_payment_charge_id": "tg-charge-fail", "provider_payment_charge_id": "",
     }))
-    check("повторная доставка досылает недоставленный ключ",
-          any("vless://" in m["params"].get("text", "") for m in tg_calls("sendMessage")))
+    check("повторная доставка досылает недоставленную подписку",
+          any("/sub/" in m["params"].get("text", "") for m in tg_calls("sendMessage")))
     check("при досылке срок подписки не меняется",
           int(panel_client(f"tg-paid-{TG_TG_ID}")["expiryTime"]) == expiry_before)
     check("после успешной досылки заказ помечен уведомлённым",
@@ -1332,7 +1338,7 @@ async def test_simulated_payment(store_file):
     check("в панели сохранился id тарифа и дата", client and client["comment"].startswith("basic до "))
 
     texts = [m["params"].get("text", "") for m in tg_calls("sendMessage")]
-    key_text = [t for t in texts if "🧪" in t and "vless://" in t]
+    key_text = [t for t in texts if "🧪" in t and "/sub/" in t]
     check("пользователю отправлено сообщение с ключом и пометкой «без оплаты»", bool(key_text))
     check("в тестовом сообщении нет слова «Оплата получена»",
           not any("Оплата получена" in t for t in key_text))
@@ -1664,6 +1670,126 @@ async def test_production_handlers(store_file):
           "тестовый режим" in _last_api_text())
 
 
+async def test_subscription_link(store_file):
+    print("\n▶ 14е. Ссылка-подписка: адрес сервиса подписок, проверка и запасной ключ")
+    reset_all()
+    reset(sub={"enable": True, "port": None, "path": "/sub/", "domain": "", "uri": ""})
+    bot = new_bot({"mode": "freekassa"}, store_file + ".base")
+    runner = await bot.run_webhook_server()
+    tg_id = 551001
+
+    def text_for(chat_id: int) -> str:
+        """Последнее сообщение бота этому чату (админу уходит отдельное уведомление)."""
+        msgs = [m for m in tg_calls("sendMessage")
+                if str(m["params"].get("chat_id")) == str(chat_id)
+                and m["params"].get("text")]
+        return msgs[-1]["params"]["text"] if msgs else ""
+
+    try:
+        # 1. Обычный случай: сервис подписок на порту панели, ссылка проверена
+        await bot.start_checkout(tg_id, tg_id, "basic")
+        order = [o for o in bot.payment_store.orders.values()][-1]
+        status, body = await post_fk_notification(order["id"], bot.TARIFFS["basic"]["price"])
+        client = panel_client(f"tg-paid-{tg_id}")
+        check("оплата прошла, клиент создан", body == "YES" and client is not None, body)
+
+        sub_id = str(client.get("subId") or "")
+        check("у клиента есть Sub ID (нужен для подписки)", bool(sub_id), sub_id)
+        text = text_for(tg_id)
+        check("в сообщении именно ссылка-подписка",
+              f"http://127.0.0.1:{PANEL_PORT}/sub/{sub_id}" in text,
+              text[:90].replace("\n", " "))
+        check("ключ vless клиенту не показывается", "vless://" not in text)
+        check("бот проверил ссылку запросом к сервису подписок",
+              ("sub/get", sub_id) in PANEL["calls"], str(PANEL["calls"][-4:]))
+        check("бот спросил у панели настройки подписок", ("setting/all",) in PANEL["calls"])
+
+        # Проверяем, что ссылка действительно рабочая: сервис отдаёт конфигурацию
+        ok, detail = await bot._check_sub_link(f"http://127.0.0.1:{PANEL_PORT}/sub/{sub_id}")
+        check("ссылка из сообщения отдаёт конфигурацию", ok, detail)
+
+        # 2. Адрес проверяется один раз и кэшируется (не дёргаем панель на каждой выдаче)
+        PANEL["calls"].clear()
+        await bot.start_checkout(tg_id + 1, tg_id + 1, "basic")
+        order2 = [o for o in bot.payment_store.orders.values()][-1]
+        # intid у каждого уведомления свой: по нему бот отсекает повторные доставки
+        await post_fk_notification(order2["id"], bot.TARIFFS["basic"]["price"], intid="987655")
+        check("второй заказ тоже выдан",
+              panel_client(f"tg-paid-{tg_id + 1}") is not None)
+        check("повторная выдача обошлась без новых запросов настроек",
+              ("setting/all",) not in PANEL["calls"], str(PANEL["calls"]))
+        text2 = text_for(tg_id + 1)
+        check("второй клиент получил свою ссылку-подписку",
+              f"/sub/" in text2 and f"http://127.0.0.1:{PANEL_PORT}/sub/" in text2,
+              text2[:90].replace("\n", " "))
+
+        # 3. Запасной вариант: сервис подписок выключен в панели —
+        #    клиент получает ключ, админ предупреждение
+        reset_all()
+        reset(sub={"enable": False, "port": None, "path": "/sub/", "domain": "", "uri": ""})
+        off = new_bot({"mode": "freekassa"}, store_file + ".off")
+        await off.start_checkout(tg_id, tg_id, "basic")
+        order3 = [o for o in off.payment_store.orders.values()][-1]
+        info3 = await off.fulfill_order(order3, charge_id="test-sub-off")
+        check("при выключенном сервисе подписок ссылки нет", info3["info"]["sub_link"] is None)
+        check("ключ при этом выдан (клиент без доступа не остаётся)",
+              bool(info3["info"].get("link")))
+        text3 = text_for(tg_id)
+        check("клиент получил ключ вместо ссылки",
+              "vless://" in text3 and "/sub/" not in text3, text3[:90].replace("\n", " "))
+        admin_texts = [m["params"].get("text", "") for m in tg_calls("sendMessage")]
+        check("админ предупреждён, что подписки нет",
+              any("Ссылки-подписки нет" in t for t in admin_texts),
+              str(admin_texts)[-160:])
+
+        # 4. Переопределения: SUB_URL_BASE, Sub URI и Sub Domain из панели
+        cases = [
+            ("SUB_URL_BASE", {"sub_url_base": f"http://127.0.0.1:{PANEL_PORT}/sub"},
+             {"enable": True, "port": None, "path": "/sub/", "domain": "", "uri": ""},
+             f"http://127.0.0.1:{PANEL_PORT}/sub/"),
+            ("Sub URI из панели", {"sub_url_base": None},
+             {"enable": True, "port": 2096, "path": "/sub/",
+              "domain": "", "uri": "https://sub.example.com:2096/sub/"},
+             "https://sub.example.com:2096/sub/"),
+            ("Sub Domain из панели", {"sub_url_base": None},
+             {"enable": True, "port": 2096, "path": "/sub/",
+              "domain": "vpn.example.com", "uri": ""},
+             "https://vpn.example.com:2096/sub/"),
+        ]
+        for index, (label, env, sub_settings, expected) in enumerate(cases):
+            reset_all()
+            reset(sub=sub_settings)
+            # Адрес берём из настоящих настроек панели (через фейковый API 3x-ui):
+            # панель может быть за прокси, поэтому проверку доступности тут не ждём.
+            variant = new_bot({**{"mode": "freekassa"}, **env}, f"{store_file}.case{index}")
+            async with variant.XUIClient() as client:
+                panel_settings = await variant.fetch_panel_settings(client)
+            base, note = await variant.get_subscription_base(refresh=True)
+            candidates = [b for b, _ in variant.subscription_candidates(panel_settings)]
+            check(f"адрес подписки: {label}", candidates[0] == expected.rstrip("/"),
+                  f"{candidates[:2]} (ожидался {expected})")
+            check(f"пояснение к адресу ({label}) непустое", bool(note), note)
+
+        # 5. Приоритет адресов: переменная важнее настроек панели
+        variant = new_bot({"mode": "freekassa", "sub_url_base": "https://my-sub.example.com",
+                           "sub_port": None, "sub_path": None}, f"{store_file}.prio")
+        order_candidates = variant.subscription_candidates({
+            "subURI": "https://sub.panel.example.com/sub/", "subDomain": "vpn.example.com",
+            "subPort": 2096, "subPath": "/sub/",
+        })
+        check("SUB_URL_BASE идёт первым, затем Sub URI, затем домен панели",
+              [b for b, _ in order_candidates][:3] == [
+                  "https://my-sub.example.com/sub",
+                  "https://sub.panel.example.com/sub",
+                  "https://vpn.example.com:2096/sub",
+              ], str(order_candidates))
+        check("в кандидатах нет мусорных адресов",
+              all(b.startswith("http") and "None" not in b for b, _ in order_candidates),
+              str(order_candidates))
+    finally:
+        await runner.cleanup()
+
+
 async def test_promo_tariff(store_file):
     print("\n▶ 14д. Промо-тариф: 30 дней, 10 ГБ, бесплатно и один раз на аккаунт")
     reset_all()
@@ -1870,9 +1996,12 @@ async def test_panel_debug(store_file):
     check("/panel_debug: виден режим оплаты", "Оплата" in text and "ЮKassa" in text)
     check("/panel_debug: виден вебхук", "yookassa/webhook" in text)
     check("/panel_debug: видна статистика заказов", "Заказов:" in text)
-    tail = text.split("Оплата")[-1]
+    # Блок про подписки смотрит на сервис подписок, а не на кассу: у него свои пометки
+    tail = text.split("Оплата")[-1].split("Сервис подписок")[0]
     check("/panel_debug: без OAuth подсказан путь настройки в кабинете, а не ошибка",
           "HTTP-уведомления" in tail and "❌" not in tail)
+    check("/panel_debug: виден блок про сервис подписок",
+          "Сервис подписок" in text and "Sub ID" in text)
 
 
 # ---------------- вспомогательные заглушки ----------------
@@ -1972,6 +2101,7 @@ async def main():
         await test_production_handlers(store_for("prodhandlers"))
         await test_cancel_order(store_for("cancelorder"))
         await test_promo_tariff(store_for("promo"))
+        await test_subscription_link(store_for("sub_link"))
         await test_admin_access(store_for("admin"))
     finally:
         for runner in runners:

@@ -117,7 +117,7 @@ async def test_end_to_end():
     msg = Msg()
     await bot.cmd_test_vpn(msg)
     text = msg.last
-    check("ключ выдан", "vless://" in text)
+    check("доступ выдан", "/sub/" in text or "vless://" in text)
     check("клиент попал в существующую группу панели",
           PANEL["clients"]["tg-test-42"].get("group_name") == "bot-test")
     check("сообщение говорит про существующую группу",
@@ -147,7 +147,7 @@ async def test_end_to_end():
     bot = load_bot(PORT, group="bot-test")
     msg = Msg()
     await bot.cmd_test_vpn(msg)
-    check("ключ выдан", "vless://" in msg.last)
+    check("доступ выдан", "/sub/" in msg.last or "vless://" in msg.last)
     check("объяснили, что панель не умеет группы", "Группы недоступны" in msg.last and "3.2" in msg.last)
 
     print("\n▶ 8. Без XUI_CLIENT_GROUP поведение прежнее")
@@ -155,7 +155,7 @@ async def test_end_to_end():
     bot = load_bot(PORT, group=None)
     msg = Msg()
     await bot.cmd_test_vpn(msg)
-    check("ключ выдан", "vless://" in msg.last)
+    check("доступ выдан", "/sub/" in msg.last or "vless://" in msg.last)
     check("ничего про группы не пишем", "Группа" not in msg.last)
     check("группа у клиента не проставлена", not PANEL["clients"]["tg-test-42"].get("group_name"))
 

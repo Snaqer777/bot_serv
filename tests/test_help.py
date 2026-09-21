@@ -182,14 +182,17 @@ async def test_wiring():
     check("в главном меню — «Как подключиться»", "help_menu" in main_cbs, str(main_cbs))
     key_cbs = callbacks_of(bot.key_actions_kb())
     check("после выдачи ключа — кнопка инструкции", "help_menu" in key_cbs)
-    check("после выдачи ключа — кнопка профиля с ключом", "profile" in key_cbs)
+    check("после выдачи ключа — кнопка профиля с подпиской", "profile" in key_cbs)
     check("в главном меню — «Пригласить друга»", "invite" in main_cbs)
 
     info = {"tariff": bot.TARIFFS["basic"], "expiry_ms": 4102444800000, "link": "vless://demo",
-            "sub_link": None, "status": "created"}
+            "sub_link": "https://sub.example.com:2096/sub/demo", "status": "created"}
     paid_text = bot.order_paid_message({"id": "o-1", "simulated": False}, info)
     check("после оплаты зовём в пошаговую инструкцию", "Как подключиться" in paid_text)
     check("после оплаты нет старых советов", "/test_vpn" not in paid_text)
+    check("после оплаты выдаётся ссылка-подписка",
+          "ссылка-подписка" in paid_text and "/sub/demo" in paid_text)
+    check("ключ vless в сообщении не показывается", "vless://" not in paid_text)
 
     # Команды видны в меню Telegram (on_startup дергает set_my_commands)
     commands_seen = []

@@ -256,6 +256,19 @@ if XUI_CLIENT_GROUP:
 VPN_HOST = (os.getenv("VPN_HOST") or "").strip()
 VPN_PORT = _int_env("VPN_PORT")
 
+# --- Ссылка-подписка (сервис подписок 3x-ui) ---
+# Клиент получает не отдельный ключ, а ссылку-подписку: приложение по ней само
+# забирает конфигурацию и обновляет её, когда что-то меняется на сервере.
+# Адрес сервиса подписок бот спрашивает у панели (Settings -> Subscription:
+# Sub URI / Sub Domain / Sub Port / Sub Path) и проверяет ссылку запросом.
+# Переменные ниже — принудительное переопределение (например, панель за прокси):
+#   SUB_URL_BASE=https://sub.example.com:2096 — адрес сервиса подписок (можно с путём);
+#   SUB_PORT=2096     — порт сервиса подписок, если он не входит в SUB_URL_BASE;
+#   SUB_PATH=/sub/    — путь сервиса подписок, если отличается от настроек панели.
+SUB_URL_BASE = (os.getenv("SUB_URL_BASE") or "").strip().rstrip("/")
+SUB_PORT = (os.getenv("SUB_PORT") or "").strip()
+SUB_PATH = (os.getenv("SUB_PATH") or "").strip()
+
 # =========================
 # ОПЛАТА ПОДПИСОК
 # =========================
@@ -523,6 +536,10 @@ BROWSER_UA = (
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 vpn_lock = asyncio.Lock()
+
+# Кэш адреса сервиса подписок: чтобы не проверять его на каждой выдаче ключа.
+SUB_CACHE_TTL = 600
+_sub_base_cache: dict = {"base": None, "note": "", "at": 0.0, "checked": False}
 
 
 # =========================
@@ -1476,6 +1493,177 @@ def extract_vless_params(inbound: dict) -> dict:
     }
 
 
+def _norm_sub_path(path: str) -> str:
+    """Приводит путь сервиса подписок к виду «/sub/» (со слэшами с обеих сторон)."""
+    path = (path or "").strip()
+    if not path:
+        return "/sub/"
+    if not path.startswith("/"):
+        path = "/" + path
+    if not path.endswith("/"):
+        path += "/"
+    return path
+
+
+def panel_host_port() -> tuple[str, str]:
+    """Хост и порт панели из XUI_URL (без секретного пути webBasePath)."""
+    raw = XUI_URL if "://" in XUI_URL else f"http://{XUI_URL}"
+    parsed = urlsplit(raw)
+    scheme = parsed.scheme or "http"
+    host = parsed.hostname or ""
+    port = str(parsed.port or (443 if scheme == "https" else 80))
+    return host, port
+
+
+def build_sub_link(base: str, sub_id: str) -> str:
+    """Склеивает адрес сервиса подписок с Sub ID клиента."""
+    return f"{(base or '').strip().rstrip('/')}/{sub_id}"
+
+
+def subscription_candidates(settings: dict | None = None) -> list[tuple[str, str]]:
+    """
+    Возможные адреса сервиса подписок: [(база, откуда взяли)].
+
+    Порядок — от самого надёжного к запасному: явные настройки (SUB_URL_BASE, Sub URI
+    в панели), затем Sub Domain, затем хост панели с портом сервиса подписок и, наконец,
+    адрес панели целиком (вариант с обратным прокси, когда /sub/ отдаёт сам веб-сервер).
+    """
+    settings = settings or {}
+    path = _norm_sub_path(SUB_PATH or str(settings.get("subPath") or ""))
+    panel_host, panel_port = panel_host_port()
+
+    candidates: list[tuple[str, str]] = []
+
+    def add(base: str, source: str) -> None:
+        base = (base or "").strip().rstrip("/")
+        if base and base not in [known for known, _ in candidates]:
+            candidates.append((base, source))
+
+    def with_path(raw: str) -> str:
+        """Дописывает стандартный путь, если в адресе его нет."""
+        raw = (raw or "").strip().rstrip("/")
+        return raw if urlsplit(raw).path.strip("/") else f"{raw}{path}"
+
+    if SUB_URL_BASE:
+        add(with_path(SUB_URL_BASE), "SUB_URL_BASE")
+
+    sub_uri = str(settings.get("subURI") or "").strip()
+    if sub_uri.startswith(("http://", "https://")):
+        add(with_path(sub_uri), "настройки панели (Sub URI)")
+
+    sub_domain = str(settings.get("subDomain") or "").strip().strip("/")
+    sub_port = (SUB_PORT or str(settings.get("subExternalPort") or "")
+                or str(settings.get("subPort") or "")).strip()
+    port_part = f":{sub_port}" if sub_port and sub_port not in ("80", "443") else ""
+
+    if sub_domain and "/" not in sub_domain:
+        add(f"https://{sub_domain}{port_part}{path}", "настройки панели (Sub Domain)")
+
+    if panel_host:
+        if sub_port:
+            add(f"{'https' if XUI_URL.startswith('https://') else 'http'}://{panel_host}:{sub_port}{path}",
+                "адрес панели и порт сервиса подписок")
+        elif panel_port:
+            add(f"{'https' if XUI_URL.startswith('https://') else 'http'}://{panel_host}:{panel_port}{path}",
+                "адрес панели")
+        # Запасной вариант: панель отдаёт подписку сама (обратный прокси), тогда
+        # путь сервиса подписок живёт на том же адресе, что и панель.
+        add(f"{XUI_URL.rstrip('/')}{path}", "адрес панели с путём подписок")
+
+    return candidates
+
+
+async def _check_sub_link(url: str, *, timeout: int = 6) -> tuple[bool, str]:
+    """Проверяет, отдаёт ли сервис подписок конфигурацию по ссылке."""
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout)
+        ) as session:
+            async with session.get(url, headers={"User-Agent": BROWSER_UA},
+                                   proxy=XUI_PROXY, allow_redirects=True) as resp:
+                body = await resp.text()
+                if resp.status != 200:
+                    return False, f"HTTP {resp.status}"
+                if not body.strip():
+                    return False, "пустой ответ"
+                return True, "200"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+async def get_subscription_base(
+    client: "XUIClient | None" = None,
+    *,
+    sub_id: str = "",
+    refresh: bool = False,
+    probe: bool = True,
+) -> tuple[str | None, str]:
+    """
+    Определяет адрес сервиса подписок: (база без Sub ID, пояснение).
+
+    Базу бот берёт из настроек панели (или переменных SUB_*), а затем проверяет
+    реальным запросом: сервис подписок обычно слушает отдельный порт (по умолчанию
+    2096), и без проверки клиент рискует получить нерабочую ссылку. Результат
+    кэшируется на 10 минут, чтобы не дёргать панель на каждую выдачу.
+
+    probe=False — отдать адрес из кэша или первый по приоритету, без сетевых
+    проверок. Так бот показывает ссылку в /profile, не заставляя клиента ждать.
+    Пояснение — откуда адрес или почему его нет (идёт в лог и админу).
+    """
+    now = time.monotonic()
+    cached = _sub_base_cache
+    if (not refresh and cached["base"] and now - cached["at"] < SUB_CACHE_TTL
+            and (not sub_id or cached["checked"])):
+        return cached["base"], cached["note"]
+
+    settings: dict = {}
+    if client is not None:
+        settings = await fetch_panel_settings(client)
+
+    if settings and settings.get("subEnable") is False:
+        note = "сервис подписок выключен в панели (Settings → Subscription → Enable)"
+        logger.warning("Ссылка-подписка недоступна: %s", note)
+        return None, note
+
+    candidates = subscription_candidates(settings)
+    if not candidates:
+        return None, "не удалось определить адрес сервиса подписок (задай SUB_URL_BASE)"
+
+    if sub_id and probe:
+        # Проверяем не все варианты, а первые два: на выдаче доступа клиент ждёт,
+        # а вебхук платёжной системы — ответа. Остальные адреса видны в /panel_debug.
+        for base, source in candidates[:2]:
+            ok, detail = await _check_sub_link(build_sub_link(base, sub_id))
+            if ok:
+                logger.info("Ссылка-подписка: адрес «%s» (%s), проверка пройдена.", base, source)
+                _sub_base_cache.update(base=base, note=source, at=now, checked=True)
+                return base, source
+            logger.info("Ссылка-подписка: адрес «%s» (%s) не ответил (%s).", base, source, detail)
+        base, source = candidates[0]
+        note = f"{source}, но проверка не прошла"
+        logger.warning("Ссылка-подписка: ни один адрес не ответил, показываю «%s».", base)
+        _sub_base_cache.update(base=base, note=note, at=now, checked=False)
+        return base, note
+
+    base, source = candidates[0]
+    _sub_base_cache.update(base=base, note=source, at=now, checked=False)
+    return base, source
+
+
+async def fetch_panel_settings(client: "XUIClient") -> dict:
+    """Читает настройки панели 3x-ui (нужны для адреса сервиса подписок)."""
+    for method, path in (("POST", "/panel/api/setting/all"), ("GET", "/panel/setting/all")):
+        try:
+            kwargs = {"json": {}} if method == "POST" else {}
+            data = await client.request(method, path, **kwargs)
+        except Exception as exc:
+            logger.debug("Настройки панели не получены (%s %s): %s", method, path, exc)
+            continue
+        if isinstance(data, dict):
+            return data
+    return {}
+
+
 def build_vless_link(client: dict, inbound: dict, params: dict) -> str:
     """Собирает рабочую ссылку vless:// из параметров подключения."""
     host = VPN_HOST or panel_host()
@@ -1616,6 +1804,16 @@ async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool
         clients = settings.get("clients") or []
         target_email = f"tg-test-{telegram_id}"
 
+        async def sub_link_for(sub_id: str | None) -> str | None:
+            """Ссылка-подписка клиента (или None, если сервис подписок недоступен)."""
+            if not sub_id:
+                return None
+            base, note = await get_subscription_base(client, sub_id=sub_id)
+            if not base:
+                logger.warning("Тестовый клиент %s: подписка недоступна — %s", target_email, note)
+                return None
+            return build_sub_link(base, sub_id)
+
         # ВАЖНО: ищем только тестового клиента (tg-test-*). Платная подписка того же
         # человека (tg-paid-*) — отдельный клиент, тестовый ключ её не трогает.
         existing = next(
@@ -1653,8 +1851,7 @@ async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool
             # Если ключ активен и срок не истёк — отдаём как есть
             if enabled and (expiry <= 0 or expiry > now_ms):
                 link = build_vless_link(existing, inbound, params)
-                sub_id = existing.get("subId")
-                sub_link = f"{XUI_URL}/sub/{sub_id}" if sub_id else None
+                sub_link = await sub_link_for(existing.get("subId"))
                 # Клиент мог быть создан до настройки группы — досылаем его в группу
                 group_note = _group_note(await assign_group(), group_name)
                 return link, "exists", inbound, auto_picked, sub_link, group_note
@@ -1669,8 +1866,7 @@ async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool
             )
             await client.update_client(inbound_id, payload)
             link = build_vless_link(payload, inbound, params)
-            sub_id = payload.get("subId")
-            sub_link = f"{XUI_URL}/sub/{sub_id}" if sub_id else None
+            sub_link = await sub_link_for(payload.get("subId"))
             group_note = _group_note(await assign_group(), group_name)
             return link, "updated", inbound, auto_picked, sub_link, group_note
 
@@ -1680,8 +1876,7 @@ async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool
         await client.add_client(inbound_id, payload)
 
         link = build_vless_link(payload, inbound, params)
-        sub_id = payload.get("subId")
-        sub_link = f"{XUI_URL}/sub/{sub_id}" if sub_id else None
+        sub_link = await sub_link_for(payload.get("subId"))
         group_note = _group_note(await assign_group(), group_name)
         return link, "created", inbound, auto_picked, sub_link, group_note
 
@@ -3184,6 +3379,16 @@ async def activate_paid_subscription(
         clients = [c for c in (settings.get("clients") or []) if isinstance(c, dict)]
         existing = next((c for c in clients if str(c.get("email")) == target_email), None)
 
+        async def sub_link_for(sub_id: str | None) -> str | None:
+            """Ссылка-подписка клиента (или None, если сервис подписок недоступен)."""
+            if not sub_id:
+                return None
+            base, note = await get_subscription_base(client, sub_id=sub_id)
+            if not base:
+                logger.warning("Подписка %s: ссылка подписки недоступна — %s", target_email, note)
+                return None
+            return build_sub_link(base, sub_id)
+
         # Уже выдан по этому платежу? (журнал мог не сохраниться — смотрим в панель)
         if existing is not None and comment_has_payment_ref(existing.get("comment"), payment_ref):
             logger.info("Подписка %s уже выдана по платежу %s — повторно не продлеваю.", target_email, payment_ref)
@@ -3192,7 +3397,7 @@ async def activate_paid_subscription(
                 "already": True,
                 "expiry_ms": int(existing.get("expiryTime") or 0),
                 "link": build_vless_link(existing, inbound, params),
-                "sub_link": f"{XUI_URL}/sub/{existing['subId']}" if existing.get("subId") else None,
+                "sub_link": await sub_link_for(existing.get("subId")),
                 "tariff": tariff,
                 "inbound_id": inbound_id,
                 "auto_picked": auto_picked,
@@ -3247,7 +3452,7 @@ async def activate_paid_subscription(
             "status": status,
             "expiry_ms": expires_ms,
             "link": build_vless_link(payload, inbound, params),
-            "sub_link": f"{XUI_URL}/sub/{payload['subId']}" if payload.get("subId") else None,
+            "sub_link": await sub_link_for(payload.get("subId")),
             "tariff": tariff,
             "inbound_id": inbound_id,
             "auto_picked": auto_picked,
@@ -3315,6 +3520,32 @@ def subscription_status_text(sub: dict | None) -> str:
 
 # --- запуск оплаты ---
 
+def access_block(info: dict, *, heading: str = "") -> str:
+    """
+    Блок с доступом в сообщениях клиенту.
+
+    Основное — ссылка-подписка: приложение само забирает по ней конфигурацию и
+    обновляет её. Если сервис подписок в панели выключен или не отвечает, показываем
+    ключ vless:// — он работает всегда и не оставит клиента без доступа (админ
+    получает отдельное предупреждение).
+    """
+    sub_link = info.get("sub_link")
+    if sub_link:
+        return (
+            f"{heading or '🔗 <b>Твоя ссылка-подписка (нажми, чтобы скопировать):</b>'}\n"
+            f"<code>{escape(sub_link)}</code>\n\n"
+            "📥 <b>Как добавить:</b> в приложении выбери «Добавить подписку» / "
+            "«Импорт из ссылки» и вставь эту ссылку — профиль появится сам и будет "
+            "обновляться, если на сервере что-то изменится."
+        )
+    return (
+        "🔑 <b>Твой ключ (нажми, чтобы скопировать):</b>\n"
+        f"<code>{escape(info.get('link') or '')}</code>\n\n"
+        "📥 <b>Как добавить:</b> в приложении выбери «Импорт из буфера обмена» — "
+        "ключ уже скопирован, останется вставить его."
+    )
+
+
 def order_paid_message(order: dict, info: dict) -> str:
     """Сообщение пользователю после успешной оплаты."""
     tariff = info["tariff"]
@@ -3341,9 +3572,9 @@ def order_paid_message(order: dict, info: dict) -> str:
         f"📊 <b>Трафик:</b> {tariff['traffic']}\n"
         f"📱 <b>Устройств:</b> {tariff['ips']}\n"
         f"🌍 <b>Локации:</b> {tariff['locations']}\n\n"
-        f"🔑 <b>Твой ключ (нажми, чтобы скопировать):</b>\n<code>{escape(info['link'])}</code>\n\n"
+        + access_block(info) + "\n\n"
         "📲 <b>Как подключиться:</b> нажми кнопку под сообщением — покажу по шагам, "
-        "что скачать и куда вставить ключ (инструкции для iPhone, Android, Windows и macOS)."
+        "что скачать и куда вставить ссылку (инструкции для iPhone, Android, Windows и macOS)."
         + (info.get("group_note") or "")
     )
 
@@ -3363,7 +3594,7 @@ async def notify_payment_success(order: dict, info: dict) -> bool:
     """
     Отправляет покупателю ключ, а админу — уведомление о продаже.
 
-    Возвращает True, если ключ доставлен. Если Telegram не принял сообщение
+    Возвращает True, если доступ доставлен. Если Telegram не принял сообщение
     (сбой сети, бот заблокирован), заказ не помечается уведомлённым — при
     повторной доставке платежа ключ будет отправлен снова.
     """
@@ -3393,12 +3624,18 @@ async def notify_payment_success(order: dict, info: dict) -> bool:
             header = "🧪 <b>Тестовая выдача (оплата не производилась)</b>\n"
         else:
             header = f"💰 <b>Новая оплата:</b> {amount}\n"
+        access_note = "" if info.get("sub_link") else (
+            "\n⚠️ <b>Ссылки-подписки нет</b> — клиент получил ключ. "
+            "Проверь в панели Settings → Subscription (включено ли, порт и путь) "
+            "или задай <code>SUB_URL_BASE</code>. Подробнее: /panel_debug"
+        )
         await notify_admins(
             header
             + f"• Тариф: {order['tariff_name']}\n"
             f"• Пользователь: <code>{order['tg_id']}</code>\n"
             f"• Заказ: <code>{order['id']}</code>\n"
             f"• Действует до: <code>{format_date(info['expiry_ms'])}</code>"
+            + access_note
         )
 
     return delivered
@@ -3427,16 +3664,24 @@ async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str 
         # Ключ мог не дойти (сбой сети у Telegram) — при повторной доставке платежа досылаем его
         if not order.get("notified") and int(order.get("expiry_ms") or 0) > 0:
             link = order.get("link")
-            if not link:
-                # заказ был выдан более старой версией бота — пересобираем ключ из панели
-                try:
-                    sub = await get_paid_subscription(order["tg_id"])
-                    if sub:
+            sub_link = order.get("sub_link")
+            # Заказ мог быть выдан более старой версией бота: тогда пересобираем ключ
+            # из панели, а ссылку-подписку считаем заново — старая могла собираться
+            # на адресе панели и уже не работать.
+            try:
+                sub = await get_paid_subscription(order["tg_id"])
+                if sub:
+                    if not link:
                         async with XUIClient() as client:
                             params = extract_vless_params(sub["inbound"])
                         link = build_vless_link(sub["client"], sub["inbound"], params)
-                except Exception as exc:
-                    logger.warning("Не удалось пересобрать ключ для заказа %s: %s", order["id"], exc)
+                    sub_id = sub["client"].get("subId")
+                    if sub_id:
+                        base, _note = await get_subscription_base(sub_id=str(sub_id), probe=False)
+                        if base:
+                            sub_link = build_sub_link(base, str(sub_id))
+            except Exception as exc:
+                logger.warning("Не удалось пересобрать доступ для заказа %s: %s", order["id"], exc)
 
             info = {
                 "tariff": TARIFFS.get(order["tariff"], {}),
@@ -3444,7 +3689,7 @@ async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str 
                 "already": True,
                 "status": "extended",
                 "link": link,
-                "sub_link": order.get("sub_link"),
+                "sub_link": sub_link,
             }
             if not info["link"]:
                 logger.warning(
@@ -4292,7 +4537,7 @@ def install_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🆘 Не работает", callback_data="help_trouble"),
             ],
             [
-                InlineKeyboardButton(text="🔑 Показать мой ключ", callback_data="profile"),
+                InlineKeyboardButton(text="🔗 Показать мою подписку", callback_data="profile"),
                 InlineKeyboardButton(text="◀️ Меню", callback_data="main_menu"),
             ],
         ]
@@ -4304,7 +4549,7 @@ def install_step_kb(platform: str) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="✅ Проверить подключение", callback_data="help_check")],
         [InlineKeyboardButton(text="🆘 Не работает", callback_data="help_trouble")],
-        [InlineKeyboardButton(text="🔑 Мой ключ", callback_data="profile")],
+        [InlineKeyboardButton(text="🔗 Моя подписка", callback_data="profile")],
         [InlineKeyboardButton(text="◀️ Другое устройство", callback_data="help_menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -4312,10 +4557,10 @@ def install_step_kb(platform: str) -> InlineKeyboardMarkup:
 
 INSTALL_INTRO = (
     "📲 <b>Подключение VPN: пошагово</b>\n\n"
-    "Выбери своё устройство — покажу, что скачать и куда вставить ключ. "
+    "Выбери своё устройство — покажу, что скачать и куда вставить ссылку-подписку. "
     "Займёт 2–3 минуты.\n\n"
-    "🔑 <i>Ключ уже у тебя: он в сообщении после оплаты и в разделе "
-    "«👤 Мой профиль» — там же кнопка «Скопировать ключ».</i>"
+    "🔗 <i>Ссылка уже у тебя: она в сообщении после оплаты и в разделе "
+    "«👤 Мой профиль» — нажми на неё, чтобы скопировать.</i>"
 )
 
 
@@ -4330,11 +4575,13 @@ def install_text(platform: str) -> str:
             f"• {_a('v2box', 'V2Box')} — поддерживает VLESS и ссылки подписки;\n"
             f"• {_a('happ', 'Happ')} — сайт разработчика (в российском App Store его нет, "
             "понадобится зарубежный Apple ID).\n\n"
-            "<b>Шаг 2. Скопируй ключ</b>\n"
-            "Открой «👤 Мой профиль» → нажми на ключ <code>vless://…</code>, он скопируется в буфер.\n\n"
-            "<b>Шаг 3. Добавь ключ в приложение</b>\n"
-            "Открой приложение → «+» (плюс) → «Импорт из буфера обмена» / «Add from clipboard».\n"
-            "<i>Если пункта нет — выбери «Добавить вручную» → «Импорт из буфера».</i>\n\n"
+            "<b>Шаг 2. Скопируй ссылку-подписку</b>\n"
+            "Открой «👤 Мой профиль» → нажми на ссылку <code>…/sub/…</code>, она скопируется.\n\n"
+            "<b>Шаг 3. Добавь подписку в приложение</b>\n"
+            "Открой приложение → «+» (плюс) → «Добавить подписку» / «Add subscription» → "
+            "вставь ссылку.\n"
+            "<i>Streisand и Happ: «Добавить» → «Импорт из ссылки». Если приложение не умеет "
+            "подписки — вставь вместо неё ключ из «Мой профиль» через «Импорт из буфера».</i>\n\n"
             "<b>Шаг 4. Подключись</b>\n"
             "Выбери профиль → нажми кнопку подключения. iOS попросит разрешение "
             "«Добавить конфигурацию VPN» → <b>Разрешить</b> и подтверди Face ID / паролем.\n\n"
@@ -4350,10 +4597,11 @@ def install_text(platform: str) -> str:
             f"• {_a('v2rayng_play', 'v2rayNG (Google Play)')} — самый популярный;\n"
             f"• {_a('v2rayng', 'v2rayNG (APK с GitHub)')} — если Play недоступен;\n"
             f"• {_a('happ', 'Happ')} — современный, простой интерфейс.\n\n"
-            "<b>Шаг 2. Скопируй ключ</b>\n"
-            "«👤 Мой профиль» → нажми на ключ <code>vless://…</code> — он попадёт в буфер обмена.\n\n"
-            "<b>Шаг 3. Добавь ключ</b>\n"
-            "Открой приложение → «+» справа сверху → «Импорт профиля из буфера обмена».\n\n"
+            "<b>Шаг 2. Скопируй ссылку-подписку</b>\n"
+            "«👤 Мой профиль» → нажми на ссылку <code>…/sub/…</code> — она попадёт в буфер.\n\n"
+            "<b>Шаг 3. Добавь подписку</b>\n"
+            "v2rayNG: три точки справа сверху → «Группы» → «+» → «Добавить подписку» → вставь "
+            "ссылку.\nHapp: «Добавить» → «Импорт из ссылки».\n\n"
             "<b>Шаг 4. Подключись</b>\n"
             "Нажми круг со значком «V» внизу → Android спросит про VPN → <b>Разрешить/OK</b>.\n\n"
             "<b>Шаг 5. Проверь</b>\n"
@@ -4371,12 +4619,13 @@ def install_text(platform: str) -> str:
             f"• {_a('v2rayn', 'v2rayN')} — классика, открытый код (GitHub Releases, файл "
             "<code>v2rayN-windows-64.zip</code>);\n"
             f"• {_a('hiddify', 'Hiddify')} — простой интерфейс.\n\n"
-            "<b>Шаг 2. Скопируй ключ</b>\n"
-            "В боте: «👤 Мой профиль» → нажми на ключ <code>vless://…</code>. "
-            "Либо выдели ключ мышкой и скопируй (Ctrl+C).\n\n"
-            "<b>Шаг 3. Добавь ключ</b>\n"
-            "Happ: открой приложение → «Добавить» → «Импорт из буфера обмена».\n"
-            "v2rayN: меню «Серверы» → «Импорт из буфера обмена» (или Ctrl+V на главном окне).\n\n"
+            "<b>Шаг 2. Скопируй ссылку-подписку</b>\n"
+            "В боте: «👤 Мой профиль» → нажми на ссылку <code>…/sub/…</code> "
+            "(или выдели мышкой и Ctrl+C).\n\n"
+            "<b>Шаг 3. Добавь подписку</b>\n"
+            "Happ: «Добавить» → «Импорт из ссылки».\n"
+            "v2rayN: меню «Подписка» → «Добавить подписку» → вставь ссылку → "
+            "«Обновить подписки без прокси».\n\n"
             "<b>Шаг 4. Подключись</b>\n"
             "v2rayN: правый клик по серверу → «Установить как активный» → включи "
             "«Режим системного прокси» (или TUN) в меню «Настройки»/«Режим».\n"
@@ -4395,10 +4644,10 @@ def install_text(platform: str) -> str:
             f"• {_a('v2box', 'V2Box (App Store)')};\n"
             f"• {_a('foxray', 'FoXray (App Store)')};\n"
             f"• {_a('v2rayn', 'v2rayN')} — для Apple Silicon и Intel.\n\n"
-            "<b>Шаг 2. Скопируй ключ</b>\n"
-            "«👤 Мой профиль» → нажми на ключ <code>vless://…</code>.\n\n"
-            "<b>Шаг 3. Добавь ключ</b>\n"
-            "Открой приложение → «+» → «Импорт из буфера обмена» / «Add from clipboard».\n\n"
+            "<b>Шаг 2. Скопируй ссылку-подписку</b>\n"
+            "«👤 Мой профиль» → нажми на ссылку <code>…/sub/…</code>.\n\n"
+            "<b>Шаг 3. Добавь подписку</b>\n"
+            "Открой приложение → «+» → «Добавить подписку» / «Add subscription» → вставь ссылку.\n\n"
             "<b>Шаг 4. Подключись</b>\n"
             "Нажми «Подключить». macOS спросит: «Разрешить добавление конфигурации VPN?» → "
             "Разрешить, затем System Settings → ввести пароль/Touch ID.\n\n"
@@ -4415,12 +4664,11 @@ def install_text(platform: str) -> str:
         f"• {_a('v2rayng', 'v2rayNG (APK)')} — установи через USB-флешку или приложение "
         "«Downloader» (его можно поставить из Google Play на телевизоре);\n"
         f"• {_a('hiddify', 'Hiddify')} — есть сборка для Android TV.\n\n"
-        "<b>Шаг 2. Возьми ключ</b>\n"
-        "Проще всего: «👤 Мой профиль» → кнопка «Скопировать ключ», а затем переслать ключ "
-        "себе в Telegram на телевизоре (или ввести вручную пультом — ссылка длинная, лучше "
-        "через буфер).\n\n"
-        "<b>Шаг 3. Добавь ключ</b>\n"
-        "v2rayNG → «+» → «Импорт профиля из буфера обмена».\n\n"
+        "<b>Шаг 2. Возьми ссылку-подписку</b>\n"
+        "Проще всего: «👤 Мой профиль» → нажми на ссылку-подписку, а затем перешли её себе "
+        "в Telegram на телевизоре (вводить пультом долго — лучше через буфер обмена).\n\n"
+        "<b>Шаг 3. Добавь подписку</b>\n"
+        "v2rayNG → три точки → «Группы» → «+» → «Добавить подписку» → вставь ссылку.\n\n"
         "<b>Шаг 4. Подключись и проверь</b>\n"
         "Нажми «V» → Разрешить VPN → открой браузер на телевизоре и зайди на "
         f"{_a('check_ip', '2ip.ru')}.\n\n"
@@ -4433,7 +4681,7 @@ def install_check_text() -> str:
     return (
         "✅ <b>Проверка подключения</b>\n\n"
         "1. Убедись, что VPN включён: в приложении горит «Подключено», "
-        "а в шторке телефона/трее есть значок ключа или VPN.\n"
+        "а в шторке телефона/трее есть значок VPN.\n"
         f"2. Открой {_a('check_ip', '2ip.ru')} — страна должна смениться на "
         "Нидерланды или Германию.\n"
         f"3. Для строгой проверки — {_a('whoer', 'whoer.net')}: там видно и IP, и "
@@ -4444,7 +4692,7 @@ def install_check_text() -> str:
         "• скорость немного ниже, чем без VPN, — это нормально;\n"
         "• первый сайт открывается 1–2 секунды дольше — тоже нормально.\n\n"
         "Если IP не сменился — вернись в инструкцию своего устройства: "
-        "чаще всего ключ добавлен, но кнопка «Подключить» не нажата."
+        "чаще всего подписка добавлена, но кнопка «Подключить» не нажата."
     )
 
 
@@ -4452,7 +4700,7 @@ def install_trouble_text() -> str:
     """Что делать, если не работает — чек-лист от частого к редкому."""
     return (
         "🆘 <b>Не работает? Идём по порядку</b>\n\n"
-        "1️⃣ <b>Ключ добавлен, но не подключается.</b> Нажми «Подключить» в приложении "
+        "1️⃣ <b>Подписка добавлена, но не подключается.</b> Нажми «Подключить» в приложении "
         "и разреши создание VPN-подключения (системное окно). Без разрешения туннель не встанет.\n"
         "2️⃣ <b>Пишет «ошибка» или «таймаут».</b> Выключи VPN → включи режим полёта на 5 секунд → "
         "выключи → подключись снова. Помогает в 8 случаях из 10.\n"
@@ -4464,11 +4712,11 @@ def install_trouble_text() -> str:
         "5️⃣ <b>Отключается в фоне (Android).</b> Настройки → Приложения → твой клиент → "
         "Батарея → «Без ограничений»; в клиенте включи «Always-on VPN».\n"
         "6️⃣ <b>Истёк срок подписки.</b> Проверь «👤 Мой профиль» — если дата прошла, "
-        "продли в «💰 Тарифы» (ключ придёт сразу после оплаты).\n"
+        "продли в «💰 Тарифы» (доступ придёт сразу после оплаты).\n"
         "7️⃣ <b>Ничего не помогло.</b> Напиши в поддержку: приложи скриншот экрана приложения "
         "с ошибкой и свой Telegram ID (команда /myid).\n\n"
-        "💡 Переустановка ключа: «👤 Мой профиль» → «🔄 Сбросить и получить заново» — "
-        "выдам свежий ключ."
+        "💡 Переустановка доступа: «👤 Мой профиль» → «🔄 Сбросить и получить заново» — "
+        "выдам свежую ссылку-подписку."
     )
 
 
@@ -4540,7 +4788,7 @@ def key_actions_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
     """
     rows = [
         [InlineKeyboardButton(text="📲 Как подключиться (пошагово)", callback_data="help_menu")],
-        [InlineKeyboardButton(text="🔑 Мой ключ и подписка", callback_data="profile")],
+        [InlineKeyboardButton(text="🔗 Моя подписка", callback_data="profile")],
     ]
     if tg_id is None or is_admin(tg_id):
         rows.append([InlineKeyboardButton(text="🔄 Сбросить и получить заново",
@@ -4590,7 +4838,7 @@ def welcome_text(tg_id: int) -> str:
         "Мы используем современный протокол <b>VLESS Reality</b>, "
         "который неотличим от обычного интернет-трафика и работает стабильно.\n\n"
         + trial_line +
-        "💰 Платные тарифы — раздел «Тарифы» (оплата и моментальная выдача ключа).\n"
+        "💰 Платные тарифы — раздел «Тарифы» (оплата и моментальная выдача доступа).\n"
         "📲 Подключение по шагам (со ссылками на приложения) — /help.\n"
         "👤 Статус подписки и продление — /profile.\n"
         "📄 Условия сервиса, оплаты и возврата — /terms."
@@ -4717,14 +4965,14 @@ async def cmd_test_vpn(message: Message):
     if not trial_available_for(message.from_user.id):
         await message.answer(
             "🎁 Бесплатный тестовый доступ сейчас недоступен.\n\n"
-            "Актуальные тарифы и цены — в разделе «💰 Тарифы»: ключ приходит сразу "
+            "Актуальные тарифы и цены — в разделе «💰 Тарифы»: доступ приходит сразу "
             "после оплаты. Если нужна помощь — напиши в поддержку.",
             parse_mode="HTML",
             reply_markup=back_kb(),
         )
         return
 
-    wait_msg = await message.answer("⏳ Подключаюсь к 3x-ui и генерирую ключ...")
+    wait_msg = await message.answer("⏳ Подключаюсь к 3x-ui и готовлю доступ...")
 
     try:
         async with vpn_lock:
@@ -4741,11 +4989,11 @@ async def cmd_test_vpn(message: Message):
         inbound_remark = inbound.get("remark") or f"Подключение #{inbound_id}"
 
         if status == "created":
-            title = "🎉 <b>Новый тестовый VPN-клиент успешно создан в 3x-ui!</b>"
+            title = "🎉 <b>Тестовый доступ активирован — 24 часа!</b>"
         elif status == "updated":
-            title = "♻️ <b>Срок твоего ключа истёк — доступ продлён ещё на 24 часа!</b>"
+            title = "♻️ <b>Срок тестового доступа истёк — продлил ещё на 24 часа!</b>"
         else:
-            title = "🔐 <b>Твой действующий тестовый VPN-ключ:</b>"
+            title = "🔐 <b>Твой действующий тестовый доступ:</b>"
 
         auto_note = ""
         if auto_picked:
@@ -4761,18 +5009,16 @@ async def cmd_test_vpn(message: Message):
                 "Запиши его в Railway -> Variables -> <b>ADMIN_ID</b>."
             )
 
-        # Ссылку подписки пользователю не показываем: клиенту достаточно самого
-        # VLESS-ключа, а адрес панели 3x-ui в переписке светить не нужно.
         msg_text = (
             f"{title}\n\n"
             f"⏳ <b>Срок:</b> 24 часа\n"
             f"📦 <b>Трафик:</b> 1 ГиБ\n"
             f"📱 <b>Устройств:</b> 1\n"
             f"📡 <b>Подключение:</b> #{inbound_id} ({escape(inbound_remark)})\n\n"
-            f"🔑 <b>Твой VLESS-ключ (нажми на него, чтобы скопировать):</b>\n"
-            f"<code>{escape(link)}</code>\n\n"
+            + access_block({"link": link, "sub_link": sub_link}) + "\n\n"
             "📲 <b>Дальше по шагам:</b> нажми «Как подключиться» под этим сообщением — "
-            "покажу, какое приложение скачать на твоё устройство и куда вставить ключ."
+            "покажу, какое приложение скачать на твоё устройство и куда вставить ссылку "
+            "(или ключ, если приложение не умеет подписки)."
             f"{group_note}"
             f"{auto_note}"
             f"{admin_note}"
@@ -4803,7 +5049,7 @@ async def cmd_reset_vpn(message: Message):
         if removed:
             await message.answer(
                 "🗑 <b>Тестовый клиент успешно удалён из 3x-ui!</b>\n\n"
-                "Теперь можешь отправить команду /test_vpn для генерации нового ключа с нуля.",
+                "Теперь можешь отправить команду /test_vpn — выдам доступ заново.",
                 parse_mode="HTML",
             )
         else:
@@ -5122,6 +5368,38 @@ async def cmd_panel_debug(message: Message):
             f"   Заказов: {stats['orders_total']}, оплачено: {stats['paid_count']}, "
             f"выручка: {stats['rub']} ₽ / {stats['stars']} ⭐️"
         )
+
+    # Ссылка-подписка: клиенты получают её вместо ключа, поэтому проверяем адрес
+    lines.append("")
+    lines.append("📥 <b>Сервис подписок (ссылка для клиентов):</b>")
+    try:
+        if SUB_URL_BASE:
+            lines.append(f"   Задан SUB_URL_BASE: <code>{escape(SUB_URL_BASE)}</code>")
+        async with XUIClient() as client:
+            settings = await fetch_panel_settings(client)
+            if not settings:
+                lines.append("   ⚠️ Панель не отдала настройки подписок — бот соберёт адрес сам.")
+            elif settings.get("subEnable") is False:
+                lines.append("   ⚠️ Сервис подписок <b>выключен</b> в панели "
+                             "(Settings → Subscription → Enable). Клиенты получат ключ vless.")
+            else:
+                lines.append(
+                    f"   Панель: порт <code>{escape(str(settings.get('subPort')))}</code>, "
+                    f"путь <code>{escape(str(settings.get('subPath')))}</code>, "
+                    f"домен <code>{escape(str(settings.get('subDomain') or '—'))}</code>, "
+                    f"URI <code>{escape(str(settings.get('subURI') or '—'))}</code>"
+                )
+            candidates = subscription_candidates(settings)
+        for base, source in candidates[:3]:
+            ok, detail = await _check_sub_link(build_sub_link(base, "test-address"))
+            lines.append(
+                f"   {'✅' if ok else '❌'} <code>{escape(base)}</code> — {escape(source)}"
+                + ("" if ok else f" ({escape(detail)})")
+            )
+        if candidates:
+            lines.append(f"   Бот использует: <code>{escape(candidates[0][0])}</code>/&lt;Sub ID&gt;")
+    except Exception as exc:
+        lines.append(f"   ❌ Не удалось проверить: <code>{escape(str(exc))}</code>")
 
     await message.answer("\n".join(lines)[:4000], parse_mode="HTML")
 
@@ -5865,7 +6143,14 @@ async def send_profile(message: Message, user_id: int):
                 inbound = sub["inbound"]
                 params = extract_vless_params(inbound)
                 link = build_vless_link(sub["client"], inbound, params)
-            lines += ["", f"🔑 <b>Ключ:</b>\n<code>{escape(link)}</code>"]
+                sub_link = None
+                sub_id = sub["client"].get("subId")
+                if sub_id:
+                    base, _note = await get_subscription_base(client, sub_id=str(sub_id), probe=False)
+                    if base:
+                        sub_link = build_sub_link(base, str(sub_id))
+            lines += ["", access_block({"link": link, "sub_link": sub_link},
+                                       heading="🔗 <b>Твоя ссылка-подписка:</b>")]
         except Exception:
             pass
 
@@ -6244,7 +6529,7 @@ def bot_commands() -> list[BotCommand]:
     # Пользовательские команды — всегда.
     commands = [BotCommand(command="start", description="🏠 Главное меню")]
     if TRIAL_PUBLIC and TRIAL_BUTTON:
-        commands.append(BotCommand(command="test_vpn", description="🔑 Бесплатный доступ на 24 часа"))
+        commands.append(BotCommand(command="test_vpn", description="🔗 Бесплатный доступ на 24 часа"))
     commands += [
         BotCommand(command="profile", description="👤 Моя подписка и ключ"),
         BotCommand(command="help", description="📲 Как подключиться (пошагово)"),
@@ -6263,7 +6548,7 @@ def bot_commands() -> list[BotCommand]:
             BotCommand(command="reset_vpn", description="🔄 Сбросить тестовый ключ"),
         ]
         if TRIAL_BUTTON and not TRIAL_PUBLIC:
-            commands.insert(1, BotCommand(command="test_vpn", description="🔑 Тестовый ключ (24 часа)"))
+            commands.insert(1, BotCommand(command="test_vpn", description="🔗 Тестовый доступ (24 часа)"))
     # Тестовые команды проверки оплаты — отдельный флаг TEST_TOOLS.
     if test_tools_enabled():
         commands += [

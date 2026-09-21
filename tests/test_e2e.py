@@ -310,10 +310,12 @@ async def step_payment(bot):
     check("срок подписки 30 дней", 29 <= (days_left(client) or 0) <= 30,
           f"{days_left(client)} дн.")
     key_msg = last_text(ADMIN)
-    check("ключ отправлен сообщением", "vless://" in key_msg)
-    check("в сообщении с ключом нет ссылки подписки и адреса панели",
-          "Ссылка подписки" not in key_msg and "/sub/" not in key_msg
-          and "XUI_URL" not in key_msg, key_msg[:70].replace("\n", " "))
+    check("доступ отправлен сообщением (ссылка-подписка)",
+          "/sub/" in key_msg and "ссылка-подписка" in key_msg,
+          key_msg[:80].replace("\n", " "))
+    check("отдельный ключ vless в сообщении не показывается", "vless://" not in key_msg)
+    check("в сообщении нет внутреннего адреса панели",
+          "XUI_URL" not in key_msg, key_msg[:70].replace("\n", " "))
     check("в сообщении есть тариф, срок и дата",
           "Базовый" in key_msg and "Действует до" in key_msg)
     check("кнопки после оплаты: инструкция, ключ, главное меню",
@@ -323,7 +325,8 @@ async def step_payment(bot):
     await bot.cmd_profile(make_message(bot, ADMIN, "/profile"))
     profile = last_text(ADMIN)
     check("/profile показывает активную подписку", "Активна" in profile)
-    check("/profile показывает срок и ключ", "Действует до" in profile and "vless://" in profile)
+    check("/profile показывает срок и ссылку-подписку",
+          "Действует до" in profile and "/sub/" in profile)
     check("в профиле остались тарифы, а кнопки теста нет",
           {"tariffs", "main_menu"} <= set(buttons(last_sent(ADMIN)))
           and "get_test_key_btn" not in buttons(last_sent(ADMIN)),
@@ -339,18 +342,18 @@ async def step_trial_key(bot):
     await bot.cmd_test_vpn(make_message(bot, ADMIN, "/test_vpn"))
     trial = trial_client(ADMIN)
     check("тестовый клиент создан в панели (tg-test-*)", trial is not None)
-    check("тестовый ключ отправлен", "vless://" in last_text(ADMIN))
-    check("в тестовом ключе тоже нет ссылки подписки",
-          "Ссылка подписки" not in last_text(ADMIN) and "/sub/" not in last_text(ADMIN))
+    check("тестовый доступ отправлен (ссылка-подписка)", "/sub/" in last_text(ADMIN),
+          last_text(ADMIN)[:80].replace("\n", " "))
+    check("в тестовом доступе ключ vless не показывается", "vless://" not in last_text(ADMIN))
     check("в сообщении срок 24 часа и трафик 1 ГиБ",
           "24 часа" in last_text(ADMIN) and "1 ГиБ" in last_text(ADMIN))
     check("кнопки под тестовым ключом",
           {"help_menu", "profile", "main_menu"} <= set(buttons(last_sent(ADMIN))))
 
     await bot.cmd_test_vpn(make_message(bot, ADMIN, "/test_vpn"))
-    check("повторный запрос отдаёт тот же ключ, а не создаёт новый",
-          "действующий тестовый ключ" in last_text(ADMIN).lower()
-          or "Твой действующий тестовый VPN-ключ" in last_text(ADMIN))
+    check("повторный запрос отдаёт тот же доступ, а не создаёт новый",
+          "действующий тестовый доступ" in last_text(ADMIN).lower(),
+          last_text(ADMIN)[:80].replace("\n", " "))
 
     check("тестовый ключ не тронул платную подписку",
           panel_client(ADMIN) is not None and trial_client(ADMIN) is not None)
@@ -455,9 +458,9 @@ async def step_admin_tools(bot):
     fp.TG["calls"].clear()
     await bot.cmd_test_pay(make_message(bot, ADMIN, "/test_pay school"))
     # /test_pay присылает два сообщения: сначала ключ, потом отчёт с кнопкой удаления
-    check("/test_pay выдаёт ключ без оплаты (админ)",
+    check("/test_pay выдаёт доступ без оплаты (админ)",
           panel_client(ADMIN) is not None
-          and any("vless://" in t for t in texts_to(ADMIN)[-3:]),
+          and any("/sub/" in t for t in texts_to(ADMIN)[-3:]),
           last_text(ADMIN)[:80].replace("\n", " "))
     check("выдан именно тариф school (30 дней)",
           29 <= (days_left(panel_client(ADMIN)) or 0) <= 30, f"{days_left(panel_client(ADMIN))} дн.")
