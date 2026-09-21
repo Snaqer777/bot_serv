@@ -56,7 +56,6 @@ Telegram-бот на **aiogram 3**, работающий на **Railway**.
 | `FREEKASSA_SECRET1` | `secret_word_1` | «Секретное слово» из кабинета FK — подпись ссылки на оплату |
 | `FREEKASSA_SECRET2` | `secret_word_2` | «Секретное слово 2» из кабинета FK — проверка уведомлений о платеже (обязательно для выдачи ключа) |
 | `FREEKASSA_TEST` | `1` | Тестовый режим магазина FK: деньги не списываются, `/test_pay` включается сам. **Для боя переменную убрать** |
-| `FREEKASSA_METHOD` | не задана | Какой способ оплаты предлагать клиенту (`i` в ссылке): `sbp`, `mir`, `visa`, `mastercard`, `card`, `yoomoney`, `fkwallet`, `usdt`, `bitcoin` или ID числом. Без переменной страница открывается со способом по умолчанию — часто это FKWallet, для него нужна регистрация в кошельке. Клиент может выбрать другой способ на странице |
 | `FREEKASSA_PAY_URL` | `https://pay.freekassa.ru/` | Платёжная страница. Если `pay.freekassa.ru` не открывается у вас и у клиентов (блокировка провайдера/DNS) — зеркало `https://pay.kassa.shop/` (та же касса) или `https://pay.fk.money/` для международного кабинета |
 | `FREEKASSA_CURRENCY` | `RUB` | Валюта счёта: `RUB`, `USD`, `EUR`, `UAH`, `KZT` |
 | `FREEKASSA_SIGN_VARIANT` | `currency` | Формула подписи ссылки: `currency` — `md5(магазин:сумма:секрет:валюта:заказ)`, `plain` — старая форма без валюты |
@@ -298,7 +297,7 @@ FreeKassa — самый быстрый способ принимать рубл
   Нужен `PAYMENTS_ALLOW_TEST_PAY=1` (в тестовом режиме FreeKassa включается сам).
 - `/freekassa_check` — проверка настроек FreeKassa без денег: магазин, оба секретных слова,
   подписи, адрес вебхука, доступность сервера и памятка с полями для кабинета FK.
-- `python tests/test_payments.py` — полный прогон оплаты на фейковых API (333 проверки).
+- `python tests/test_payments.py` — полный прогон оплаты на фейковых API (327 проверок).
 
 ### Что происходит после оплаты
 
@@ -655,7 +654,7 @@ FreeKassa — самый быстрый способ принимать рубл
 ```bash
 pip install -r requirements.txt pyotp
 
-python tests/test_payments.py   # оплата: Stars, BotFather, ЮKassa, FreeKassa — 333 проверки
+python tests/test_payments.py   # оплата: Stars, BotFather, ЮKassa, FreeKassa — 327 проверок
 python tests/test_help.py       # пошаговая инструкция подключения и её кнопки — 74 проверки
 python tests/test_production.py # боевой вид (ADMIN_TOOLS, TRIAL_PUBLIC, TRIAL_BUTTON, TERMS_ACCEPT) — 129 проверок
 python tests/test_referral.py   # реферальная программа: ссылка → друг → оплата → дни — 48 проверок

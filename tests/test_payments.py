@@ -294,7 +294,6 @@ def new_bot(env, store_file, admins=None):
         "FREEKASSA_SECRET1": env.get("secret1", FK_SECRET1),
         "FREEKASSA_SECRET2": env.get("secret2", FK_SECRET2),
         "FREEKASSA_PAY_URL": env.get("pay_url") or "https://pay.freekassa.ru/",
-        "FREEKASSA_METHOD": env.get("fk_method"),
         "FREEKASSA_CURRENCY": env.get("currency") or "RUB",
         "FREEKASSA_SIGN_VARIANT": env.get("sign_variant"),
         "FREEKASSA_TEST": env.get("fk_test"),
@@ -1622,34 +1621,6 @@ async def test_myid_payments_diag(store_file):
     await bot.cmd_myid(make_message(bot, text="/myid"))
     text = _last_api_text()
     check("/myid: видно, что магазин не задан", "не задан ❌" in text)
-
-    # Способ оплаты: по умолчанию не предлагаем, по переменной — подставляем в ссылку
-    reset_all()
-    plain = new_bot({"mode": "freekassa"}, store_file)
-    probe = {"id": "probe-2", "tg_id": 0, "amount_rub": 99, "currency": "RUB"}
-    check("без FREEKASSA_METHOD в ссылке нет параметра i",
-          "i=" not in plain.freekassa_payment_url(probe), plain.freekassa_payment_url(probe)[:80])
-
-    reset_all()
-    sbp = new_bot({"mode": "freekassa", "fk_method": "sbp"}, store_file)
-    check("FREEKASSA_METHOD=sbp подставляет i=42",
-          "i=42" in sbp.freekassa_payment_url(probe), sbp.freekassa_payment_url(probe)[:80])
-    check("способ оплаты виден в отчёте /freekassa_check", "i=42" in (await sbp.freekassa_self_check()))
-
-    reset_all()
-    mir = new_bot({"mode": "freekassa", "fk_method": "мир"}, store_file)
-    check("русский псевдоним тоже работает (мир → 12)",
-          "i=12" in mir.freekassa_payment_url(probe))
-
-    reset_all()
-    numeric = new_bot({"mode": "freekassa", "fk_method": "42"}, store_file)
-    check("можно указать ID способа числом",
-          "i=42" in numeric.freekassa_payment_url(probe))
-
-    reset_all()
-    reset_bot = new_bot({"mode": "freekassa", "fk_method": "fkwallet"}, store_file)
-    check("FKWallet тоже можно предложить (i=1)",
-          "i=1" in reset_bot.freekassa_payment_url(probe))
 
     # Обычному пользователю диагностика оплаты не показывается
     reset_all()
