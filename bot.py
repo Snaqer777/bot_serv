@@ -3583,7 +3583,26 @@ async def freekassa_self_check() -> str:
         except Exception as exc:
             lines.append(f"• Самопроверка сервера: ⚠️ {escape(_snip(str(exc), 120))}")
 
-    # 3. Что вписать в кабинет FK и что попросить у поддержки.
+    # 3. Доступна ли платёжная страница (домен может блокироваться у провайдеров,
+    #    тогда ссылка не откроется ни у админа, ни у клиентов — это не ошибка настроек).
+    try:
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(FREEKASSA_PAY_URL + "/") as resp:
+                lines.append(
+                    f"• Доступность страницы оплаты: отвечает ✅ (HTTP {resp.status})"
+                )
+    except Exception as exc:
+        lines.append(
+            "• Доступность страницы оплаты: ⚠️ "
+            f"<code>{escape(_snip(str(exc), 90))}</code>\n"
+            "  С сервера бота домен не отвечает — у клиентов ссылка тоже не откроется. "
+            "Варианты: зеркало <code>FREEKASSA_PAY_URL=https://pay.kassa.shop/</code> "
+            "(та же касса и подписи) или <code>https://pay.fk.money/</code> "
+            "для международного кабинета. Актуальный домен подтвердит поддержка FK."
+        )
+
+    # 4. Что вписать в кабинет FK и что попросить у поддержки.
     bot_username = await get_bot_username()
     back_url = f"https://t.me/{bot_username}" if bot_username else "https://t.me/<имя_бота>"
     lines += [

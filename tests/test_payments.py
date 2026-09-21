@@ -1525,6 +1525,11 @@ async def test_freekassa_self_check(store_file):
               f"http://127.0.0.1:{WEBHOOK_PORT}/freekassa/webhook" in text)
         check("отчёт показывает адрес возврата на бота", "t.me/" in text)
         check("отчёт напоминает про «Подтверждение заявки»", "Подтверждение заявки" in text)
+        check("отчёт проверяет доступность страницы оплаты",
+              "Доступность страницы оплаты" in text)
+        check("если домен не отвечает — подсказано зеркало pay.kassa.shop",
+              "Доступность страницы оплаты: отвечает ✅" in text
+              or "pay.kassa.shop" in text, text[-260:])
         check("отчёт ведёт к первой настоящей оплате",
               "первая настоящая оплата" in text and "PAYMENTS_ALLOW_TEST_PAY=1" in text)
         check("самопроверка сервера прошла (healthz отвечает)", "Самопроверка сервера: ✅" in text, text[-200:])

@@ -56,7 +56,7 @@ Telegram-бот на **aiogram 3**, работающий на **Railway**.
 | `FREEKASSA_SECRET1` | `secret_word_1` | «Секретное слово» из кабинета FK — подпись ссылки на оплату |
 | `FREEKASSA_SECRET2` | `secret_word_2` | «Секретное слово 2» из кабинета FK — проверка уведомлений о платеже (обязательно для выдачи ключа) |
 | `FREEKASSA_TEST` | `1` | Тестовый режим магазина FK: деньги не списываются, `/test_pay` включается сам. **Для боя переменную убрать** |
-| `FREEKASSA_PAY_URL` | `https://pay.freekassa.ru/` | Платёжная страница: РФ-франшиза (рубли) либо `https://pay.fk.money/` (международная) |
+| `FREEKASSA_PAY_URL` | `https://pay.freekassa.ru/` | Платёжная страница. Если `pay.freekassa.ru` не открывается у вас и у клиентов (блокировка провайдера/DNS) — зеркало `https://pay.kassa.shop/` (та же касса) или `https://pay.fk.money/` для международного кабинета |
 | `FREEKASSA_CURRENCY` | `RUB` | Валюта счёта: `RUB`, `USD`, `EUR`, `UAH`, `KZT` |
 | `FREEKASSA_SIGN_VARIANT` | `currency` | Формула подписи ссылки: `currency` — `md5(магазин:сумма:секрет:валюта:заказ)`, `plain` — старая форма без валюты |
 | `FREEKASSA_CHECK_IP` / `FREEKASSA_ALLOWED_IPS` | `0` / — | Проверять ли IP уведомлений и свой белый список. На Railway оставьте `0`: бот видит IP прокси, защищает подпись `SIGN` |
