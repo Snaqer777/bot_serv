@@ -2566,19 +2566,27 @@ def payments_diag_text() -> str:
     elif PAYMENTS_MODE == "provider":
         lines.append(f"• Токен BotFather: {'задан ✅' if PAYMENT_PROVIDER_TOKEN else 'НЕ задан ❌'}")
 
-    if test_tools_enabled():
-        lines.append("• Проверки оплаты: <b>включены</b> ✅ — /test_pay, /freekassa_check")
-    else:
-        need = []
-        if not ADMIN_TOOLS:
-            need.append("<code>ADMIN_TOOLS=1</code>")
-        if TEST_TOOLS_RAW in ("0", "false", "no", "off"):
-            need.append("<code>TEST_TOOLS=1</code> или убрать эту переменную")
-        elif not test_pay_enabled():
-            need.append("<code>FREEKASSA_TEST=1</code> (или <code>PAYMENTS_ALLOW_TEST_PAY=1</code>)")
+    # Диагностика настроек — только чтение, поэтому доступна и в боевом режиме.
+    if admin_tools_enabled() and PAYMENTS_MODE == "freekassa":
+        lines.append("• <code>/freekassa_check</code> — проверка настроек магазина: <b>доступна</b> ✅")
+    elif PAYMENTS_MODE == "freekassa":
         lines.append(
-            "• Проверки оплаты: <b>скрыты</b> — /test_pay и /freekassa_check не отвечают.\n"
-            "  Чтобы включить, поставь в Railway → Variables: " + ", ".join(need) + "."
+            "• <code>/freekassa_check</code> — проверка настроек магазина: скрыта, "
+            "нужна <code>ADMIN_TOOLS=1</code>"
+        )
+    # Выдача ключа без оплаты — это уже тестовый инструмент.
+    if not ADMIN_TOOLS or TEST_TOOLS_RAW in ("0", "false", "no", "off"):
+        lines.append(
+            "• <code>/test_pay</code> — выдача ключа без оплаты: скрыта"
+            + (" (<code>ADMIN_TOOLS=0</code>)" if not ADMIN_TOOLS else " (<code>TEST_TOOLS=0</code>)")
+        )
+    elif test_pay_enabled():
+        lines.append("• <code>/test_pay</code> — выдача ключа без оплаты: <b>включена</b> ✅")
+    else:
+        lines.append(
+            "• <code>/test_pay</code> — выдача ключа без оплаты: скрыта. "
+            "Включить: <code>PAYMENTS_ALLOW_TEST_PAY=1</code> (в тестовом режиме FK — "
+            "<code>FREEKASSA_TEST=1</code>)"
         )
     if not ADMIN_TOOLS:
         lines.append(
@@ -3590,13 +3598,21 @@ async def freekassa_self_check() -> str:
         "<code>YES</code>, и FK повторяет уведомление, пока не получит ответ.",
         "2. Если магазин под бота — попросить поддержку разрешить URL оповещения на своём домене.",
         (
-            "3. Тестовый режим уже включён — проведи тестовую оплату и убедись, что ключ пришёл."
+            "3. Тестовый режим включён: галочка в кабинете FK и <code>FREEKASSA_TEST=1</code>. "
+            "Проведи тестовую оплату — ключ должен прийти сам."
             if FREEKASSA_TEST
-            else "3. Перед боем включить в кабинете FK <b>«Тестовый режим»</b> и прислать "
-                 "<code>FREEKASSA_TEST=1</code> — проверим выдачу без реальных денег."
+            else "3. Боевой режим: в кабинете FK галочка <b>«Тестовый режим»</b> должна быть "
+                 "<b>выключена</b>, а переменная <code>FREEKASSA_TEST</code> — убрана из Railway. "
+                 "Если тест останется только с одной стороны, оплата не спишется, а бот будет ждать тест."
         ),
         "",
-        "Дальше: /test_pay — выдача ключа тем же путём, что и после настоящей оплаты.",
+        (
+            "Дальше: /test_pay — выдача ключа тем же путём, что и после настоящей оплаты."
+            if test_pay_enabled()
+            else "Дальше: первая настоящая оплата самого дешёвого тарифа. После неё заказ в "
+                 "<code>/payments</code> станет «✅ оплачен», а ключ придёт в чат. "
+                 "Хочешь прогонять выдачу без денег и в бою — <code>PAYMENTS_ALLOW_TEST_PAY=1</code>."
+        ),
     ]
     return "\n".join(lines)
 
@@ -4901,6 +4917,8 @@ async def cmd_panel_debug(message: Message):
             )
             if test_tools_enabled():
                 lines.append("   Проверка без оплаты: /test_pay ✅, связка с FreeKassa: /freekassa_check")
+            elif admin_tools_enabled():
+                lines.append("   Диагностика магазина без денег: /freekassa_check")
 
         elif PAYMENTS_MODE == "stars":
             lines.append(f"   Курс: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (STARS_RUB_RATE)")
@@ -5238,6 +5256,8 @@ async def cmd_payments(message: Message):
         lines.append(f"• Курс пересчёта: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (меняется через STARS_RUB_RATE)")
     if test_tools_enabled():
         lines.append("• Проверка без оплаты: /test_pay ✅ (ключ выдаётся тем же путём, что после оплаты)")
+    elif PAYMENTS_MODE == "freekassa" and admin_tools_enabled():
+        lines.append("• Диагностика магазина без денег: /freekassa_check")
 
     lines += [
         "",
@@ -5900,23 +5920,31 @@ else:
         "Включить при необходимости: ADMIN_TOOLS=1 в Railway → Variables."
     )
 
-# Тестовые команды (проверка оплаты без денег) — отдельный флаг TEST_TOOLS,
-# и только когда включены служебные команды.
+# Диагностика связки с FreeKassa: ничего не создаёт и не оплачивает, только читает
+# настройки и считает подписи. Доступна администратору и в боевом режиме — именно там
+# она и нужна, поэтому флагов тестового режима не требует.
+if admin_tools_enabled() and PAYMENTS_MODE == "freekassa":
+    dp.message.register(cmd_freekassa_check, Command("freekassa_check"))
+    dp.callback_query.register(cb_freekassa_check, F.data == "freekassa_check")
+    logger.info("Проверка настроек FreeKassa доступна администратору: /freekassa_check.")
+elif admin_tools_enabled():
+    logger.info(
+        "Проверка /freekassa_check не нужна: режим оплаты %s, а не freekassa.", PAYMENTS_MODE
+    )
+
+# Проверка выдачи ключа без оплаты — отдельный флаг TEST_TOOLS и только когда
+# включены служебные команды: в боевом виде она не регистрируется вообще.
 if test_tools_enabled():
     dp.message.register(cmd_test_pay, Command("test_pay"))
-    dp.message.register(cmd_freekassa_check, Command("freekassa_check"))
     dp.callback_query.register(cb_testpay_menu, F.data == "testpay_menu")
     dp.callback_query.register(cb_testpay_run, F.data.startswith("testpay_run_"))
     dp.callback_query.register(cb_testpay_del, F.data.startswith("testpay_del_"))
-    dp.callback_query.register(cb_freekassa_check, F.data == "freekassa_check")
-    logger.info(
-        "Проверки оплаты включены: /test_pay, /freekassa_check (режим %s).", PAYMENTS_MODE
-    )
+    logger.info("Проверка выдачи ключа без оплаты включена: /test_pay (только для администратора).")
 else:
-    # Тишина в ответ на /test_pay и /freekassa_check — это не поломка, а флаг ниже.
-    # Пишем в лог, что именно мешает: так видно в Railway → Deployments → Logs.
+    # Тишина в ответ на /test_pay — это не поломка, а флаг ниже. Пишем в лог,
+    # что именно мешает: видно в Railway → Deployments → Logs.
     logger.info(
-        "Проверки оплаты скрыты: /test_pay и /freekassa_check не зарегистрированы. "
+        "Проверка выдачи ключа без оплаты скрыта: /test_pay не зарегистрирована. "
         "Включить: ADMIN_TOOLS=1 и (FREEKASSA_TEST=1 или PAYMENTS_ALLOW_TEST_PAY=1 или TEST_TOOLS=1). "
         "Сейчас: ADMIN_TOOLS=%s, TEST_TOOLS=%r, режим оплаты %s.",
         int(ADMIN_TOOLS), TEST_TOOLS_RAW or "авто", PAYMENTS_MODE,
@@ -5985,6 +6013,21 @@ async def main():
 
     payment_store.load()
     logger.info("Приём оплаты: %s.", payments_mode_title())
+    if PAYMENTS_MODE == "freekassa":
+        if FREEKASSA_TEST:
+            logger.warning(
+                "FreeKassa в ТЕСТОВОМ режиме (FREEKASSA_TEST=1): реальные платежи не пройдут. "
+                "Для боя выключи «Тестовый режим» в кабинете FK и убери переменную FREEKASSA_TEST."
+            )
+        elif freekassa_configured():
+            logger.info(
+                "FreeKassa в боевом режиме: платежи настоящие. Проверка настроек — /freekassa_check."
+            )
+        else:
+            logger.warning(
+                "FreeKassa настроена не полностью: нужны FREEKASSA_MERCHANT_ID, FREEKASSA_SECRET1, "
+                "FREEKASSA_SECRET2. Чего не хватает — видно в /myid."
+            )
 
     runner = None
     try:

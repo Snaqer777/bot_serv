@@ -55,7 +55,7 @@ Telegram-бот на **aiogram 3**, работающий на **Railway**.
 | `FREEKASSA_MERCHANT_ID` | `14248` | ID магазина из кабинета FreeKassa (Настройки магазина). Нужен только для режима `freekassa` |
 | `FREEKASSA_SECRET1` | `secret_word_1` | «Секретное слово» из кабинета FK — подпись ссылки на оплату |
 | `FREEKASSA_SECRET2` | `secret_word_2` | «Секретное слово 2» из кабинета FK — проверка уведомлений о платеже (обязательно для выдачи ключа) |
-| `FREEKASSA_TEST` | `1` | Тестовый режим магазина FK: деньги не списываются. Включает `/freekassa_check` и `/test_pay` автоматически |
+| `FREEKASSA_TEST` | `1` | Тестовый режим магазина FK: деньги не списываются, `/test_pay` включается сам. **Для боя переменную убрать** |
 | `FREEKASSA_PAY_URL` | `https://pay.freekassa.ru/` | Платёжная страница: РФ-франшиза (рубли) либо `https://pay.fk.money/` (международная) |
 | `FREEKASSA_CURRENCY` | `RUB` | Валюта счёта: `RUB`, `USD`, `EUR`, `UAH`, `KZT` |
 | `FREEKASSA_SIGN_VARIANT` | `currency` | Формула подписи ссылки: `currency` — `md5(магазин:сумма:секрет:валюта:заказ)`, `plain` — старая форма без валюты |
@@ -140,6 +140,13 @@ FreeKassa — самый быстрый способ принимать рубл
    перезапускался).
 6. Бой: выключи «Тестовый режим» в кабинете и убери `FREEKASSA_TEST`.
 
+   В боевом режиме `/freekassa_check` остаётся доступной администратору (это только проверка
+   настроек, ключи она не выдаёт), а `/test_pay` исчезает — вернуть её можно переменной
+   `PAYMENTS_ALLOW_TEST_PAY=1`, если нужно прогонять выдачу без денег уже в бою.
+
+   Первая настоящая оплата: оплати самый дешёвый тариф и проверь, что заказ в `/payments`
+   стал «✅ оплачен», а ключ пришёл в чат. Не сошлось — `/freekassa_check` покажет, где.
+
 
 | Режим | `PAYMENTS_MODE` | Что нужно | Кому подходит |
 |---|---|---|---|
@@ -200,7 +207,7 @@ FreeKassa — самый быстрый способ принимать рубл
 | `ADMIN_TOOLS` | Что происходит |
 |---|---|
 | `0` или не задана (по умолчанию) | Служебных команд в боте **нет**: не видны в меню Telegram, не отвечают на ввод |
-| `1` | Возвращаются `/payments`, `/panel_debug`, `/groups`, `/inbounds`, `/totp`, `/reset_vpn`, `/revoke` (и проверки оплаты: `/test_pay`, `/freekassa_check`) |
+| `1` | Возвращаются `/payments`, `/panel_debug`, `/groups`, `/inbounds`, `/totp`, `/reset_vpn`, `/revoke`, а также диагностика `/freekassa_check` (она нужна и в бою) |
 
 Что именно скрывается: `/inbounds`, `/reset_vpn`, `/panel_debug`, `/totp`, `/groups`, `/payments`,
 `/revoke`, `/test_pay`, `/freekassa_check`. Обычный пользователь в любом случае не мог ими
@@ -272,7 +279,8 @@ FreeKassa — самый быстрый способ принимать рубл
 
 | Режим | Что видно админу |
 |---|---|
-| `ADMIN_TOOLS=1` + `PAYMENTS_ALLOW_TEST_PAY=1` | Кнопки проверок в `/payments`, команды `/test_pay`, `/freekassa_check` |
+| `ADMIN_TOOLS=1` | Диагностика `/freekassa_check` — работает и в бою (ничего не создаёт) |
+| `ADMIN_TOOLS=1` + `PAYMENTS_ALLOW_TEST_PAY=1` | Кнопки проверок в `/payments` и выдача ключа без оплаты `/test_pay` |
 | `ADMIN_TOOLS=1` + `FREEKASSA_TEST=1` | То же — включается автоматически в тестовом режиме FreeKassa |
 | `TEST_TOOLS=0` | Прячет проверки даже в тестовом режиме (полностью боевой вид) |
 | `TEST_TOOLS=1` | Включает проверки принудительно |
@@ -288,7 +296,7 @@ FreeKassa — самый быстрый способ принимать рубл
   Нужен `PAYMENTS_ALLOW_TEST_PAY=1` (в тестовом режиме FreeKassa включается сам).
 - `/freekassa_check` — проверка настроек FreeKassa без денег: магазин, оба секретных слова,
   подписи, адрес вебхука, доступность сервера и памятка с полями для кабинета FK.
-- `python tests/test_payments.py` — полный прогон оплаты на фейковых API (296 проверок).
+- `python tests/test_payments.py` — полный прогон оплаты на фейковых API (307 проверок).
 
 ### Что происходит после оплаты
 
@@ -557,7 +565,7 @@ FreeKassa — самый быстрый способ принимать рубл
 | `/revoke <telegram_id>` | Админ | Удаляет платную подписку из панели (возврат/блокировка) |
 | `/myid` | Все | Показывает ваш Telegram ID; администратору — ещё и состояние оплаты: режим, магазин FK, URL оповещения и почему скрыты проверки (`/test_pay`, `/freekassa_check`) |
 | `/test_pay [тариф]` | Админ | Проверяет выдачу ключа без оплаты (нужен `PAYMENTS_ALLOW_TEST_PAY=1`, в тестовом режиме FK включён сам) |
-| `/freekassa_check` | Админ | Проверяет настройки FreeKassa без денег: магазин, подписи, адрес вебхука, памятка по кабинету FK |
+| `/freekassa_check` | Админ | Проверяет настройки FreeKassa без денег: магазин, подписи, адрес вебхука, памятка по кабинету FK. Доступна и в боевом режиме |
 
 ---
 
@@ -586,7 +594,7 @@ FreeKassa — самый быстрый способ принимать рубл
   - Если `ADMIN_ID` заполнен нечисловым значением, бот не блокирует команды (чтобы нельзя было запереть себя
     вне бота), но `/myid` и `/panel_debug` прямо предупредят об этом.
   - После правки переменной перезапуск сервиса выполняет Railway сам — подождите 1–2 минуты.
-  - `/test_pay` и `/freekassa_check` дополнительно требуют, чтобы проверка была разрешена:
+  - `/test_pay` дополнительно требует, чтобы проверка была разрешена:
     `PAYMENTS_ALLOW_TEST_PAY=1` (в тестовом режиме FreeKassa включается автоматически).
 
 - **Бот пишет: «Панель 3x-ui не отвечает по адресу»**
@@ -644,9 +652,9 @@ FreeKassa — самый быстрый способ принимать рубл
 ```bash
 pip install -r requirements.txt pyotp
 
-python tests/test_payments.py   # оплата: Stars, BotFather, ЮKassa, FreeKassa — 296 проверок
+python tests/test_payments.py   # оплата: Stars, BotFather, ЮKassa, FreeKassa — 307 проверок
 python tests/test_help.py       # пошаговая инструкция подключения и её кнопки — 74 проверки
-python tests/test_production.py # боевой вид (ADMIN_TOOLS, TRIAL_PUBLIC, TRIAL_BUTTON, TERMS_ACCEPT) — 116 проверок
+python tests/test_production.py # боевой вид (ADMIN_TOOLS, TRIAL_PUBLIC, TRIAL_BUTTON, TERMS_ACCEPT) — 129 проверок
 python tests/test_referral.py   # реферальная программа: ссылка → друг → оплата → дни — 48 проверок
 python tests/test_groups.py     # группы клиентов 3x-ui 3.2+ — 45 проверок
 python tests/test_2fa.py        # 2FA (Google Authenticator) и вход в панель — 30 проверок

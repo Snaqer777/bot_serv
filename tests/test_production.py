@@ -24,10 +24,14 @@ from panel import load_bot
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ADMIN_ID = 42
-TEST_HANDLERS = {
-    "cmd_test_pay", "cmd_freekassa_check",
-    "cb_testpay_menu", "cb_testpay_run", "cb_testpay_del", "cb_freekassa_check",
+# Выдача ключа без оплаты — тестовый инструмент (TEST_TOOLS / FREEKASSA_TEST /
+# PAYMENTS_ALLOW_TEST_PAY).
+TEST_PAY_HANDLERS = {
+    "cmd_test_pay", "cb_testpay_menu", "cb_testpay_run", "cb_testpay_del",
 }
+# Диагностика настроек FreeKassa — только чтение: доступна администратору и в бою.
+FREEKASSA_CHECK_HANDLERS = {"cmd_freekassa_check", "cb_freekassa_check"}
+TEST_HANDLERS = TEST_PAY_HANDLERS | FREEKASSA_CHECK_HANDLERS
 ADMIN_HANDLERS = {
     "cmd_inbounds", "cmd_reset_vpn", "cmd_groups", "cmd_panel_debug",
     "cmd_totp", "cmd_payments", "cmd_revoke",
@@ -166,6 +170,8 @@ async def test_production_look():
     check("ни один тестовый обработчик не зарегистрирован",
           not (TEST_HANDLERS & (msg_handlers | cb_handlers)),
           str(sorted(TEST_HANDLERS & (msg_handlers | cb_handlers))))
+    check("диагностика FreeKassa не отвечает, пока не включены служебные команды",
+          not (FREEKASSA_CHECK_HANDLERS & (msg_handlers | cb_handlers)))
 
     commands = []
 
@@ -204,11 +210,12 @@ async def test_production_look():
 
     myid = FakeMsg(uid=ADMIN_ID, text="/myid")
     await bot.cmd_myid(myid)
-    # Владельцу /myid честно показывает, что проверки оплаты скрыты и какой переменной
-    # их вернуть — иначе молчание /test_pay выглядит как поломка бота.
-    check("админ-подсказка /myid говорит, что проверки оплаты скрыты",
-          "Проверки оплаты: <b>скрыты</b>" in myid.last and "/test_pay" in myid.last)
-    check("/myid называет причину: ADMIN_TOOLS=0", "ADMIN_TOOLS=1" in myid.last)
+    # Владельцу /myid честно показывает, что тестовая выдача скрыта и какой переменной
+    # её вернуть — иначе молчание /test_pay выглядит как поломка бота.
+    check("админ-подсказка /myid говорит, что выдача без оплаты скрыта",
+          "/test_pay" in myid.last and "скрыта" in myid.last)
+    check("/myid называет причину: ADMIN_TOOLS=0", "ADMIN_TOOLS=0" in myid.last)
+    check("/myid подсказывает, что включить", "ADMIN_TOOLS=1" in myid.last)
     check("/myid объясняет, как вернуть служебные команды",
           "ADMIN_TOOLS=1" in myid.last and "скрыты" in myid.last)
 
@@ -274,7 +281,11 @@ async def test_test_mode_returns_tools():
                    "fk_test": "1", "admin_tools": "1", "test_tools": "0"})
     check("TEST_TOOLS=0 прячет проверку даже в тестовом режиме", hidden.test_tools_enabled() is False)
     hidden_handlers = handler_names(hidden.dp.message) | handler_names(hidden.dp.callback_query)
-    check("в этом случае обработчиков проверки нет", not (TEST_HANDLERS & hidden_handlers))
+    check("в этом случае выдача без оплаты недоступна",
+          not (TEST_PAY_HANDLERS & hidden_handlers),
+          str(sorted(TEST_PAY_HANDLERS & hidden_handlers)))
+    check("диагностика /freekassa_check остаётся доступной",
+          FREEKASSA_CHECK_HANDLERS <= hidden_handlers)
 
     forced = load({"mode": "freekassa", "merchant": "14248", "secret1": "s1", "secret2": "s2",
                    "test_tools": "1", "admin_tools": "1"})
@@ -286,6 +297,46 @@ async def test_test_mode_returns_tools():
     check("ADMIN_TOOLS=0 прячет проверки оплаты", no_admin.test_tools_enabled() is False)
     check("обработчиков проверок нет", not (TEST_HANDLERS & (handler_names(no_admin.dp.message)
                                                              | handler_names(no_admin.dp.callback_query))))
+
+
+async def test_wartime_diagnostics():
+    print("\n▶ 2б. Боевой режим: диагностика FreeKassa доступна, выдача без оплаты — нет")
+    bot = load({"mode": "freekassa", "merchant": "14248", "secret1": "s1", "secret2": "s2",
+                "admin_tools": "1"})
+    handlers = handler_names(bot.dp.message) | handler_names(bot.dp.callback_query)
+    check("в бою /freekassa_check зарегистрирована", FREEKASSA_CHECK_HANDLERS <= handlers,
+          str(sorted(FREEKASSA_CHECK_HANDLERS - handlers)))
+    check("в бою /test_pay не зарегистрирована", not (TEST_PAY_HANDLERS & handlers),
+          str(sorted(TEST_PAY_HANDLERS & handlers)))
+    check("в бою test_tools_enabled() выключен", bot.test_tools_enabled() is False)
+    check("режим оплаты — боевой", bot.FREEKASSA_TEST is False)
+
+    commands = []
+
+    async def fake_set_my_commands(items):
+        commands.extend(items)
+
+    bot.bot.set_my_commands = fake_set_my_commands
+    await bot.on_startup()
+    names = [c.command for c in commands]
+    check("в бою в меню Telegram нет ни /test_pay, ни /freekassa_check",
+          "test_pay" not in names and "freekassa_check" not in names, str(names))
+
+    msg = FakeMsg()
+    await bot.cmd_payments(msg)
+    text = msg.last
+    check("в /payments нет ни /test_pay, ни PAYMENTS_ALLOW_TEST_PAY",
+          "/test_pay" not in text and "PAYMENTS_ALLOW_TEST_PAY" not in text)
+    check("в /payments есть подсказка про диагностику", "/freekassa_check" in text)
+
+    myid = FakeMsg(uid=ADMIN_ID, text="/myid")
+    await bot.cmd_myid(myid)
+    check("/myid в бою: диагностика отмечена доступной",
+          "/freekassa_check" in myid.last and "доступна" in myid.last)
+    check("/myid в бою: выдача без оплаты отмечена скрытой",
+          "/test_pay" in myid.last and "скрыта" in myid.last)
+    check("/myid в бою: подсказан способ включить выдачу",
+          "PAYMENTS_ALLOW_TEST_PAY=1" in myid.last)
 
 
 async def test_admin_switch():
@@ -605,6 +656,7 @@ async def test_terms_gate():
 async def main():
     await test_production_look()
     await test_test_mode_returns_tools()
+    await test_wartime_diagnostics()
     await test_admin_switch()
     await test_trial_visibility()
     await test_terms_in_bot()

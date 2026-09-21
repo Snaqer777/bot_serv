@@ -1525,7 +1525,8 @@ async def test_freekassa_self_check(store_file):
               f"http://127.0.0.1:{WEBHOOK_PORT}/freekassa/webhook" in text)
         check("отчёт показывает адрес возврата на бота", "t.me/" in text)
         check("отчёт напоминает про «Подтверждение заявки»", "Подтверждение заявки" in text)
-        check("отчёт подсказывает следующий шаг /test_pay", "/test_pay" in text)
+        check("отчёт ведёт к первой настоящей оплате",
+              "первая настоящая оплата" in text and "PAYMENTS_ALLOW_TEST_PAY=1" in text)
         check("самопроверка сервера прошла (healthz отвечает)", "Самопроверка сервера: ✅" in text, text[-200:])
 
         msg = make_message(bot, text="/freekassa_check")
@@ -1559,14 +1560,17 @@ async def test_myid_payments_diag(store_file):
     check("/myid: видно, что секретные слова заданы", "заданы ✅" in text)
     check("/myid: видно, что включён тестовый режим FK", "Тестовый режим FK" in text)
     check("/myid: показан адрес для «URL оповещения»", "/freekassa/webhook" in text)
-    check("/myid: сказано, что проверки включены", "включены" in text and "/test_pay" in text)
+    check("/myid: видно, что диагностика /freekassa_check доступна",
+          "/freekassa_check" in text and "доступна" in text)
+    check("/myid: сказано, что выдача без оплаты включена",
+          "/test_pay" in text and "включена" in text)
 
     # ADMIN_TOOLS=0 — команда проверки не отвечает, и /myid объясняет почему
     reset_all()
     bot = new_bot({"mode": "freekassa", "fk_test": "1", "admin_tools": "0"}, store_file)
     await bot.cmd_myid(make_message(bot, text="/myid"))
     text = _last_api_text()
-    check("/myid: сказано, что проверки скрыты", "скрыты" in text)
+    check("/myid: сказано, что выдача без оплаты скрыта", "скрыта" in text)
     check("/myid: подсказана переменная ADMIN_TOOLS=1", "ADMIN_TOOLS=1" in text)
     check("/myid: видно, что служебные команды скрыты", "ADMIN_TOOLS=0" in text)
 
@@ -1575,14 +1579,17 @@ async def test_myid_payments_diag(store_file):
     bot = new_bot({"mode": "freekassa", "allow_test_pay": "1", "admin_tools": "1", "test_tools": "0"}, store_file)
     await bot.cmd_myid(make_message(bot, text="/myid"))
     text = _last_api_text()
-    check("/myid: TEST_TOOLS=0 назван причиной", "TEST_TOOLS=1" in text and "скрыты" in text)
+    check("/myid: TEST_TOOLS=0 назван причиной", "TEST_TOOLS=0" in text and "скрыта" in text)
 
     # Проверки скрыты, потому что не включён тестовый режим
     reset_all()
     bot = new_bot({"mode": "freekassa", "admin_tools": "1"}, store_file)
     await bot.cmd_myid(make_message(bot, text="/myid"))
     text = _last_api_text()
-    check("/myid: подсказан FREEKASSA_TEST=1", "FREEKASSA_TEST=1" in text and "скрыты" in text)
+    check("/myid: подсказано, как включить выдачу без оплаты",
+          "PAYMENTS_ALLOW_TEST_PAY=1" in text and "скрыта" in text)
+    check("/myid: диагностика /freekassa_check в бою доступна",
+          "/freekassa_check" in text and "доступна" in text)
 
     # Магазин не задан — видно прямо в подсказке
     reset_all()
@@ -1598,7 +1605,38 @@ async def test_myid_payments_diag(store_file):
     await bot.cmd_myid(make_message(bot, uid=555, text="/myid"))
     text = _last_api_text()
     check("обычный пользователь не видит диагностику оплаты",
-          "Проверки оплаты" not in text and FK_MERCHANT_ID not in text)
+          "/freekassa_check" not in text and FK_MERCHANT_ID not in text)
+
+
+async def test_production_handlers(store_file):
+    print("\n▶ 14в. Боевой режим: /freekassa_check есть у админа, /test_pay — нет")
+    reset_all()
+    prod = new_bot({"mode": "freekassa", "admin_tools": "1"}, store_file)
+    handlers = {h.callback.__name__ for h in prod.dp.message.handlers}
+    check("боевой режим: диагностика FreeKassa зарегистрирована",
+          "cmd_freekassa_check" in handlers, str(sorted(handlers)))
+    check("боевой режим: выдача ключа без оплаты не зарегистрирована",
+          "cmd_test_pay" not in handlers)
+    check("боевой режим: кнопки проверок скрыты", not prod.test_tools_enabled())
+    check("боевой режим: /freekassa_check указана в /myid", prod.admin_tools_enabled())
+
+    # администратору диагностика отвечает и без тестовых флагов
+    msg = make_message(prod, text="/freekassa_check")
+    await prod.cmd_freekassa_check(msg)
+    check("боевой режим: /freekassa_check отвечает", "Проверка FreeKassa" in _last_api_text())
+    check("боевой режим: в отчёте сказано «боевой режим»",
+          "боевой режим" in _last_api_text())
+    check("боевой режим: напоминание выключить тест в кабинете",
+          "выключена" in _last_api_text() and "FREEKASSA_TEST" in _last_api_text())
+
+    # в тестовом режиме — отдельная памятка и команда выдачи без оплаты
+    reset_all()
+    test_bot = new_bot({"mode": "freekassa", "fk_test": "1", "admin_tools": "1"}, store_file)
+    check("тестовый режим: выдача без оплаты зарегистрирована",
+          "cmd_test_pay" in {h.callback.__name__ for h in test_bot.dp.message.handlers})
+    await test_bot.cmd_freekassa_check(make_message(test_bot, text="/freekassa_check"))
+    check("тестовый режим: в отчёте сказано «тестовый режим»",
+          "тестовый режим" in _last_api_text())
 
 
 async def test_panel_debug(store_file):
@@ -1710,6 +1748,7 @@ async def main():
         await test_simulated_payment(store_for("simulate"))
         await test_freekassa_self_check(store_for("selfcheck"))
         await test_myid_payments_diag(store_for("myid"))
+        await test_production_handlers(store_for("prodhandlers"))
         await test_admin_access(store_for("admin"))
     finally:
         for runner in runners:
