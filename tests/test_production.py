@@ -36,6 +36,8 @@ ADMIN_HANDLERS = {
     "cmd_inbounds", "cmd_reset_vpn", "cmd_groups", "cmd_panel_debug",
     "cmd_totp", "cmd_payments", "cmd_revoke",
 }
+# Разделы текста, который бот показывает сейчас (прежняя редакция — перенос новой
+# редакции в bot.py отдельным шагом).
 TERMS_SECTIONS = (
     "1. Общие положения",
     "2. Предмет соглашения",
@@ -47,6 +49,30 @@ TERMS_SECTIONS = (
     "8. Ответственность",
     "9. Изменение условий",
     "10. Заключительные положения",
+)
+# Разделы новой редакции соглашения (файл TERMS.md).
+TERMS_DOC_SECTIONS = (
+    "1. Общие положения",
+    "2. Характер услуг и цифровых товаров",
+    "3. Отказ от гарантий и ответственности",
+    "4. Законность использования",
+    "5. Интеллектуальная собственность",
+    "6. Ограничение доступа",
+    "7. Платежи и возвраты",
+    "8. Конфиденциальность",
+    "9. Изменение условий",
+    "10. Контактная информация",
+    "Реквизиты Исполнителя",
+)
+# Разделы политики конфиденциальности (файл PRIVACY.md).
+PRIVACY_SECTIONS = (
+    "1. Общие положения",
+    "2. Сбор информации",
+    "3. Использование информации",
+    "4. Передача информации третьим лицам",
+    "5. Хранение и защита данных",
+    "6. Отказ от ответственности",
+    "7. Изменения в Политике",
 )
 
 FAILURES = []
@@ -561,11 +587,11 @@ async def test_terms_file_matches_bot():
 
     check("в документе есть титул и дата редакции",
           "Пользовательское соглашение" in doc and "Редакция от" in doc)
-    check("в документе есть все разделы утверждённого текста",
-          all(title in doc for title in (
-              "Предмет соглашения", "Порядок оплаты", "Предоставление доступа",
-              "Возврат и отмена", "Контакты поддержки", "Политика обработки персональных данных",
-              "Ответственность", "Заключительные положения", "Реквизиты Исполнителя")))
+    check("в документе есть все разделы новой редакции",
+          all(title in doc for title in TERMS_DOC_SECTIONS),
+          str([t for t in TERMS_DOC_SECTIONS if t not in doc]))
+    check("в документе есть ссылка на политику конфиденциальности",
+          "PRIVACY.md" in doc and "Конфиденциальность" in doc)
     check("в документе отмечено, что реквизиты нужно заполнить",
           "заполните" in doc.lower())
     check("в документе описано, как подключено в боте",
@@ -574,13 +600,41 @@ async def test_terms_file_matches_bot():
     bot = load({"mode": "stars"})
     bot_text = bot.terms_text()
     check("ключевые обещания бота и документа совпадают",
-          "акцепт оферты" in bot_text and "акцепт оферты" in doc
+          "как есть" in bot_text and "как есть" in doc
           and "24 часов" in bot_text and "24 часов" in doc)
-    check("способы оплаты в соглашении названы актуально (карта, СБП, Stars)",
-          "банковская карта" in bot_text and "СБП" in bot_text
-          and "банковская карта" in doc and "СБП" in doc)
-    check("в соглашении не осталось старых платёжных систем (CryptoBot)",
-          "CryptoBot" not in bot_text and "CryptoBot" not in doc)
+    check("в боте способы оплаты названы актуально (карта, СБП, Stars)",
+          "банковская карта" in bot_text and "СБП" in bot_text)
+    check("в документе оплата идёт через платёжного провайдера",
+          "платёжным провайдером" in doc and "chargeback" in doc)
+    check("в соглашении не осталось старых платёжных систем (CryptoBot, FreeKassa)",
+          all(system not in bot_text and system not in doc
+              for system in ("CryptoBot", "FreeKassa", "ЮKassa")))
+
+    # Политика конфиденциальности — отдельный документ репозитория
+    privacy_path = os.path.join(REPO_DIR, "PRIVACY.md")
+    check("PRIVACY.md есть в репозитории", os.path.exists(privacy_path))
+    with open(privacy_path, "r", encoding="utf-8") as fh:
+        privacy = fh.read()
+    check("в политике есть титул и дата редакции",
+          "ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ" in privacy and "Редакция от" in privacy)
+    check("в политике есть все разделы",
+          all(title in privacy for title in PRIVACY_SECTIONS),
+          str([t for t in PRIVACY_SECTIONS if t not in privacy]))
+    check("в политике сказано, какие данные собираются",
+          "Telegram ID" in privacy and "техническую информацию" in privacy
+          and "историю взаимодействий" in privacy)
+    check("в политике сказано, что паспортные данные не нужны",
+          "не требует" in privacy and "паспортных данных" in privacy)
+    check("в политике описана передача третьим лицам и оплата",
+          "не передаёт полученные данные третьим лицам" in privacy
+          and "платёжными системами" in privacy)
+    check("в политике описаны хранение и защита данных",
+          "Хранение и защита данных" in privacy and "разумные меры" in privacy)
+    check("в политике есть контакт поддержки для запросов об удалении данных",
+          "@Darktier_support" in privacy and "удаление" in privacy)
+    check("в политике не осталось заглушек шаблона",
+          "ваш сайт" not in privacy and "Укажите актуальную дату" not in privacy
+          and "Cocoon" not in privacy)
 
 
 async def test_terms_gate():
