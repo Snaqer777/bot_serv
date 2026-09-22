@@ -36,19 +36,19 @@ ADMIN_HANDLERS = {
     "cmd_inbounds", "cmd_reset_vpn", "cmd_groups", "cmd_panel_debug",
     "cmd_totp", "cmd_payments", "cmd_revoke",
 }
-# Разделы текста, который бот показывает сейчас (прежняя редакция — перенос новой
-# редакции в bot.py отдельным шагом).
+# Разделы текста, который бот показывает в /terms и на первом запуске: та же новая
+# редакция, что и в TERMS.md (10 разделов, ссылка на политику в п. 8.3).
 TERMS_SECTIONS = (
     "1. Общие положения",
-    "2. Предмет соглашения",
-    "3. Порядок оплаты",
-    "4. Предоставление доступа",
-    "5. Возврат и отмена",
-    "6. Контакты поддержки",
-    "7. Политика обработки персональных данных",
-    "8. Ответственность",
+    "2. Характер услуг и цифровых товаров",
+    "3. Отказ от гарантий и ответственности",
+    "4. Законность использования",
+    "5. Интеллектуальная собственность",
+    "6. Ограничение доступа",
+    "7. Платежи и возвраты",
+    "8. Конфиденциальность",
     "9. Изменение условий",
-    "10. Заключительные положения",
+    "10. Контактная информация",
 )
 # Разделы новой редакции соглашения (файл TERMS.md).
 TERMS_DOC_SECTIONS = (
@@ -215,7 +215,9 @@ async def test_production_look():
           not ({"payments", "panel_debug", "totp", "groups", "inbounds", "reset_vpn"} & set(names)),
           str(names))
     check("в меню остались только рабочие команды",
-          set(names) == {"start", "profile", "help", "invite", "terms", "myid"}, str(names))
+          set(names) == {"start", "profile", "help", "invite", "terms", "privacy", "myid"}, str(names))
+    check("политика конфиденциальности есть в меню Telegram-команд",
+          "privacy" in names, str(names))
 
     admin_handlers = handler_names(bot.dp.message)
     check("админские обработчики не зарегистрированы",
@@ -510,7 +512,7 @@ async def test_terms_in_bot():
 
     check("соглашение умещается в одно сообщение Telegram", len(text) < 4096, f"{len(text)} символов")
     check("заголовок и подзаголовок как в утверждённом тексте",
-          "ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ (ПУБЛИЧНАЯ ОФЕРТА)" in text)
+          "ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ" in text and "Сервис «SuperVPN» · редакция от 01.10.2026" in text)
     check("указаны название сервиса и дата редакции",
           "SuperVPN" in text and "01.10.2026" in text)
     check("указан исполнитель (переменная TERMS_OPERATOR)",
@@ -520,16 +522,18 @@ async def test_terms_in_bot():
     check("все обязательные разделы на месте",
           all(section in text for section in TERMS_SECTIONS),
           str([s for s in TERMS_SECTIONS if s not in text]))
-    check("сказано про акцепт оферты и цифровую услугу",
-          "акцепт оферты" in text and "в цифровом виде" in text)
-    check("есть безвозвратность и порядок возврата",
-          "безвозвратной" in text and "Возврат средств за уже оказанную услугу не производится" in text)
+    check("сказано, что услуги нематериального характера",
+          "нематериального характера" in text and "ссылки-подписки" in text)
+    check("есть порядок возврата: только по технической вине в течение 24 часов",
+          "Возврат после предоставления доступа не производится" in text
+          and "по технической вине" in text and "24 часов" in text)
     check("есть запреты и ответственность",
-          "противоправных действий" in text and "заблокирован без возврата средств" in text)
-    check("описана обработка персональных данных",
-          "Telegram ID" in text and "не передаются третьим лицам" in text)
-    check("оплата: банковская карта и СБП",
-          "банковская карта" in text and "СБП" in text)
+          "противоправной деятельности" in text and "ограничение доступа без компенсации" in text)
+    check("оплата описана через платёжного провайдера, без карты и СБП",
+          "платёжный провайдер" in text and "банковская карта" not in text
+          and "СБП" not in text and "chargeback" in text)
+    check("из соглашения ведёт ссылка на политику конфиденциальности",
+          "8.3. Подробно — в Политике конфиденциальности: /privacy" in text)
     check("теги HTML закрыты",
           text.count("<b>") == text.count("</b>") and text.count("<i>") == text.count("</i>")
           and text.count("<blockquote expandable>") == 1 and text.count("</blockquote>") == 1)
@@ -540,7 +544,7 @@ async def test_terms_in_bot():
           text.index("ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ") < text.index("<blockquote expandable>"))
     check("внутри цитаты лежит весь текст разделов",
           text.index("1. Общие положения") > text.index("<blockquote expandable>")
-          and text.index("10. Заключительные положения") < text.index("</blockquote>"))
+          and text.index("10. Контактная информация") < text.index("</blockquote>"))
 
     msg = FakeMsg(text="/terms")
     await bot.cmd_terms(msg)
@@ -578,6 +582,75 @@ async def test_terms_in_bot():
     check("на экране тарифов есть напоминание про условия", "/terms" in tariffs.message.last)
 
 
+async def test_privacy_in_bot():
+    print("\n▶ 3б. Политика конфиденциальности доступна в боте (/privacy)")
+    bot = load({"mode": "stars", "service_name": "SuperVPN",
+                "support_username": "my_support", "support_email": "help@example.com",
+                "terms_updated": "01.10.2026"})
+    text = bot.privacy_text()
+
+    check("политика умещается в одно сообщение Telegram", len(text) < 4096, f"{len(text)} символов")
+    check("заголовок и подзаголовок как у соглашения",
+          "ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ" in text
+          and "Сервис «SuperVPN» · редакция от 01.10.2026" in text)
+    check("все разделы политики на месте",
+          all(section in text for section in PRIVACY_SECTIONS),
+          str([section for section in PRIVACY_SECTIONS if section not in text]))
+    check("сказано, какие данные собираются",
+          "Telegram ID" in text and "историю взаимодействий" in text
+          and "IP-адрес" in text)
+    check("сказано, что данные не передаются третьим лицам и оплата идёт через платёжные системы",
+          "не передаются третьим лицам" in text and "платёжные системы" in text)
+    check("описаны хранение и защита данных",
+          "Хранение и защита данных" in text and "разумные меры защиты" in text)
+    check("указан контакт поддержки для удаления данных",
+          "@my_support" in text and "Вместе с удалением данных" in text)
+    check("теги HTML закрыты и документ свёрнут в раскрывающуюся цитату",
+          text.count("<b>") == text.count("</b>") and text.count("<i>") == text.count("</i>")
+          and text.count("<blockquote expandable>") == 1 and text.endswith("</blockquote>"))
+    check("заголовок политики остаётся видимым (вне цитаты)",
+          text.index("ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ") < text.index("<blockquote expandable>"))
+
+    msg = FakeMsg(text="/privacy")
+    await bot.cmd_privacy(msg)
+    check("команда /privacy отвечает политикой", msg.last == text)
+    cb = FakeCallback("privacy", FakeMsg())
+    await bot.cb_privacy(cb)
+    check("кнопка «Политика конфиденциальности» открывает тот же текст", cb.message.last == text)
+    check("под политикой есть соглашение, поддержка и меню",
+          {"terms", "main_menu"} <= set(callbacks_of(bot.privacy_kb(ADMIN_ID)))
+          and "https://t.me/my_support" in str(bot.privacy_kb(ADMIN_ID).inline_keyboard))
+    check("кнопка политики есть в главном меню",
+          "privacy" in callbacks_of(bot.main_menu_kb(ADMIN_ID)))
+
+    sup = FakeCallback("support", FakeMsg())
+    await bot.cb_support(sup)
+    check("в разделе «Поддержка» есть обе ссылки на документы",
+          "/terms" in sup.message.last and "/privacy" in sup.message.last)
+
+    tariffs = FakeCallback("tariffs", FakeMsg())
+    await bot.cb_tariffs(tariffs)
+    check("на экране тарифов напоминание про оба документа",
+          "/terms" in tariffs.message.last and "/privacy" in tariffs.message.last)
+
+    # Длинные SERVICE_NAME и TERMS_OPERATOR (например, полное наименование ИП) не
+    # должны ломать отправку: документ бьётся на части и каждая влезает в лимит.
+    long_bot = load({"mode": "stars", "service_name": "Очень длинное название сервиса " * 40,
+                     "terms_operator": "ИП Очень-Длинное-Наименование " * 30})
+    long_chunks = long_bot.document_messages(long_bot.terms_header(), long_bot.terms_body())
+    privacy_chunks = long_bot.document_messages(long_bot.privacy_header(), long_bot.privacy_body())
+    check("при переполнении документ разбивается на части в пределах лимита",
+          len(long_chunks) > 1 and all(len(part) <= 4096 for part in long_chunks)
+          and all(len(part) <= 4096 for part in privacy_chunks),
+          f"{[len(part) for part in long_chunks]}")
+    long_msg = FakeMsg()
+    await long_bot.cmd_privacy(long_msg)
+    check("каждая часть несёт заголовок политики и закрытую цитату",
+          len(long_msg.sent) == len(privacy_chunks)
+          and all("ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ" in part and part.endswith("</blockquote>")
+                  for part in long_msg.sent))
+
+
 async def test_terms_file_matches_bot():
     print("\n▶ 4. Файл TERMS.md синхронен с текстом в боте")
     path = os.path.join(REPO_DIR, "TERMS.md")
@@ -595,15 +668,15 @@ async def test_terms_file_matches_bot():
     check("в документе отмечено, что реквизиты нужно заполнить",
           "заполните" in doc.lower())
     check("в документе описано, как подключено в боте",
-          "/terms" in doc and "TERMS_OPERATOR" in doc)
+          "/terms" in doc and "/privacy" in doc and "TERMS_OPERATOR" in doc)
 
     bot = load({"mode": "stars"})
     bot_text = bot.terms_text()
     check("ключевые обещания бота и документа совпадают",
           "как есть" in bot_text and "как есть" in doc
           and "24 часов" in bot_text and "24 часов" in doc)
-    check("в боте способы оплаты названы актуально (карта, СБП, Stars)",
-          "банковская карта" in bot_text and "СБП" in bot_text)
+    check("в боте оплата описана через платёжного провайдера",
+          "платёжный провайдер" in bot_text and "chargeback" in bot_text)
     check("в документе оплата идёт через платёжного провайдера",
           "платёжным провайдером" in doc and "chargeback" in doc)
     check("в соглашении не осталось старых платёжных систем (CryptoBot, FreeKassa)",
@@ -656,6 +729,15 @@ async def test_terms_gate():
           "Привет!" in start.last and "accept_terms" in callbacks_of(_last_markup(start)))
     check("меню до подтверждения не показывается",
           "tariffs" not in callbacks_of(_last_markup(start)))
+    check("на экране соглашения есть кнопка политики конфиденциальности",
+          "privacy" in callbacks_of(_last_markup(start)))
+
+    policy = FakeMsg(uid=555, text="/privacy")
+    await bot.cmd_privacy(policy)
+    check("/privacy доступен до принятия соглашения и не показывает меню",
+          "ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ" in policy.last
+          and "tariffs" not in callbacks_of(_last_markup(policy))
+          and "accept_terms" in callbacks_of(_last_markup(policy)))
     check("до подтверждения пользователь не отмечен принявшим",
           bot.terms_store.is_accepted(555) is False)
 
@@ -730,6 +812,7 @@ async def main():
     await test_admin_switch()
     await test_trial_visibility()
     await test_terms_in_bot()
+    await test_privacy_in_bot()
     await test_terms_file_matches_bot()
     await test_terms_gate()
 

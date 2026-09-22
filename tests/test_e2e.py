@@ -503,8 +503,21 @@ async def step_admin_tools(bot):
 
     await bot.cmd_terms(make_message(bot, STRANGER, "/terms"))
     check("/terms отдаёт соглашение", "ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ" in last_text(STRANGER)
-          and "10. Заключительные положения" in last_text(STRANGER)
+          and "10. Контактная информация" in last_text(STRANGER)
           and "<blockquote expandable>" in last_text(STRANGER))
+
+    fp.TG["calls"].clear()
+    await bot.cmd_privacy(make_message(bot, STRANGER, "/privacy"))
+    privacy_text = last_text(STRANGER)
+    check("/privacy отдаёт политику конфиденциальности",
+          "ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ" in privacy_text
+          and "7. Изменения в Политике" in privacy_text
+          and "<blockquote expandable>" in privacy_text
+          and len(privacy_text) < 4096)
+    fp.TG["calls"].clear()
+    await bot.cmd_terms(make_message(bot, STRANGER, "/terms"))
+    check("в соглашении есть ссылка на политику конфиденциальности",
+          "/privacy" in last_text(STRANGER))
 
 
 async def step_production_bot(store_file, ref_file):
