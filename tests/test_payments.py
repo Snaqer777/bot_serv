@@ -1817,14 +1817,15 @@ async def test_subscription_link(store_file):
 
 
 async def test_promo_tariff(store_file):
-    print("\n▶ 14д. Промо-тариф: 30 дней, 10 ГБ, бесплатно и один раз на аккаунт")
+    print("\n▶ 14д. Промо-тариф: 15 дней, 10 ГБ, бесплатно и один раз на аккаунт")
     reset_all()
     bot = new_bot({"mode": "freekassa"}, store_file)
     email = f"tg-paid-{TG_TG_ID}"
 
     check("промо включён по умолчанию", bot.promo_enabled() is True)
-    check("тариф промо: 30 дней, 10 ГБ, 1 устройство",
-          bot.TARIFFS["promo"]["days"] == 30 and bot.TARIFFS["promo"]["traffic_gb"] == 10
+    check("тариф промо: 15 дней, 10 ГБ, 1 устройство",
+          bot.TARIFFS["promo"]["days"] == bot.PROMO_DAYS == 15
+          and bot.TARIFFS["promo"]["traffic_gb"] == 10
           and bot.TARIFFS["promo"]["ip_limit"] == 1)
     check("промо указан как бесплатный", bot.tariff_price_label(bot.TARIFFS["promo"]) == "Бесплатно")
     check("промо видно в списке тарифов", bot.promo_visible(TG_TG_ID) is True)
@@ -1843,7 +1844,7 @@ async def test_promo_tariff(store_file):
     await bot.grant_promo(TG_TG_ID, TG_TG_ID)
     client = panel_client(email)
     check("промо создало подписку в панели", client is not None)
-    check("срок промо — 30 дней", round(days_left(client)) == 30, str(days_left(client)))
+    check("срок промо — 15 дней", round(days_left(client)) == 15, str(days_left(client)))
     check("лимит трафика — 10 ГБ",
           round(client["totalGB"] / (1024 ** 3)) == 10, str(client["totalGB"]))
     check("заказ помечен промо и не попал в выручку",
@@ -1881,8 +1882,8 @@ async def test_promo_tariff(store_file):
     await click.cb_buy(cb)
     click_client = panel_client(f"tg-paid-{user_id}")
     check("нажатие «Промо» выдаёт ключ", click_client is not None)
-    check("подписка после нажатия кнопки активна на 30 дней",
-          round(days_left(click_client)) == 30, str(days_left(click_client)))
+    check("подписка после нажатия кнопки активна на 15 дней",
+          round(days_left(click_client)) == 15, str(days_left(click_client)))
     check("клиент увидел уведомление о выдаче", "Активирую промо-доступ" in " ".join(cb.answers),
           str(cb.answers))
     second = _FakeCallback(click, "buy_promo", uid=user_id)

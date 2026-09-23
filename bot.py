@@ -402,10 +402,11 @@ TEST_TOOLS_RAW = (os.getenv("TEST_TOOLS") or "").strip().lower()
 # как включить служебные команды обратно.
 ADMIN_TOOLS = (os.getenv("ADMIN_TOOLS") or "0").strip().lower() in ("1", "true", "yes", "on")
 
-# Промо-тариф (бесплатно 30 дней, 10 ГБ): виден всем, но выдаётся один раз на аккаунт.
+# Промо-тариф (бесплатно 15 дней, 10 ГБ): виден всем, но выдаётся один раз на аккаунт.
 #   PROMO_ENABLED=0 — полностью убрать пункт из тарифов (промо закончилось);
 #   PROMO_ONCE=0    — разрешить получать промо повторно (для своих тестов).
 PROMO_KEY = "promo"
+PROMO_DAYS = 15          # срок промо-доступа в днях (см. тариф PROMO_KEY ниже)
 PROMO_ENABLED = (os.getenv("PROMO_ENABLED") or "1").strip().lower() in ("1", "true", "yes", "on")
 PROMO_ONCE = (os.getenv("PROMO_ONCE") or "1").strip().lower() in ("1", "true", "yes", "on")
 
@@ -2784,7 +2785,7 @@ def promo_used(tg_id: int | None) -> bool:
     """
     Пользовался ли этот аккаунт промо (по журналу заказов).
 
-    Промо выдаётся один раз: иначе бесплатные 30 дней можно оформлять бесконечно.
+    Промо выдаётся один раз: иначе бесплатные 15 дней можно оформлять бесконечно.
     PROMO_ONCE=0 снимает ограничение — для проверок на своём аккаунте.
     """
     if not PROMO_ONCE or tg_id is None:
@@ -4791,9 +4792,9 @@ TARIFFS = {
         "locations": "Стокгольм",
     },
     "promo": {
-        "name": "🎉 Промо-доступ (30 дней)",
+        "name": "🎉 Промо-доступ (15 дней)",
         "price": 0,
-        "days": 30,
+        "days": 15,
         "traffic": "10 ГБ",
         "traffic_gb": 10,
         "ips": 1,
@@ -5140,7 +5141,7 @@ def tariffs_intro(tg_id: int | None = None) -> str:
     if promo_visible(tg_id):
         free_items.append(
             f"• 🎉 <b>Промо-доступ</b> — {traffic_label(promo.get('traffic_gb', 0))} "
-            f"на {days_label(promo.get('days', 30))} (один раз на аккаунт)"
+            f"на {days_label(promo.get('days', PROMO_DAYS))} (один раз на аккаунт)"
         )
     trial = TARIFFS.get("trial") or {}
     if tariff_visible(tg_id, "trial", trial):
@@ -5168,7 +5169,8 @@ def tariffs_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
     if promo_visible(tg_id):
         promo = TARIFFS.get(PROMO_KEY) or {}
         buttons.append([InlineKeyboardButton(
-            text=f"🎉 Промо-доступ — {promo.get('traffic', '')} на {promo.get('days', 30)} дней бесплатно",
+            text=f"🎉 Промо-доступ — {promo.get('traffic', '')} на "
+                 f"{days_label(promo.get('days', PROMO_DAYS))} бесплатно",
             callback_data="buy_promo",
         )])
     if tariff_visible(tg_id, "trial", TARIFFS.get("trial") or {}):

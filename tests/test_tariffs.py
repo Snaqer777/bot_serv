@@ -84,8 +84,9 @@ async def test_catalog(store_file):
     check("старых тарифов (Школьник/Базовый/Семейный/Премиум) больше нет",
           not any(key in bot.TARIFFS for key in OLD_KEYS),
           str([key for key in OLD_KEYS if key in bot.TARIFFS]))
-    check("бесплатные предложения на месте (промо и тестовый период)",
-          bot.TARIFFS["promo"]["price"] == 0 and bot.TARIFFS["trial"]["price"] == 0)
+    check("бесплатные предложения на месте: промо 15 дней / 10 ГБ и тестовый период",
+          bot.TARIFFS["promo"]["price"] == 0 and bot.TARIFFS["promo"]["days"] == bot.PROMO_DAYS == 15
+          and bot.TARIFFS["promo"]["traffic_gb"] == 10 and bot.TARIFFS["trial"]["price"] == 0)
 
     for kind, grid in (("time", TIME_GRID), ("traffic", TRAFFIC_GRID)):
         for level, (price, gb, days, ips, tunnels) in grid.items():
@@ -136,8 +137,8 @@ async def test_three_steps(store_file):
           str(step1_buttons))
     check("шаг 1: в кнопках нет старых тарифов",
           not any(f"buy_{key}" in step1_buttons for key in OLD_KEYS), str(step1_buttons))
-    check("шаг 1: у промо указан трафик и срок",
-          any("10 ГБ" in text and "30 дней" in text for text in step1_labels), str(step1_labels))
+    check("шаг 1: у промо указан трафик и срок (15 дней)",
+          any("10 ГБ" in text and "15 дней" in text for text in step1_labels), str(step1_labels))
 
     # Шаг 2: «по времени»
     kind_cb = _FakeCallback(bot, "tkind_time")
