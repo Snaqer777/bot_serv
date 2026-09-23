@@ -185,7 +185,7 @@ async def test_wiring():
     check("после выдачи ключа — кнопка профиля с подпиской", "profile" in key_cbs)
     check("в главном меню — «Пригласить друга»", "invite" in main_cbs)
 
-    info = {"tariff": bot.TARIFFS["basic"], "expiry_ms": 4102444800000, "link": "vless://demo",
+    info = {"tariff": bot.TARIFFS["time_3"], "expiry_ms": 4102444800000, "link": "vless://demo",
             "sub_link": "https://sub.example.com:2096/sub/demo", "status": "created"}
     paid_text = bot.order_paid_message({"id": "o-1", "simulated": False}, info)
     check("после оплаты зовём в пошаговую инструкцию", "Как подключиться" in paid_text)

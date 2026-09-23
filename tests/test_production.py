@@ -470,7 +470,8 @@ async def test_trial_visibility():
     await hidden.cb_tariffs(hidden_tariffs)
     check("в тарифах остались только платные пункты",
           "Тестовый период" not in hidden_tariffs.message.last
-          and "Школьник" in hidden_tariffs.message.last)
+          and "Новичок" in hidden_tariffs.message.last
+          and "По времени" in hidden_tariffs.message.last)
     profile = FakeMsg(uid=555, text="/profile")
     await hidden.send_profile(profile, 555)
     check("в профиле кнопки теста нет",
@@ -787,10 +788,10 @@ async def test_terms_gate():
     await bot.cb_tariffs(stale_tariffs)
     check("старая кнопка «Тарифы» тоже ведёт на соглашение",
           has_terms_text(stale_tariffs.message)
-          and not any("Школьник" in t for t in stale_tariffs.message.sent))
+          and not any("Новичок" in t for t in stale_tariffs.message.sent))
 
     try:
-        await bot.start_checkout(777, 777, "basic")
+        await bot.start_checkout(777, 777, "time_1")
         check("оплата до подтверждения соглашения отклонена", False)
     except Exception as exc:
         check("оплата до подтверждения соглашения отклонена",

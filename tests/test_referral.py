@@ -22,6 +22,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aiohttp import web
 from panel import PANEL, load_bot, make_app, reset
 
+# Новый каталог: «по времени» и «по трафику». В реферальных сценариях важен срок
+# (дни), поэтому берём тарифы с ограничением по времени.
+BASIC = "time_3"   # 250 ₽, 30 дней, 100 ГБ, 5 устройств, 2+ локации
+FAMILY = "time_1"  # 70 ₽, 15 дней, 15 ГБ, 1 устройство (выбор сервера)
+
+
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.types import Message
@@ -161,7 +167,7 @@ def expiry_of(tg_id):
     return int(client["expiryTime"]) if client else 0
 
 
-async def pay_stars(bot, uid, tariff="basic", charge=None):
+async def pay_stars(bot, uid, tariff=BASIC, charge=None):
     """Счёт + подтверждение оплаты (звёзды). Возвращает id заказа."""
     await bot.start_checkout(uid, uid, tariff)
     order_id = last_tg("sendInvoice")["payload"]
@@ -266,12 +272,12 @@ async def test_friend_pays(store_file, ref_file):
     await bot.cmd_start(make_message(bot, REFERRER, "/start"))
     await bot.cmd_start(make_message(bot, FRIEND1, f"/start ref_{REFERRER}"))
 
-    await pay_stars(bot, FRIEND1, "basic")
+    await pay_stars(bot, FRIEND1, BASIC)
     check("друг получил тариф + бонус приглашённого (~33 дня)",
           days_left(FRIEND1) is not None and 32 <= days_left(FRIEND1) <= 33,
           f"{days_left(FRIEND1)} дн.")
     check("в комментарии клиента — тариф и платёж",
-          "basic до " in panel_client(FRIEND1)["comment"] and "|" in panel_client(FRIEND1)["comment"])
+          f"{BASIC} до " in panel_client(FRIEND1)["comment"] and "|" in panel_client(FRIEND1)["comment"])
     check("бонус другу указан в сообщении об оплате",
           any("Бонус за друзей:" in t
               and f"+{INVITED_BONUS_DAYS} {bot.days_word(INVITED_BONUS_DAYS)}" in t
@@ -296,7 +302,7 @@ async def test_friend_pays(store_file, ref_file):
 
     # Пригласивший покупает тариф — копилка сгорает в дни подписки
     TG["calls"].clear()
-    await pay_stars(bot, REFERRER, "basic")
+    await pay_stars(bot, REFERRER, BASIC)
     check("пригласивший получил тариф + накопленные дни (~37 дней)",
           days_left(REFERRER) is not None and 36 <= days_left(REFERRER) <= 37,
           f"{days_left(REFERRER)} дн.")
@@ -323,13 +329,13 @@ async def test_second_friend_immediate(store_file, ref_file):
     await bot.cmd_start(make_message(bot, FRIEND2, f"/start ref_{REFERRER}"))
 
     # У пригласившего уже есть активная подписка
-    await pay_stars(bot, REFERRER, "basic")
+    await pay_stars(bot, REFERRER, BASIC)
     before = expiry_of(REFERRER)
     check("подписка пригласившего ~30 дней", 29 <= days_left(REFERRER) <= 30)
 
     TG["calls"].clear()
     await bot.cmd_start(make_message(bot, FRIEND2, f"/start ref_{REFERRER}"))
-    await pay_stars(bot, FRIEND2, "family")
+    await pay_stars(bot, FRIEND2, FAMILY)
 
     after = expiry_of(REFERRER)
     check(f"пригласившему добавилось ровно {BONUS_DAYS} дней",
@@ -338,7 +344,7 @@ async def test_second_friend_immediate(store_file, ref_file):
           any("уже в твоей подписке" in t for t in texts_to(REFERRER)))
     comment = panel_client(REFERRER)["comment"]
     check("комментарий клиента обновлён с сохранением платежа",
-          comment.startswith("basic до ") and "|" in comment, comment)
+          comment.startswith(f"{BASIC} до ") and "|" in comment, comment)
     check("бонус не ушёл в копилку", bot.referral_store.pending_days(REFERRER) == 0)
     stats = bot.referral_store.stats(REFERRER)
     check("статистика: 1 друг пришёл, 1 оплатил, 7 дней начислено",
@@ -353,7 +359,7 @@ async def test_test_payment_no_reward(store_file, ref_file):
     await bot.cmd_start(make_message(bot, REFERRER, "/start"))
     await bot.cmd_start(make_message(bot, FRIEND3, f"/start ref_{REFERRER}"))
 
-    await bot.simulate_successful_payment(FRIEND3, FRIEND3, "basic")
+    await bot.simulate_successful_payment(FRIEND3, FRIEND3, BASIC)
     check("тестовый ключ выдан (~30 дней, без бонуса)",
           days_left(FRIEND3) is not None and 29 <= days_left(FRIEND3) <= 30,
           f"{days_left(FRIEND3)} дн.")

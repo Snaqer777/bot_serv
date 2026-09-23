@@ -243,6 +243,38 @@ if XUI_2FA_SECRET:
 # ID входящего подключения (VLESS). Если 0 — бот подберёт подходящее автоматически.
 XUI_INBOUND_ID = _int_env("XUI_INBOUND_ID")
 
+# --- Локации (серверы) ---
+# Каждая локация — своё входящее подключение (inbound) в панели 3x-ui. Клиент выбирает
+# локацию при покупке тарифа на один туннель; тарифы на два и больше туннелей выдают
+# доступ сразу во всех локациях.
+#
+# ID подключений берутся из переменных XUI_INBOUND_<ЛОКАЦИЯ>. Если переменная не задана,
+# бот ищет подключение по названию (remark) в панели: «Стокгольм»/«Stockholm» для первой
+# локации, «Варшава»/«Warsaw» — для второй. Если и по названию не нашлось, локация
+# работает на общем XUI_INBOUND_ID (как до появления выбора сервера) — что именно
+# сопоставилось, видно в /panel_debug.
+XUI_INBOUND_STOCKHOLM = _int_env("XUI_INBOUND_STOCKHOLM")
+XUI_INBOUND_WARSAW = _int_env("XUI_INBOUND_WARSAW")
+
+LOCATIONS = {
+    "stockholm": {
+        "title": "🇸🇪 Стокгольм",
+        "short": "Стокгольм",
+        "env": "XUI_INBOUND_STOCKHOLM",
+        "inbound_id": XUI_INBOUND_STOCKHOLM,
+        "aliases": ("стокгольм", "stockholm", "швец", "sweden", "-se-", " se ", "se-"),
+    },
+    "warsaw": {
+        "title": "🇵🇱 Варшава",
+        "short": "Варшава",
+        "env": "XUI_INBOUND_WARSAW",
+        "inbound_id": XUI_INBOUND_WARSAW,
+        "aliases": ("варшав", "warsaw", "варшавa", "польш", "poland", "-pl-", "pl-"),
+    },
+}
+# Порядок локаций в кнопках и текстах.
+LOCATION_ORDER = ("stockholm", "warsaw")
+
 # --- Группа клиентов в 3x-ui ---
 # Если задано, все создаваемые ботом клиенты помечаются этой группой (раздел
 # "Группы"/Groups в панели 3x-ui, версия 3.2+): в панели их можно отфильтровать,
@@ -466,8 +498,8 @@ except Exception:   # нет базы часовых поясов — работ
 # На Railway без volume файл живёт до передеплоя: заказы также пишутся в 3x-ui.
 PAYMENT_STORE_FILE = (os.getenv("PAYMENT_STORE_FILE") or "data/payments.json").strip()
 
-# Сколько рублей в одной звезде при пересчёте цены тарифа в Stars (можно переопределить
-# цену в звёздах для каждого тарифа: STARS_BASIC, STARS_STANDARD, STARS_PREMIUM).
+# Сколько рублей в одной звезде при пересчёте цены тарифа в Stars (цену в звёздах для
+# конкретного тарифа можно задать точно: STARS_TIME_1, STARS_TRAFFIC_4 и т.п.).
 STARS_RUB_RATE = float((os.getenv("STARS_RUB_RATE") or "1.6").replace(",", "."))
 
 # Чек 54-ФЗ для ЮKassa: 1..6 — ставка НДС (чек формирует и передаёт бот), 0 — не передавать.
@@ -1300,6 +1332,28 @@ class XUIClient:
         # Fallback: первое подключение
         return inbounds[0], True
 
+    async def find_inbound_by_name(self, names: list[str]) -> dict | None:
+        """
+        Ищет подключение по названию (remark) в панели.
+
+        Нужно для выбора сервера: локации «Стокгольм» и «Варшава» — это разные inbound
+        одной панели, и клиент должен попадать именно в выбранный (название сравнивается
+        без учёта регистра, подходит и латиница).
+        """
+        wanted = [name.strip().lower() for name in names if name]
+        if not wanted:
+            return None
+        try:
+            inbounds = await self.get_inbounds()
+        except Exception as exc:
+            logger.warning("Не удалось получить список подключений для поиска по названию: %s", exc)
+            return None
+        for inbound in inbounds:
+            remark = str(inbound.get("remark") or "").strip().lower()
+            if remark and any(name in remark for name in wanted):
+                return inbound
+        return None
+
     async def add_client(self, inbound_id: int, client_payload: dict):
         """
         Универсальное добавление клиента.
@@ -1805,7 +1859,14 @@ async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool
     Статусы: 'created', 'updated', 'exists'.
     """
     async with XUIClient() as client:
-        inbound, auto_picked = await client.find_suitable_inbound(XUI_INBOUND_ID)
+        # Тестовый ключ живёт в первой локации каталога (Стокгольм), а не в случайном
+        # подключении панели — иначе после появления выбора сервера тест уезжал бы
+        # в Варшаву или в чужой inbound.
+        first_spot = configured_locations()[0] if configured_locations() else None
+        if first_spot:
+            inbound, auto_picked, source = await resolve_location_inbound(client, first_spot)
+        else:
+            inbound, auto_picked, source = await client.find_suitable_inbound(XUI_INBOUND_ID)
         inbound_id = inbound.get("id")
         params = extract_vless_params(inbound)
 
@@ -1891,27 +1952,20 @@ async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool
 
 
 async def delete_test_key(telegram_id: int) -> bool:
-    """Удаляет тестового клиента из 3x-ui."""
+    """Удаляет тестового клиента из 3x-ui (ищем во всех подключениях панели)."""
+    target_email = f"tg-test-{telegram_id}"
     async with XUIClient() as client:
+        inbounds = await client.get_inbounds()
+        for inbound in inbounds:
+            settings = as_dict(inbound.get("settings"))
+            for candidate in settings.get("clients") or []:
+                if isinstance(candidate, dict) and str(candidate.get("email")) == target_email:
+                    return await client.delete_client(inbound.get("id"), target_email,
+                                                      candidate.get("id"))
+
+        # На случай, если в inbound кэш устарел, пробуем удалить напрямую по email
         inbound, _ = await client.find_suitable_inbound(XUI_INBOUND_ID)
-        inbound_id = inbound.get("id")
-        settings = as_dict(inbound.get("settings"))
-        clients = settings.get("clients") or []
-        target_email = f"tg-test-{telegram_id}"
-
-        existing = next(
-            (
-                c for c in clients
-                if isinstance(c, dict) and str(c.get("email")) == target_email
-            ),
-            None,
-        )
-
-        if not existing:
-            # На случай, если в inbound кэш устарел, пробуем удалить напрямую по email
-            return await client.delete_client(inbound_id, target_email, None)
-
-        return await client.delete_client(inbound_id, target_email, existing.get("id"))
+        return await client.delete_client(inbound.get("id"), target_email, None)
 
 
 # =========================
@@ -2367,6 +2421,18 @@ def referral_rules_text() -> str:
     )
 
 
+def devices_word(count: int) -> str:
+    """«1 устройство», «3 устройства», «6 устройств»."""
+    value = abs(int(count))
+    if value % 100 in (11, 12, 13, 14):
+        return "устройств"
+    if value % 10 == 1:
+        return "устройство"
+    if value % 10 in (2, 3, 4):
+        return "устройства"
+    return "устройств"
+
+
 def days_word(days: int) -> str:
     """«1 день», «3 дня», «7 дней» — чтобы сообщения читались по-человечески."""
     value = abs(int(days))
@@ -2805,6 +2871,21 @@ def payments_diag_text() -> str:
     """
     lines = [f"💳 <b>Оплата:</b> {escape(payments_mode_title())} (<code>{PAYMENTS_MODE}</code>)"]
 
+    lines.append(
+        "• Тарифы: "
+        + ", ".join(
+            f"{TARIFF_LEVELS[level]['name']} ({TARIFF_KINDS[kind]['short']}) "
+            f"{TARIFF_GRID[kind][level]['price']} ₽"
+            for kind in TARIFF_KIND_ORDER for level in TARIFF_LEVEL_ORDER
+        )
+    )
+    lines.append(
+        "• Локации: "
+        + ", ".join(f"{spot['title']} (<code>{spot['env']}</code>"
+                    + (f"={spot['inbound_id']}" if spot['inbound_id'] else "")
+                    + ")" for spot in configured_locations())
+    )
+
     promo_tariff = TARIFFS.get(PROMO_KEY) or {}
     if promo_enabled():
         lines.append(
@@ -2870,6 +2951,65 @@ def format_date(timestamp_ms: int) -> str:
     return datetime.fromtimestamp(timestamp_ms / 1000, tz=LOCAL_TZ).strftime("%d.%m.%Y")
 
 
+def configured_locations() -> list[dict]:
+    """Локации, доступные в боте, в порядке каталога."""
+    return [{"key": key, **LOCATIONS[key]} for key in LOCATION_ORDER if key in LOCATIONS]
+
+
+def tariff_tunnels(tariff: dict) -> int:
+    """Сколько локаций реально входит в тариф (не больше, чем настроено серверов)."""
+    declared = int(tariff.get("tunnels", 1) or 1)
+    return max(1, min(declared, len(configured_locations())))
+
+
+def tariff_locations(tariff: dict) -> list[dict]:
+    """Список локаций тарифа: один сервер — выбранный клиентом, иначе первые N локаций."""
+    locations = configured_locations()
+    count = tariff_tunnels(tariff)
+    return locations[:count]
+
+
+def tariff_locations_label(tariff: dict) -> str:
+    """«Стокгольм» или «все серверы (Стокгольм, Варшава)»."""
+    spots = tariff_locations(tariff)
+    if not spots:
+        return "Все локации"
+    if len(spots) == 1:
+        return spots[0]["short"]
+    return "все серверы (" + ", ".join(spot["short"] for spot in spots) + ")"
+
+
+def location_display(tariff: dict, location_key: str | None = None) -> str:
+    """Что показывать в строке «Сервер»: выбранную локацию или список локаций тарифа."""
+    spot = location_by_key(location_key)
+    if spot:
+        return spot["title"]
+    return tariff_locations_label(tariff)
+
+
+def location_by_key(key: str | None) -> dict | None:
+    if not key:
+        return None
+    meta = LOCATIONS.get(key)
+    return {"key": key, **meta} if meta else None
+
+
+def location_from_text(text: str) -> str | None:
+    """Распознаёт локацию по callback-данным, коду или названию («warsaw», «варшава»)."""
+    value = (text or "").strip().lower()
+    if not value:
+        return None
+    if value in LOCATIONS:
+        return value
+    for key, meta in LOCATIONS.items():
+        if value == str(meta["short"]).lower() or value in meta["aliases"]:
+            return key
+    for key, meta in LOCATIONS.items():
+        if value and (value in str(meta["short"]).lower() or any(value in alias for alias in meta["aliases"])):
+            return key
+    return None
+
+
 def tariff_price_label(tariff: dict) -> str:
     """Цена тарифа в валюте текущего режима оплаты."""
     if tariff["price"] <= 0:
@@ -2879,8 +3019,13 @@ def tariff_price_label(tariff: dict) -> str:
     return f"{tariff['price']} ₽"
 
 
-def new_order(tg_id: int, tariff_key: str) -> dict:
-    """Создаёт заказ со статусом pending."""
+def new_order(tg_id: int, tariff_key: str, location_key: str | None = None) -> dict:
+    """
+    Создаёт заказ со статусом pending.
+
+    location_key — выбранный сервер для тарифов с одним туннелем (тарифы на несколько
+    туннелей получают все локации сразу, поэтому там он не нужен).
+    """
     tariff = TARIFFS[tariff_key]
     now = int(time.time())
     currency = "XTR" if PAYMENTS_MODE == "stars" else "RUB"
@@ -2890,9 +3035,13 @@ def new_order(tg_id: int, tariff_key: str) -> dict:
         "tg_id": tg_id,
         "tariff": tariff_key,
         "tariff_name": tariff["name"],
+        "tariff_kind": tariff.get("kind", ""),
+        "tariff_level": tariff.get("level", 0),
         "days": tariff["days"],
         "traffic_gb": tariff["traffic_gb"],
         "ip_limit": tariff["ip_limit"],
+        "tunnels": tariff.get("tunnels", 1),
+        "location": location_key or None,
         "amount_rub": tariff["price"],
         "amount_stars": tariff.get("stars", 0),
         "currency": currency,
@@ -3353,6 +3502,33 @@ def order_charge_id(order: dict) -> str:
     return str(order.get("payment_id") or "")
 
 
+async def resolve_location_inbound(client, spot: dict) -> tuple[dict, bool, str]:
+    """
+    Находит подключение (inbound) для локации.
+
+    Приоритет: ID из переменной XUI_INBOUND_<ЛОКАЦИЯ> → название в панели
+    (Стокгольм / Варшава) → общее подключение XUI_INBOUND_ID. Возвращает
+    (inbound, auto_picked, откуда) — откуда потом видно в /panel_debug.
+    """
+    inbound_id = int(spot.get("inbound_id") or 0)
+    if inbound_id > 0:
+        try:
+            inbound = await client.get_inbound(inbound_id)
+            if inbound and inbound.get("id"):
+                return inbound, False, f"{spot.get('env')}={inbound_id}"
+        except Exception as exc:
+            logger.warning("Локация %s: подключение #%s недоступно (%s) — ищу дальше.",
+                           spot.get("title"), inbound_id, exc)
+
+    names = [spot.get("short", ""), *(spot.get("aliases") or ())]
+    by_name = await client.find_inbound_by_name(names)
+    if by_name is not None:
+        return by_name, False, f"название «{by_name.get('remark')}» в панели"
+
+    inbound, auto_picked = await client.find_suitable_inbound(XUI_INBOUND_ID)
+    return inbound, auto_picked, "общее подключение XUI_INBOUND_ID"
+
+
 async def activate_paid_subscription(
     telegram_id: int,
     tariff_key: str,
@@ -3360,33 +3536,46 @@ async def activate_paid_subscription(
     order_id: str,
     payment_ref: str,
     extra_days: int = 0,
+    location_key: str | None = None,
 ) -> dict:
     """
-    Создаёт или продлевает платного клиента в 3x-ui по оплаченному заказу.
+    Создаёт или продлевает платную подписку в 3x-ui по оплаченному заказу.
+
+    Тариф на один туннель выдаётся в выбранной локации (Стокгольм или Варшава),
+    тарифы на несколько туннелей — сразу во всех локациях, входящих в тариф.
+    Если срок тарифа не ограничен (тип «по трафику»), expiryTime = 0: подписка
+    действует, пока не израсходован трафик, а реферальные бонусы (дни) задают срок.
 
     Идемпотентно: если в комментарии клиента уже стоит этот платёж, повторная
     выдача не происходит (защита от дублей вебхука и перезапуска бота).
     extra_days — реферальный бонус приглашённого; к ним добавляются накопленные
     бонусы самого покупателя (он тоже мог приглашать друзей).
-    Возвращает словарь с ключом, сроком и деталями подписки.
+    Возвращает словарь с доступом, сроком и деталями подписки.
     """
     tariff = TARIFFS[tariff_key]
     target_email = f"tg-paid-{telegram_id}"
     bonus_days = max(0, int(extra_days))
     pending_bonus = referral_store.pending_days(telegram_id) if REFERRAL_ENABLED else 0
     bonus_days += pending_bonus
-    total_days = tariff["days"] + bonus_days
+
+    # Срок: у тарифа «по трафику» его нет (0 = без ограничения), но бонусные дни
+    # за друзей задают срок — иначе они бы просто потерялись.
+    total_days = int(tariff["days"]) + bonus_days
+    limited = total_days > 0 or int(tariff["days"]) > 0
     now_ms = int(time.time() * 1000)
-    comment = f"{tariff_key} до {format_date(now_ms + total_days * 86400 * 1000)} | {payment_ref[:40]}"
+    if total_days > 0:
+        comment = f"{tariff_key} до {format_date(now_ms + total_days * 86400 * 1000)} | {payment_ref[:40]}"
+    else:
+        comment = f"{tariff_key} без ограничения по времени | {payment_ref[:40]}"
+
+    spots = tariff_locations(tariff)
+    if int(tariff.get("tunnels", 1) or 1) <= 1:
+        chosen = location_by_key(location_key) or spots[0]
+        spots = [chosen]
 
     async with XUIClient() as client:
-        inbound, auto_picked = await client.find_suitable_inbound(XUI_INBOUND_ID)
-        inbound_id = inbound.get("id")
-        params = extract_vless_params(inbound)
-
-        settings = as_dict(inbound.get("settings"))
-        clients = [c for c in (settings.get("clients") or []) if isinstance(c, dict)]
-        existing = next((c for c in clients if str(c.get("email")) == target_email), None)
+        group_name, group_state = await client.resolve_client_group()
+        entries: list[dict] = []
 
         async def sub_link_for(sub_id: str | None) -> str | None:
             """Ссылка-подписка клиента (или None, если сервис подписок недоступен)."""
@@ -3398,50 +3587,76 @@ async def activate_paid_subscription(
                 return None
             return build_sub_link(base, sub_id)
 
-        # Уже выдан по этому платежу? (журнал мог не сохраниться — смотрим в панель)
-        if existing is not None and comment_has_payment_ref(existing.get("comment"), payment_ref):
-            logger.info("Подписка %s уже выдана по платежу %s — повторно не продлеваю.", target_email, payment_ref)
-            return {
-                "email": target_email,
-                "already": True,
-                "expiry_ms": int(existing.get("expiryTime") or 0),
-                "link": build_vless_link(existing, inbound, params),
-                "sub_link": await sub_link_for(existing.get("subId")),
-                "tariff": tariff,
+        for spot in spots:
+            inbound, auto_picked, source = await resolve_location_inbound(client, spot)
+            inbound_id = inbound.get("id")
+            params = extract_vless_params(inbound)
+
+            settings = as_dict(inbound.get("settings"))
+            clients = [c for c in (settings.get("clients") or []) if isinstance(c, dict)]
+            existing = next((c for c in clients if str(c.get("email")) == target_email), None)
+
+            # Уже выдан по этому платежу? (журнал мог не сохраниться — смотрим в панель)
+            if existing is not None and comment_has_payment_ref(existing.get("comment"), payment_ref):
+                logger.info("Подписка %s (%s) уже выдана по платежу %s — повторно не продлеваю.",
+                            target_email, spot["title"], payment_ref)
+                entries.append({
+                    "location": spot.get("key"),
+                    "location_title": spot.get("title"),
+                    "inbound_id": inbound_id,
+                    "inbound_remark": inbound.get("remark"),
+                    "resolved_by": source,
+                    "status": "already",
+                    "auto_picked": auto_picked,
+                    "link": build_vless_link(existing, inbound, params),
+                    "sub_link": await sub_link_for(existing.get("subId")),
+                    "expiry_ms": int(existing.get("expiryTime") or 0),
+                    "existing": True,
+                })
+                continue
+
+            # Продление считается от текущего срока, если он ещё не истёк
+            base_ms = now_ms
+            if existing is not None and bool(existing.get("enable", True)):
+                existing_expiry = int(existing.get("expiryTime") or 0)
+                if existing_expiry > now_ms:
+                    base_ms = existing_expiry
+            expires_ms = (base_ms + total_days * 86400 * 1000) if limited else 0
+
+            payload = _paid_client_payload(
+                telegram_id,
+                (existing or {}).get("id") or str(uuid.uuid4()),
+                now_ms,
+                inbound,
+                tariff,
+                expires_ms,
+                comment,
+                sub_id=(existing or {}).get("subId") or "",
+                group_name=group_name or "",
+            )
+
+            if existing is not None:
+                await client.update_client(inbound_id, payload)
+                status = "extended"
+            else:
+                await client.add_client(inbound_id, payload)
+                status = "created"
+
+            sub_link = await sub_link_for(payload.get("subId"))
+
+            entries.append({
+                "location": spot.get("key"),
+                "location_title": spot.get("title"),
                 "inbound_id": inbound_id,
+                "inbound_remark": inbound.get("remark"),
+                "resolved_by": source,
+                "status": status if existing is None else "extended",
                 "auto_picked": auto_picked,
-                "group_note": "",
-                "bonus_days": 0,
-            }
-
-        group_name, group_state = await client.resolve_client_group()
-
-        # Продление считается от текущего срока, если он ещё не истёк
-        base_ms = now_ms
-        if existing is not None and bool(existing.get("enable", True)):
-            existing_expiry = int(existing.get("expiryTime") or 0)
-            if existing_expiry > now_ms:
-                base_ms = existing_expiry
-        expires_ms = base_ms + total_days * 86400 * 1000
-
-        payload = _paid_client_payload(
-            telegram_id,
-            (existing or {}).get("id") or str(uuid.uuid4()),
-            now_ms,
-            inbound,
-            tariff,
-            expires_ms,
-            comment,
-            sub_id=(existing or {}).get("subId") or "",
-            group_name=group_name or "",
-        )
-
-        if existing is not None:
-            await client.update_client(inbound_id, payload)
-            status = "extended"
-        else:
-            await client.add_client(inbound_id, payload)
-            status = "created"
+                "link": build_vless_link(payload, inbound, params),
+                "sub_link": sub_link,
+                "expiry_ms": expires_ms,
+                "existing": existing is not None,
+            })
 
         # Дни за друзей потрачены — обнуляем копилку, чтобы не начислить их второй раз.
         if pending_bonus:
@@ -3449,32 +3664,44 @@ async def activate_paid_subscription(
             logger.info("Заказу %s зачтены накопленные реферальные дни: +%s.", order_id, pending_bonus)
 
         group_note = ""
-        if group_state == "exists" or group_state == "new":
+        if group_state in ("exists", "new"):
             group_note = _group_note(
                 await client.add_clients_to_group([target_email], group_name, existed=(group_state == "exists")),
                 group_name,
             )
 
-        return {
-            "email": target_email,
-            "already": False,
-            "status": status,
-            "expiry_ms": expires_ms,
-            "link": build_vless_link(payload, inbound, params),
-            "sub_link": await sub_link_for(payload.get("subId")),
-            "tariff": tariff,
-            "inbound_id": inbound_id,
-            "auto_picked": auto_picked,
-            "group_note": group_note,
-            "bonus_days": bonus_days,
-        }
+    primary = entries[0]
+    return {
+        "email": target_email,
+        "already": all(entry["status"] == "already" for entry in entries),
+        "status": primary["status"],
+        "expiry_ms": primary["expiry_ms"],
+        "limited": limited,
+        "link": primary["link"],
+        "sub_link": primary["sub_link"],
+        "entries": entries,
+        "location": primary.get("location"),
+        "location_title": primary.get("location_title"),
+        "tariff": tariff,
+        "inbound_id": primary["inbound_id"],
+        "auto_picked": primary["auto_picked"],
+        "group_note": group_note,
+        "bonus_days": bonus_days,
+    }
 
 
 async def get_paid_subscription(telegram_id: int) -> dict | None:
-    """Читает текущую подписку пользователя из панели (срок, трафик, статус)."""
+    """
+    Читает текущую подписку пользователя из панели (срок, трафик, статус).
+
+    Тарифы на несколько туннелей живут в нескольких локациях: возвращаем запись
+    из каждой (список «entries»), а поля верхнего уровня — по первой локации,
+    чтобы старые вызовы продолжали работать.
+    """
     target_email = f"tg-paid-{telegram_id}"
     async with XUIClient() as client:
         inbounds = await client.get_inbounds()
+        entries = []
         for inbound in inbounds:
             settings = as_dict(inbound.get("settings"))
             for candidate in settings.get("clients") or []:
@@ -3486,19 +3713,27 @@ async def get_paid_subscription(telegram_id: int) -> dict | None:
                         stats = stat
                         break
                 used = int(stats.get("up") or 0) + int(stats.get("down") or 0)
-                return {
+                entries.append({
                     "client": candidate,
                     "inbound": inbound,
+                    "inbound_id": inbound.get("id"),
+                    "inbound_remark": inbound.get("remark"),
+                    "location_title": inbound.get("remark") or f"сервер #{inbound.get('id')}",
                     "used_bytes": used,
                     "total_bytes": int(candidate.get("totalGB") or 0),
                     "expiry_ms": int(candidate.get("expiryTime") or 0),
                     "enable": bool(stats.get("enable", candidate.get("enable", True))),
-                }
-    return None
+                })
+        if not entries:
+            return None
+        primary = entries[0]
+        primary = dict(primary)
+        primary["entries"] = entries
+        return primary
 
 
 def subscription_status_text(sub: dict | None) -> str:
-    """Человеческое описание подписки для /profile."""
+    """Человеческое описание подписки для /profile (в т.ч. по всем локациям тарифа)."""
     if not sub:
         return "❌ Активной подписки нет."
 
@@ -3517,6 +3752,8 @@ def subscription_status_text(sub: dict | None) -> str:
         left_days = max(0, (expiry_ms - int(time.time() * 1000)) // 86_400_000)
         date = format_date(expiry_ms)
         lines.append(f"• Действует до: <b>{date}</b> (осталось {left_days} дн.)")
+    else:
+        lines.append("• Срок: <b>без ограничения по времени</b> (тариф по трафику)")
 
     total = sub["total_bytes"]
     used = sub["used_bytes"]
@@ -3524,6 +3761,11 @@ def subscription_status_text(sub: dict | None) -> str:
         lines.append(f"• Трафик: <b>{_human_bytes(used)}</b> из {_human_bytes(total)}")
     else:
         lines.append(f"• Трафик: <b>{_human_bytes(used)}</b> (безлимит)")
+
+    entries = sub.get("entries") or []
+    if len(entries) > 1:
+        titles = ", ".join(str(entry.get("location_title")) for entry in entries)
+        lines.append(f"• Серверы: <b>{escape(titles)}</b>")
     return "\n".join(lines)
 
 
@@ -3534,10 +3776,26 @@ def access_block(info: dict, *, heading: str = "") -> str:
     Блок с доступом в сообщениях клиенту.
 
     Основное — ссылка-подписка: приложение само забирает по ней конфигурацию и
-    обновляет её. Если сервис подписок в панели выключен или не отвечает, показываем
-    ключ vless:// — он работает всегда и не оставит клиента без доступа (админ
-    получает отдельное предупреждение).
+    обновляет её. У тарифа на несколько туннелей ссылок столько же, сколько локаций, —
+    показываем каждую с названием сервера. Если сервис подписок в панели выключен
+    или не отвечает, показываем ключ vless:// — он работает всегда и не оставит
+    клиента без доступа (админ получает отдельное предупреждение).
     """
+    entries = [entry for entry in (info.get("entries") or []) if entry.get("sub_link")]
+    if len(entries) > 1:
+        lines = [heading or "🔗 <b>Твои ссылки-подписки (нажми, чтобы скопировать):</b>"]
+        for entry in entries:
+            lines.append(
+                f"\n{entry.get('location_title') or 'Сервер'}:\n"
+                f"<code>{escape(entry['sub_link'])}</code>"
+            )
+        lines.append(
+            "\n📥 <b>Как добавить:</b> в приложении выбери «Добавить подписку» / "
+            "«Импорт из ссылки» и вставь ссылку нужного сервера — профиль появится сам "
+            "и будет обновляться. В тариф входят оба сервера: можно добавить обе ссылки."
+        )
+        return "".join(lines) + "\n"
+
     sub_link = info.get("sub_link")
     if sub_link:
         return (
@@ -3571,16 +3829,22 @@ def order_paid_message(order: dict, info: dict) -> str:
     elif order.get("simulated"):
         title = "🧪 <b>Проверка выдачи: подписка создана без оплаты.</b>"
 
+    if info.get("expiry_ms"):
+        term_line = f"⏳ <b>Действует до:</b> {expiry}\n"
+    else:
+        term_line = "⏳ <b>Срок:</b> без ограничения по времени — пока не израсходован трафик\n"
+    served = ", ".join(str(entry.get("location_title")) for entry in (info.get("entries") or []))
+
     return (
         f"{title}\n\n"
         f"📦 <b>Тариф:</b> {tariff['name']}\n"
-        f"⏳ <b>Действует до:</b> {expiry}\n"
+        + term_line
         + (f"🎁 <b>Бонус за друзей:</b> +{info['bonus_days']} "
            f"{days_word(info['bonus_days'])} к сроку\n" if info.get("bonus_days") else "")
         +
         f"📊 <b>Трафик:</b> {tariff['traffic']}\n"
         f"📱 <b>Устройств:</b> {tariff['ips']}\n"
-        f"🌍 <b>Локации:</b> {tariff['locations']}\n\n"
+        f"🌍 <b>Серверы:</b> {served or tariff['locations']}\n\n"
         + access_block(info) + "\n\n"
         "📲 <b>Как подключиться:</b> нажми кнопку под сообщением — покажу по шагам, "
         "что скачать и куда вставить ссылку (инструкции для iPhone, Android, Windows и macOS)."
@@ -3724,6 +3988,7 @@ async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str 
             order_id=order["id"],
             payment_ref=charge_id or order["id"],
             extra_days=REFERRAL_INVITED_BONUS_DAYS if referral_invite else 0,
+            location_key=order.get("location"),
         )
     except Exception as exc:
         logger.error("Не удалось выдать подписку по заказу %s: %s", order["id"], exc)
@@ -3774,14 +4039,15 @@ async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str 
     return {"order": order, "info": info}
 
 
-def new_test_order(tg_id: int, tariff_key: str) -> dict:
+def new_test_order(tg_id: int, tariff_key: str, location_key: str | None = None) -> dict:
     """
     Заказ для проверки выдачи ключа без оплаты.
 
     Всё как у обычного заказа (тариф, срок, лимиты), но помечен тестовым: в выручку
     не попадает, уведомления об оплате его не трогают (они ищут только mode=freekassa).
     """
-    order = new_order(tg_id, tariff_key)
+    order = new_order(tg_id, tariff_key,
+                      location_key=location_key or (LOCATION_ORDER[0] if LOCATION_ORDER else None))
     order["mode"] = "test"
     order["currency"] = "TEST"
     order["simulated"] = True
@@ -3796,7 +4062,7 @@ def new_promo_order(tg_id: int) -> dict:
     (денег по нему не приходило), promo — чтобы сообщения и уведомления говорили
     о промо, а не о «проверке выдачи».
     """
-    order = new_order(tg_id, PROMO_KEY)
+    order = new_order(tg_id, PROMO_KEY, location_key=LOCATION_ORDER[0] if LOCATION_ORDER else None)
     order["mode"] = "promo"
     order["currency"] = "PROMO"
     order["simulated"] = True
@@ -3848,7 +4114,8 @@ async def grant_promo(chat_id: int, tg_id: int) -> dict:
     return result
 
 
-async def simulate_successful_payment(chat_id: int, tg_id: int, tariff_key: str) -> dict:
+async def simulate_successful_payment(chat_id: int, tg_id: int, tariff_key: str,
+                                      location_key: str | None = None) -> dict:
     """
     Прогоняет путь выдачи ключа, как после реальной оплаты, — но без денег.
 
@@ -3870,7 +4137,7 @@ async def simulate_successful_payment(chat_id: int, tg_id: int, tariff_key: str)
             "2. Проверь выдачу на другом аккаунте: там эта команда создаст ключ тем же путём."
         )
 
-    order = await payment_store.create(new_test_order(tg_id, tariff_key))
+    order = await payment_store.create(new_test_order(tg_id, tariff_key, location_key))
     charge_id = f"test-{order['id']}"
     logger.info(
         "Проверка выдачи без оплаты: заказ %s, тариф %s, пользователь %s", order["id"], tariff_key, tg_id
@@ -4054,10 +4321,13 @@ def freekassa_check_price() -> int:
     return min(prices) if prices else 100
 
 
-async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
+async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
+                         location_key: str | None = None) -> None:
     """
     Начинает оплату выбранного тарифа в текущем режиме PAYMENTS_MODE.
 
+    location_key — выбранный сервер для тарифов с одним туннелем (Стокгольм/Варшава);
+    тарифы на несколько туннелей получают все локации сразу.
     stars/provider — нативный счёт Telegram; yookassa и freekassa — ссылка
     на страницу оплаты.
     """
@@ -4087,7 +4357,7 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
         )
 
     if PAYMENTS_MODE in ("stars", "provider"):
-        order = await payment_store.create(new_order(tg_id, tariff_key))
+        order = await payment_store.create(new_order(tg_id, tariff_key, location_key))
         provider_token = PAYMENT_PROVIDER_TOKEN if PAYMENTS_MODE == "provider" else None
         if PAYMENTS_MODE == "provider" and not provider_token:
             raise PaymentError(
@@ -4120,7 +4390,8 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
             title=tariff["name"][:32],
             description=(
                 f"VPN доступ: {tariff['traffic']}, {tariff['ips']} устройств, "
-                f"{tariff['days']} дней. Ключ придёт сразу после оплаты."
+                f"{days_label(tariff['days'])}. Сервер: {location_display(tariff, location_key)}. "
+                "Доступ придёт сразу после оплаты."
             )[:255],
             payload=order["id"],
             currency=order["currency"],
@@ -4146,7 +4417,7 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
                 "<b>FREEKASSA_SECRET1</b> и <b>FREEKASSA_SECRET2</b> (кабинет FreeKassa → "
                 "Настройки магазина). Проверить: команда /freekassa_check."
             )
-        order = await payment_store.create(new_order(tg_id, tariff_key))
+        order = await payment_store.create(new_order(tg_id, tariff_key, location_key))
         pay_url = freekassa_payment_url(order)
         await payment_store.update(order["id"], payment_url=pay_url)
 
@@ -4166,9 +4437,8 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
             chat_id,
             f"💳 <b>Оплата тарифа {tariff['name']}</b>\n\n"
             f"• Сумма: <b>{tariff['price']} ₽</b>\n"
-            f"• Срок: <b>{tariff['days']} дней</b>\n"
-            f"• Трафик: <b>{tariff['traffic']}</b>\n"
-            f"• Устройств: <b>{tariff['ips']}</b>\n\n"
+            f"{tariff_terms_line(tariff)}\n"
+            f"• Сервер: <b>{location_display(tariff, location_key)}</b>\n\n"
             "Нажми «Оплатить» — откроется страница FreeKassa: карта, СБП и электронные "
             "кошельки. Ключ придёт автоматически после подтверждения оплаты.\n"
             f"<i>Номер заказа: <code>{order['id']}</code></i>{test_note}",
@@ -4179,7 +4449,7 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
         return
 
     # ЮKassa: создаём платёж и отдаём ссылку на оплату
-    order = await payment_store.create(new_order(tg_id, tariff_key))
+    order = await payment_store.create(new_order(tg_id, tariff_key, location_key))
     client = make_yookassa_client()
     payment = await client.create_payment(order)
     payment_id = payment.get("id")
@@ -4204,9 +4474,8 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str) -> None:
         chat_id,
         f"💳 <b>Оплата тарифа {tariff['name']}</b>\n\n"
         f"• Сумма: <b>{tariff['price']} ₽</b>\n"
-        f"• Срок: <b>{tariff['days']} дней</b>\n"
-        f"• Трафик: <b>{tariff['traffic']}</b>\n"
-        f"• Устройств: <b>{tariff['ips']}</b>\n\n"
+        f"{tariff_terms_line(tariff)}\n"
+        f"• Сервер: <b>{location_display(tariff, location_key)}</b>\n\n"
         "Нажми «Оплатить» — откроется страница ЮKassa (карта, СБП и другие способы). "
         "Ключ придёт автоматически после успешной оплаты.\n"
         f"<i>Номер заказа: <code>{order['id']}</code></i>{test_note}",
@@ -4405,13 +4674,108 @@ async def send_error_message(message: Message, error: Exception):
 # =========================
 
 """
-Тарифные планы. Для каждого платного тарифа:
-  • price      — цена в рублях (0 = бесплатный тестовый доступ);
-  • days       — срок подписки в днях;
+Тарифные планы.
+
+Каталог строится из трёх частей:
+
+  • тип подписки (TARIFF_KINDS) — «по времени» (с ограничением по сроку) и «по трафику»
+    (срок не истекает, ограничен только трафик);
+  • уровень (TARIFF_LEVELS) — Новичок, Нетраннер, Кибер-самурай, Призрак: сколько
+    устройств и сколько туннелей (локаций) доступно;
+  • сетка цен и лимитов (TARIFF_GRID) — цена, трафик и срок для каждой пары
+    «тип + уровень».
+
+Клиент выбирает это в три шага: тип → уровень → сервер (сервер спрашиваем только у
+тарифов с одним туннелем, остальным доступны все локации).
+
+Для каждого платного тарифа:
+  • price      — цена в рублях (0 = бесплатный тестовый/промо-доступ);
+  • days       — срок подписки в днях (0 = без ограничения по времени);
   • traffic_gb — лимит трафика в ГиБ (0 = безлимит);
   • ip_limit   — сколько устройств (IP) разрешено;
+  • tunnels    — сколько локаций (серверов) входит в тариф;
   • stars      — цена в звёздах Telegram (переопределяется переменной STARS_<ТАРИФ>).
 """
+
+# Типы подписки: по времени (срок истекает) и по трафику (срок не истекает).
+TARIFF_KINDS = {
+    "traffic": {
+        "title": "🔁 По трафику",
+        "short": "по трафику",
+        "hint": "Без ограничения по времени: подписка не истекает, пока не израсходован трафик.",
+    },
+    "time": {
+        "title": "⏳ По времени",
+        "short": "по времени",
+        "hint": "С ограничением по времени: 15 или 30 дней, трафик — по уровню тарифа.",
+    },
+}
+TARIFF_KIND_ORDER = ("time", "traffic")
+
+# Уровни: название, лимит устройств и число туннелей (локаций).
+TARIFF_LEVELS = {
+    1: {"name": "Новичок", "devices": 1, "tunnels": 1},
+    2: {"name": "Нетраннер", "devices": 3, "tunnels": 2},
+    3: {"name": "Кибер-самурай", "devices": 5, "tunnels": 4},
+    4: {"name": "Призрак", "devices": 6, "tunnels": 6},
+}
+TARIFF_LEVEL_ORDER = (1, 2, 3, 4)
+
+# Сетка: тип → уровень → цена, трафик (ГБ), срок (дней; 0 = без ограничения).
+TARIFF_GRID = {
+    "traffic": {
+        1: {"price": 70, "traffic_gb": 10, "days": 0},
+        2: {"price": 150, "traffic_gb": 50, "days": 0},
+        3: {"price": 300, "traffic_gb": 100, "days": 0},
+        4: {"price": 500, "traffic_gb": 200, "days": 0},
+    },
+    "time": {
+        1: {"price": 70, "traffic_gb": 15, "days": 15},
+        2: {"price": 130, "traffic_gb": 50, "days": 15},
+        3: {"price": 250, "traffic_gb": 100, "days": 30},
+        4: {"price": 450, "traffic_gb": 0, "days": 30},
+    },
+}
+
+
+def traffic_label(traffic_gb: int) -> str:
+    """«10 ГБ» или «Безлимит»."""
+    return "Безлимит" if int(traffic_gb) <= 0 else f"{int(traffic_gb)} ГБ"
+
+
+def days_label(days: int) -> str:
+    """«15 дней» или «без ограничения по времени»."""
+    if int(days) <= 0:
+        return "без ограничения по времени"
+    return f"{int(days)} {days_word(int(days))}"
+
+
+def tariff_key(kind: str, level: int) -> str:
+    """Ключ тарифа в сетке: time_2, traffic_4 и т.д."""
+    return f"{kind}_{int(level)}"
+
+
+def _build_plan(kind: str, level: int) -> dict:
+    """Собирает описание одного платного тарифа из сетки."""
+    meta = TARIFF_LEVELS[level]
+    grid = TARIFF_GRID[kind][level]
+    tunnels = meta["tunnels"]
+    return {
+        "name": f"{meta['name']} · {TARIFF_KINDS[kind]['short']}",
+        "price": grid["price"],
+        "days": grid["days"],
+        "traffic": traffic_label(grid["traffic_gb"]),
+        "traffic_gb": grid["traffic_gb"],
+        "ips": meta["devices"],
+        "ip_limit": meta["devices"],
+        "tunnels": tunnels,
+        "kind": kind,
+        "level": level,
+        "locations": ("Все локации" if tunnels > 1
+                      else "1 локация на выбор"),
+    }
+
+
 TARIFFS = {
     "trial": {
         "name": "🎁 Тестовый период (24 ч)",
@@ -4421,7 +4785,10 @@ TARIFFS = {
         "traffic_gb": 1,
         "ips": 1,
         "ip_limit": 1,
-        "locations": "Все локации",
+        "tunnels": 1,
+        "kind": "",
+        "level": 0,
+        "locations": "Стокгольм",
     },
     "promo": {
         "name": "🎉 Промо-доступ (30 дней)",
@@ -4431,54 +4798,56 @@ TARIFFS = {
         "traffic_gb": 10,
         "ips": 1,
         "ip_limit": 1,
-        "locations": "Все локации",
-    },
-    "school": {
-        "name": "🎒 Школьник (1 месяц)",
-        "price": 99,
-        "days": 30,
-        "traffic": "50 ГБ",
-        "traffic_gb": 50,
-        "ips": 1,
-        "ip_limit": 1,
-        "locations": "1 локация (Стокгольм)",
-    },
-    "basic": {
-        "name": "⚡️ Базовый (1 месяц)",
-        "price": 249,
-        "days": 30,
-        "traffic": "Безлимит",
-        "traffic_gb": 0,
-        "ips": 3,
-        "ip_limit": 3,
-        "locations": "2 локации (Стокгольм)",
-    },
-    "family": {
-        "name": "👨👩👧 Семейный (1 месяц)",
-        "price": 399,
-        "days": 30,
-        "traffic": "Безлимит",
-        "traffic_gb": 0,
-        "ips": 5,
-        "ip_limit": 5,
-        "locations": "3 локации",
-    },
-    "premium": {
-        "name": "👑 Премиум (1 месяц)",
-        "price": 599,
-        "days": 30,
-        "traffic": "Безлимит",
-        "traffic_gb": 0,
-        "ips": 10,
-        "ip_limit": 10,
-        "locations": "Все локации",
+        "tunnels": 1,
+        "kind": "",
+        "level": 0,
+        "locations": "Стокгольм",
     },
 }
+for _kind in TARIFF_KIND_ORDER:
+    for _level in TARIFF_LEVEL_ORDER:
+        TARIFFS[tariff_key(_kind, _level)] = _build_plan(_kind, _level)
 
 
-def _stars_price(tariff_key: str, tariff: dict) -> int:
+def paid_tariff_keys() -> list[str]:
+    """Ключи платных тарифов в порядке каталога (тип → уровень)."""
+    return [tariff_key(kind, level)
+            for kind in TARIFF_KIND_ORDER for level in TARIFF_LEVEL_ORDER]
+
+
+def tariff_by_key(key: str) -> dict | None:
+    """Тариф по ключу: поддерживает и «time_2», и короткую запись «time 2»."""
+    key = (key or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return TARIFFS.get(key)
+
+
+def tariff_title(tariff: dict) -> str:
+    """Название тарифа для сообщений: «Новичок · по времени»."""
+    return tariff.get("name", "")
+
+
+def tariff_specs_line(tariff: dict) -> str:
+    """Одна строка характеристик: «15 ГБ · 15 дней · 1 устройство · Стокгольм»."""
+    parts = [
+        tariff.get("traffic", ""),
+        days_label(tariff.get("days", 0)),
+        f"{tariff['ips']} {devices_word(tariff['ips'])}",
+    ]
+    return " · ".join(part for part in parts if part)
+
+
+def tariff_terms_line(tariff: dict) -> str:
+    """Строка для счёта и подтверждения оплаты: срок, трафик, устройства."""
+    return (
+        f"⏳ <b>Срок:</b> {days_label(tariff.get('days', 0))}\n"
+        f"📊 <b>Трафик:</b> {tariff.get('traffic', '')}\n"
+        f"📱 <b>Устройств:</b> {tariff.get('ips', 0)}"
+    )
+
+
+def _stars_price(tariff_key_value: str, tariff: dict) -> int:
     """Цена тарифа в звёздах: переменная STARS_<ТАРИФ> либо пересчёт из рублей."""
-    override = (os.getenv(f"STARS_{tariff_key.upper()}") or "").strip()
+    override = (os.getenv(f"STARS_{tariff_key_value.upper()}") or "").strip()
     if override.isdigit() and int(override) > 0:
         return int(override)
     if tariff["price"] <= 0:
@@ -4489,6 +4858,8 @@ def _stars_price(tariff_key: str, tariff: dict) -> int:
 for _key, _tariff in TARIFFS.items():
     if _tariff["price"] > 0:
         _tariff["stars"] = _stars_price(_key, _tariff)
+
+
 
 
 # =========================
@@ -4758,28 +5129,154 @@ def main_menu_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def tariffs_intro(tg_id: int | None = None) -> str:
+    """Первый экран тарифов: бесплатные предложения и шаг выбора типа подписки."""
+    text = "💰 <b>Тарифные планы</b>\n\n"
+    text += ("Выбери подписку в три шага: <b>тип</b> (по времени или по трафику) → "
+             "<b>уровень</b> (Новичок, Нетраннер, Кибер-самурай, Призрак) → "
+             "<b>сервер</b> для тарифов с одним туннелем.\n\n")
+    free_items = []
+    promo = TARIFFS.get(PROMO_KEY) or {}
+    if promo_visible(tg_id):
+        free_items.append(
+            f"• 🎉 <b>Промо-доступ</b> — {traffic_label(promo.get('traffic_gb', 0))} "
+            f"на {days_label(promo.get('days', 30))} (один раз на аккаунт)"
+        )
+    trial = TARIFFS.get("trial") or {}
+    if tariff_visible(tg_id, "trial", trial):
+        free_items.append(f"• 🎁 <b>Тестовый период</b> — 24 часа, {trial.get('traffic', '')}")
+    if free_items:
+        text += "<b>Бесплатно</b>\n" + "\n".join(free_items) + "\n\n"
+    text += "<b>Платные тарифы</b>\n"
+    for kind in TARIFF_KIND_ORDER:
+        meta = TARIFF_KINDS[kind]
+        prices = [TARIFF_GRID[kind][level]["price"] for level in TARIFF_LEVEL_ORDER]
+        text += (f"• <b>{meta['title']}</b> — от {min(prices)} ₽\n"
+                 f"  <i>{meta['hint']}</i>\n")
+    return text
+
+
 def tariffs_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
     """
-    Кнопки тарифов.
+    Кнопки тарифов: бесплатные предложения, затем шаг 1 — выбор типа подписки.
 
     Бесплатный тестовый пункт показываем только тем, кому тест доступен и включён
     показ кнопок (TRIAL_BUTTON=1) — иначе пользователь нажмёт «Бесплатно» и получит
     отказ, а бот выглядит не как рабочий сервис.
     """
     buttons = []
-    for key, data in TARIFFS.items():
-        if not tariff_visible(tg_id, key, data):
-            continue
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"{data['name']} — {tariff_price_label(data)}",
-                callback_data=f"buy_{key}",
-            )
-        ])
+    if promo_visible(tg_id):
+        promo = TARIFFS.get(PROMO_KEY) or {}
+        buttons.append([InlineKeyboardButton(
+            text=f"🎉 Промо-доступ — {promo.get('traffic', '')} на {promo.get('days', 30)} дней бесплатно",
+            callback_data="buy_promo",
+        )])
+    if tariff_visible(tg_id, "trial", TARIFFS.get("trial") or {}):
+        buttons.append([InlineKeyboardButton(text="🎁 Тестовый период (24 ч) — Бесплатно",
+                                             callback_data="buy_trial")])
+    buttons.append([InlineKeyboardButton(text="━━ Выбрать тариф ━━", callback_data="noop")])
+    for kind in TARIFF_KIND_ORDER:
+        buttons.append([InlineKeyboardButton(
+            text=TARIFF_KINDS[kind]["title"],
+            callback_data=f"tkind_{kind}",
+        )])
     if PAYMENTS_MODE == "yookassa":
         buttons.append([InlineKeyboardButton(text="🔄 Проверить оплату", callback_data="check_payment_help")])
     buttons.append([InlineKeyboardButton(text="◀️ Назад в меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def kind_levels_text(kind: str) -> str:
+    """Второй экран: что входит в уровни выбранного типа подписки."""
+    meta = TARIFF_KINDS[kind]
+    text = f"{meta['title']}: <b>выбери уровень</b>\n\n"
+    text += f"<i>{meta['hint']}</i>\n\n"
+    for level in TARIFF_LEVEL_ORDER:
+        tariff = TARIFFS[tariff_key(kind, level)]
+        plan = TARIFF_LEVELS[level]
+        text += (
+            f"<b>{plan['name']}</b> — <b>{tariff_price_label(tariff)}</b>\n"
+            f"  📊 {tariff['traffic']} | ⏳ {days_label(tariff['days'])}\n"
+            f"  📱 {plan['devices']} {devices_word(plan['devices'])} | "
+            f"🌍 {plan['tunnels']} {tunnels_word(plan['tunnels'])}\n\n"
+        )
+    return text
+
+
+def tunnels_word(count: int) -> str:
+    """«1 туннель», «2 туннеля», «6 туннелей»."""
+    value = abs(int(count))
+    if value % 100 in (11, 12, 13, 14):
+        return "туннелей"
+    if value % 10 == 1:
+        return "туннель"
+    if value % 10 in (2, 3, 4):
+        return "туннеля"
+    return "туннелей"
+
+
+def kind_levels_kb(kind: str) -> InlineKeyboardMarkup:
+    """Кнопки второго экрана: четыре уровня выбранного типа подписки."""
+    rows = []
+    for level in TARIFF_LEVEL_ORDER:
+        tariff = TARIFFS[tariff_key(kind, level)]
+        plan = TARIFF_LEVELS[level]
+        rows.append([InlineKeyboardButton(
+            text=f"{plan['name']} — {tariff_price_label(tariff)}",
+            callback_data=f"tlvl_{kind}_{level}",
+        )])
+    rows.append([InlineKeyboardButton(text="◀️ Назад к типам", callback_data="tariffs")])
+    rows.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def server_pick_text(kind: str, level: int) -> str:
+    """Третий экран: выбор сервера для тарифа на один туннель."""
+    tariff = TARIFFS[tariff_key(kind, level)]
+    return (
+        f"{TARIFF_LEVELS[level]['name']} · {TARIFF_KINDS[kind]['short']} — "
+        f"<b>{tariff_price_label(tariff)}</b>\n\n"
+        f"📊 {tariff['traffic']} | ⏳ {days_label(tariff['days'])} | "
+        f"📱 {tariff['ips']} {devices_word(tariff['ips'])}\n\n"
+        "<b>Выбери сервер:</b>"
+    )
+
+
+def server_pick_kb(kind: str, level: int) -> InlineKeyboardMarkup:
+    """Кнопки выбора сервера (только для тарифов с одним туннелем)."""
+    rows = [[InlineKeyboardButton(text=LOCATIONS[key]["title"],
+                                  callback_data=f"tlocs_{kind}_{level}_{key}")]
+            for key in LOCATION_ORDER]
+    rows.append([InlineKeyboardButton(text="◀️ Назад к уровням", callback_data=f"tkind_{kind}")])
+    rows.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def tariff_confirm_text(tariff: dict, location_key: str | None) -> str:
+    """Подтверждение перед оплатой: что именно покупает клиент."""
+    plan = TARIFF_LEVELS.get(tariff.get("level") or 0, {})
+    locations = location_display(tariff, location_key)
+    return (
+        f"🧾 <b>Твой тариф</b>\n\n"
+        f"• Тип: <b>{TARIFF_KINDS[tariff['kind']]['title']}</b>\n"
+        f"• Уровень: <b>{plan.get('name', '')}</b>\n"
+        f"• Цена: <b>{tariff_price_label(tariff)}</b>\n"
+        f"• Срок: <b>{days_label(tariff['days'])}</b>\n"
+        f"• Трафик: <b>{tariff['traffic']}</b>\n"
+        f"• Устройств: <b>{tariff['ips']}</b>\n"
+        f"• Туннелей: <b>{tariff['tunnels']}</b>\n"
+        f"• Сервер: <b>{locations}</b>\n\n"
+        "Нажми «Оплатить», чтобы перейти к оплате."
+    )
+
+
+def tariff_confirm_kb(tariff_key_value: str, location_key: str | None = None) -> InlineKeyboardMarkup:
+    """Кнопка оплаты выбранного тарифа (с сервером, если он выбирался)."""
+    data = f"buyat_{tariff_key_value}" + (f"_{location_key}" if location_key else "")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Оплатить", callback_data=data)],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
+    ])
 
 
 def back_kb() -> InlineKeyboardMarkup:
@@ -5391,6 +5888,38 @@ async def cmd_panel_debug(message: Message):
             f"выручка: {stats['rub']} ₽ / {stats['stars']} ⭐️"
         )
 
+    # Локации: какие серверы бот видит и куда попадёт клиент
+    lines.append("")
+    lines.append("🌍 <b>Локации (серверы):</b>")
+    try:
+        async with XUIClient() as client:
+            inbounds = await client.get_inbounds()
+            for key in LOCATION_ORDER:
+                spot = LOCATIONS[key]
+                try:
+                    inbound, auto_picked, source = await resolve_location_inbound(client, spot)
+                    lines.append(
+                        f"   {spot['title']}: подключение #{inbound.get('id')} "
+                        f"«{escape(str(inbound.get('remark') or '—'))}» — "
+                        f"<i>{escape(source)}</i>"
+                    )
+                except Exception as exc:
+                    lines.append(f"   {spot['title']}: ❌ {escape(str(exc)[:120])}")
+            lines.append(
+                "   В панели: "
+                + ", ".join(f"#{item.get('id')} «{escape(str(item.get('remark') or '—'))}»"
+                            for item in inbounds[:8])
+            )
+            declared = max(TARIFF_LEVELS[level]["tunnels"] for level in TARIFF_LEVEL_ORDER)
+            if len(configured_locations()) < declared:
+                lines.append(
+                    f"   ⚠️ В тарифах указано до {declared} туннелей, а локаций настроено "
+                    f"{len(configured_locations())}. Чтобы включить остальные, добавь "
+                    "подключения в панели и переменные XUI_INBOUND_&lt;ЛОКАЦИЯ&gt;."
+                )
+    except Exception as exc:
+        lines.append(f"   ❌ Не удалось прочитать подключения: {escape(str(exc)[:120])}")
+
     # Ссылка-подписка: клиенты получают её вместо ключа, поэтому проверяем адрес
     lines.append("")
     lines.append("📥 <b>Сервис подписок (ссылка для клиентов):</b>")
@@ -5500,22 +6029,22 @@ async def cb_reset_my_vpn(cb: CallbackQuery):
     await cmd_reset_vpn(cb.message)
 
 
+@dp.callback_query(F.data == "noop")
+async def cb_noop(cb: CallbackQuery):
+    """Разделитель в кнопках — просто гасим нажатие."""
+    await cb.answer()
+
+
 @dp.callback_query(F.data == "tariffs")
 async def cb_tariffs(cb: CallbackQuery):
+    """Шаг 1: бесплатные предложения и выбор типа подписки."""
     await cb.answer()
     if terms_gate_needed(cb.from_user.id):
         await show_terms_gate(cb.message)
         return
-    text = "💰 <b>Тарифные планы:</b>\n\n"
-    for key, data in TARIFFS.items():
-        if not tariff_visible(cb.from_user.id, key, data):
-            continue          # бесплатные пункты — по своим правилам (см. tariff_visible)
-        text += (
-            f"• <b>{data['name']}</b> — <b>{tariff_price_label(data)}</b>\n"
-            f"  📦 Трафик: {data['traffic']} | 📱 Устройств: {data['ips']} | 🌍 {data['locations']}\n\n"
-        )
+    text = tariffs_intro(cb.from_user.id)
 
-    text += ("📄 <i>Оплачивая любой тариф, ты принимаешь условия сервиса — /terms, "
+    text += ("\n📄 <i>Оплачивая любой тариф, ты принимаешь условия сервиса — /terms, "
              "политику конфиденциальности — /privacy.</i>\n\n")
 
     if not payments_enabled():
@@ -5536,6 +6065,72 @@ async def cb_tariffs(cb: CallbackQuery):
     await cb.message.edit_text(text, reply_markup=tariffs_kb(cb.from_user.id), parse_mode="HTML")
 
 
+@dp.callback_query(F.data.startswith("tkind_"))
+async def cb_tariff_kind(cb: CallbackQuery):
+    """Шаг 2: уровни выбранного типа подписки (по времени / по трафику)."""
+    await cb.answer()
+    kind = cb.data.removeprefix("tkind_")
+    if kind not in TARIFF_KINDS:
+        await cb.answer("Такого типа подписки нет.", show_alert=True)
+        return
+    try:
+        await cb.message.edit_text(kind_levels_text(kind), reply_markup=kind_levels_kb(kind),
+                                   parse_mode="HTML")
+    except Exception:
+        await cb.message.answer(kind_levels_text(kind), reply_markup=kind_levels_kb(kind),
+                                parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("tlvl_"))
+async def cb_tariff_level(cb: CallbackQuery):
+    """Шаг 3 для многотуннельных тарифов — сразу подтверждение; для одного туннеля — выбор сервера."""
+    await cb.answer()
+    parts = cb.data.removeprefix("tlvl_").split("_")
+    if len(parts) != 2 or not parts[1].isdigit():
+        await cb.answer("Не понял выбор — начни заново из тарифов.", show_alert=True)
+        return
+    kind, level = parts[0], int(parts[1])
+    plan = TARIFFS.get(tariff_key(kind, level))
+    if plan is None:
+        await cb.answer("Такого тарифа нет.", show_alert=True)
+        return
+
+    if plan["tunnels"] > 1:
+        # Доступны все локации — сервер выбирать не нужно.
+        text = tariff_confirm_text(plan, None)
+        keyboard = tariff_confirm_kb(tariff_key(kind, level), None)
+    else:
+        text = server_pick_text(kind, level)
+        keyboard = server_pick_kb(kind, level)
+
+    try:
+        await cb.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    except Exception:
+        await cb.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("tlocs_"))
+async def cb_tariff_location(cb: CallbackQuery):
+    """Шаг 3 (один туннель): выбор сервера — Стокгольм или Варшава."""
+    await cb.answer()
+    parts = cb.data.removeprefix("tlocs_").split("_")
+    if len(parts) != 3 or not parts[1].isdigit() or parts[2] not in LOCATIONS:
+        await cb.answer("Не понял выбор сервера — начни заново из тарифов.", show_alert=True)
+        return
+    kind, level, location_key = parts[0], int(parts[1]), parts[2]
+    plan = TARIFFS.get(tariff_key(kind, level))
+    if plan is None:
+        await cb.answer("Такого тарифа нет.", show_alert=True)
+        return
+
+    text = tariff_confirm_text(plan, location_key)
+    keyboard = tariff_confirm_kb(tariff_key(kind, level), location_key)
+    try:
+        await cb.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    except Exception:
+        await cb.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+
+
 @dp.callback_query(F.data == "check_payment_help")
 async def cb_check_payment_help(cb: CallbackQuery):
     await cb.answer(
@@ -5544,9 +6139,48 @@ async def cb_check_payment_help(cb: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data.startswith("buyat_"))
+async def cb_buy_at(cb: CallbackQuery):
+    """
+    Оплата выбранного тарифа с выбранным сервером: кнопка «💳 Оплатить» после трёх шагов.
+
+    Данные кнопки: buyat_<тариф>[_<локация>] — например buyat_time_1_warsaw.
+    """
+    payload = cb.data.removeprefix("buyat_")
+    location_key = None
+    for key in LOCATIONS:
+        suffix = f"_{key}"
+        if payload.endswith(suffix):
+            payload, location_key = payload[: -len(suffix)], key
+            break
+    tariff_key = payload
+
+    tariff = TARIFFS.get(tariff_key)
+    if not tariff:
+        await cb.answer("Тариф не найден.", show_alert=True)
+        return
+    if tariff.get("tunnels", 1) <= 1 and not location_key:
+        # Защита от старой кнопки: сервер у такого тарифа выбрать обязательно.
+        await cb.answer("Выбери сервер заново — открой «Тарифы».", show_alert=True)
+        return
+
+    await cb.answer("Готовлю оплату...")
+    try:
+        await start_checkout(cb.message.chat.id, cb.from_user.id, tariff_key, location_key)
+    except PaymentError as exc:
+        await cb.message.answer(str(exc), parse_mode="HTML")
+    except Exception as exc:
+        logger.exception("Ошибка при создании оплаты: %s", exc)
+        await cb.message.answer(
+            "❌ Не удалось создать счёт на оплату.\n"
+            "Попробуй ещё раз через минуту или напиши в поддержку /start → «Поддержка».",
+            parse_mode="HTML",
+        )
+
+
 @dp.callback_query(F.data.startswith("buy_"))
 async def cb_buy(cb: CallbackQuery):
-    """Покупка тарифа: выставляет счёт или создаёт платёж."""
+    """Покупка тарифа: выставляет счёт или создаёт платёж (без выбора сервера)."""
     tariff_key = cb.data.removeprefix("buy_")
 
     if tariff_key == "trial":
@@ -5580,9 +6214,12 @@ async def cb_buy(cb: CallbackQuery):
         await cb.answer("Тариф не найден.", show_alert=True)
         return
 
+    # Кнопки «buy_*» приходят из старых сообщений и от промо/теста: сервер не выбран —
+    # для тарифа на один туннель берём локацию по умолчанию (первую в каталоге).
+    location_key = None
     await cb.answer("Готовлю оплату...")
     try:
-        await start_checkout(cb.message.chat.id, cb.from_user.id, tariff_key)
+        await start_checkout(cb.message.chat.id, cb.from_user.id, tariff_key, location_key)
     except PaymentError as exc:
         await cb.message.answer(str(exc), parse_mode="HTML")
     except Exception as exc:
@@ -5889,11 +6526,20 @@ async def cmd_payments(message: Message):
 # =========================
 
 def test_pay_kb() -> InlineKeyboardMarkup:
-    """Кнопки выбора тарифа для проверочной выдачи."""
-    buttons = [
-        [InlineKeyboardButton(text=f"{data['name']} — {data['days']} дн.", callback_data=f"testpay_run_{key}")]
-        for key, data in TARIFFS.items() if data["price"] > 0
-    ]
+    """Кнопки выбора тарифа и сервера для проверочной выдачи."""
+    buttons = []
+    for key in paid_tariff_keys():
+        data = TARIFFS[key]
+        label = f"{data['name']} — {days_label(data['days'])}, {data['traffic']}"
+        if data.get("tunnels", 1) > 1:
+            buttons.append([InlineKeyboardButton(text=label, callback_data=f"testpay_run_{key}")])
+            continue
+        # Однотуннельный тариф: сервер выбирается, поэтому кнопка на каждую локацию.
+        for spot in configured_locations():
+            buttons.append([InlineKeyboardButton(
+                text=f"{label} ({spot['short']})",
+                callback_data=f"testpay_run_{key}_{spot['key']}",
+            )])
     buttons.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -5904,8 +6550,9 @@ def test_pay_intro() -> str:
         "Выбери тариф — бот прогонит ровно тот путь, что и после настоящей оплаты: "
         "создаст клиента в 3x-ui и пришлёт сообщение с ключом. Деньги не списываются, "
         "в выручку заказ не попадёт, счёт в платёжной системе не создаётся.\n\n"
-        "<i>Инструкция: команда /test_pay &lt;тариф&gt;, тарифы — "
-        + ", ".join(f"<code>{key}</code>" for key, data in TARIFFS.items() if data["price"] > 0)
+        "<i>Инструкция: команда /test_pay &lt;тариф&gt; [сервер], тарифы — "
+        + ", ".join(f"<code>{key}</code>" for key in paid_tariff_keys())
+        + "; серверы — " + ", ".join(f"<code>{spot['key']}</code>" for spot in configured_locations())
         + ".</i>"
     )
 
@@ -5934,14 +6581,25 @@ async def cmd_test_pay(message: Message):
     if tariff_key not in TARIFFS or TARIFFS[tariff_key]["price"] <= 0:
         await message.answer(
             f"❓ Неизвестный тариф: <code>{escape(tariff_key)}</code>\n"
-            "Доступные: " + ", ".join(f"<code>{key}</code>" for key in TARIFFS if TARIFFS[key]["price"] > 0),
+            "Доступные: " + ", ".join(f"<code>{key}</code>" for key in paid_tariff_keys()),
+            parse_mode="HTML",
+        )
+        return
+
+    # Второй аргумент — сервер: /test_pay time_1 warsaw
+    location_key = location_from_text(args[2]) if len(args) > 2 else None
+    if len(args) > 2 and location_key is None:
+        await message.answer(
+            "❓ Неизвестный сервер. Доступные: "
+            + ", ".join(f"<code>{spot['key']}</code>" for spot in configured_locations()),
             parse_mode="HTML",
         )
         return
 
     wait_msg = await message.answer("🧪 Выдаю тестовый ключ (оплата не требуется)...")
     try:
-        await simulate_successful_payment(message.chat.id, message.from_user.id, tariff_key)
+        await simulate_successful_payment(message.chat.id, message.from_user.id, tariff_key,
+                                          location_key)
     except Exception as exc:
         logger.error("Проверка выдачи без оплаты не удалась: %s", exc)
         await send_error_message(message, exc)
@@ -5970,13 +6628,19 @@ async def cb_testpay_run(cb: CallbackQuery):
     if not test_pay_enabled():
         await cb.answer("Проверка без оплаты выключена (PAYMENTS_ALLOW_TEST_PAY=1).", show_alert=True)
         return
-    tariff_key = cb.data.removeprefix("testpay_run_")
+    payload = cb.data.removeprefix("testpay_run_")
+    location_key = None
+    for key in LOCATIONS:
+        if payload.endswith(f"_{key}"):
+            payload, location_key = payload[: -len(f"_{key}")], key
+            break
+    tariff_key = payload
     if tariff_key not in TARIFFS or TARIFFS[tariff_key]["price"] <= 0:
         await cb.answer("Такого тарифа нет.", show_alert=True)
         return
     await cb.answer("Выдаю тестовый ключ...")
     try:
-        await simulate_successful_payment(cb.message.chat.id, cb.from_user.id, tariff_key)
+        await simulate_successful_payment(cb.message.chat.id, cb.from_user.id, tariff_key, location_key)
     except Exception as exc:
         logger.error("Проверка выдачи без оплаты не удалась: %s", exc)
         await cb.message.answer(f"❌ Не получилось: <code>{escape(_snip(str(exc), 300))}</code>", parse_mode="HTML")
@@ -6000,7 +6664,7 @@ async def cb_testpay_del(cb: CallbackQuery):
     try:
         async with XUIClient() as client:
             inbounds = await client.get_inbounds()
-            removed = False
+            removed = 0
             foreign = False
             for inbound in inbounds:
                 settings = as_dict(inbound.get("settings"))
@@ -6009,12 +6673,10 @@ async def cb_testpay_del(cb: CallbackQuery):
                         continue
                     if comment_has_payment_ref(candidate.get("comment"), reference):
                         await client.delete_client(inbound.get("id"), email, candidate.get("id"))
-                        removed = True
+                        removed += 1
                     else:
                         # По этому клиенту выдана не тестовая подписка — чужое не удаляем.
                         foreign = True
-                    break
-                if removed or foreign:
                     break
     except Exception as exc:
         logger.error("Не удалось удалить тестовую подписку %s: %s", order_id, exc)
@@ -6082,6 +6744,25 @@ async def cb_freekassa_check(cb: CallbackQuery):
     await cb.message.answer(text, parse_mode="HTML")
 
 
+async def delete_paid_clients(client, email: str) -> int:
+    """
+    Удаляет клиента с этим email во всех подключениях панели.
+
+    Тарифы на несколько туннелей создают клиента в каждой локации — возврат
+    или блокировка должны снимать доступ везде, а не только на первом сервере.
+    """
+    inbounds = await client.get_inbounds()
+    removed = 0
+    for inbound in inbounds:
+        settings = as_dict(inbound.get("settings"))
+        for candidate in settings.get("clients") or []:
+            if isinstance(candidate, dict) and str(candidate.get("email")) == email:
+                await client.delete_client(inbound.get("id"), email, candidate.get("id"))
+                removed += 1
+                break
+    return removed
+
+
 async def cmd_revoke(message: Message):
     """Удаляет платную подписку (для возвратов и блокировок)."""
     if not is_admin(message.from_user.id):
@@ -6097,18 +6778,8 @@ async def cmd_revoke(message: Message):
     wait_msg = await message.answer(f"⏳ Удаляю платную подписку пользователя <code>{target}</code>...")
     try:
         async with XUIClient() as client:
-            inbounds = await client.get_inbounds()
             email = f"tg-paid-{target}"
-            removed = False
-            for inbound in inbounds:
-                settings = as_dict(inbound.get("settings"))
-                for candidate in settings.get("clients") or []:
-                    if isinstance(candidate, dict) and str(candidate.get("email")) == email:
-                        await client.delete_client(inbound.get("id"), email, candidate.get("id"))
-                        removed = True
-                        break
-                if removed:
-                    break
+            removed = await delete_paid_clients(client, email)
 
         try:
             await wait_msg.delete()
@@ -6117,7 +6788,8 @@ async def cmd_revoke(message: Message):
 
         if removed:
             await message.answer(
-                f"🗑 <b>Подписка <code>{email}</code> удалена из панели.</b>\n\n"
+                f"🗑 <b>Подписка <code>{email}</code> удалена из панели "
+                f"({removed} {tunnels_word(removed)}: все локации тарифа).</b>\n\n"
                 "<i>Если это возврат по оплате — сделай возврат в личном кабинете "
                 "платёжной системы (ЮKassa) или через @BotFather для Stars.</i>",
                 parse_mode="HTML",
@@ -6160,20 +6832,24 @@ async def send_profile(message: Message, user_id: int):
     if sub_error:
         lines.append("<i>Не удалось получить данные из панели — попробуй позже.</i>")
 
-    if sub and sub["client"].get("id"):
+    entries = (sub or {}).get("entries") or []
+    if entries:
         try:
             async with XUIClient() as client:
-                inbound = sub["inbound"]
-                params = extract_vless_params(inbound)
-                link = build_vless_link(sub["client"], inbound, params)
-                sub_link = None
-                sub_id = sub["client"].get("subId")
-                if sub_id:
-                    base, _note = await get_subscription_base(client, sub_id=str(sub_id), probe=False)
-                    if base:
-                        sub_link = build_sub_link(base, str(sub_id))
-            lines += ["", access_block({"link": link, "sub_link": sub_link},
-                                       heading="🔗 <b>Твоя ссылка-подписка:</b>")]
+                for entry in entries:
+                    inbound = entry["inbound"]
+                    params = extract_vless_params(inbound)
+                    entry["link"] = build_vless_link(entry["client"], inbound, params)
+                    entry["sub_link"] = None
+                    sub_id = entry["client"].get("subId")
+                    if sub_id:
+                        base, _note = await get_subscription_base(client, sub_id=str(sub_id),
+                                                                  probe=False)
+                        if base:
+                            entry["sub_link"] = build_sub_link(base, str(sub_id))
+            info = {"link": entries[0].get("link"), "sub_link": entries[0].get("sub_link"),
+                    "entries": entries}
+            lines += ["", access_block(info, heading="🔗 <b>Твоя ссылка-подписка:</b>")]
         except Exception:
             pass
 

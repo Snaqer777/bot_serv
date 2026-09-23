@@ -18,7 +18,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aiohttp import web
-from panel import PANEL, load_bot, make_app, reset
+from panel import PANEL, client_of, clients_named, load_bot, make_app, reset
 
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
@@ -155,11 +155,22 @@ def click(bot, data, uid=ADMIN):
 
 
 def panel_client(tg_id):
-    return PANEL["clients"].get(f"tg-paid-{tg_id}")
+    """Платная подписка пользователя в первой локации (обычно Стокгольм)."""
+    return client_of(f"tg-paid-{tg_id}")
+
+
+def panel_client_in(inbound_id, tg_id):
+    """Подписка в конкретной локации (1 — Стокгольм, 2 — Варшава)."""
+    return client_of(f"tg-paid-{tg_id}", inbound_id)
+
+
+def panel_subscriptions(tg_id):
+    """Все записи подписки пользователя — по одной на локацию."""
+    return clients_named(f"tg-paid-{tg_id}")
 
 
 def trial_client(tg_id):
-    return PANEL["clients"].get(f"tg-test-{tg_id}")
+    return client_of(f"tg-test-{tg_id}")
 
 
 def days_left(client):
@@ -168,12 +179,21 @@ def days_left(client):
     return round((int(client["expiryTime"]) - int(time.time() * 1000)) / 86_400_000, 1)
 
 
-async def pay_via_freekassa(bot, uid, tariff, *, post=False):
-    """Полный путь оплаты: ссылка на оплату → уведомление FreeKassa → выдача ключа."""
+async def pay_via_freekassa(bot, uid, tariff, *, post=False, location=None):
+    """
+    Полный путь оплаты: ссылка на оплату → уведомление FreeKassa → выдача ключа.
+
+    location — выбранный сервер для тарифов с одним туннелем (как в кнопке
+    «💳 Оплатить» после трёх шагов выбора).
+    """
     cb = click(bot, "tariffs", uid=uid)
     await bot.cb_tariffs(cb)
-    cb = click(bot, f"buy_{tariff}", uid=uid)
-    await bot.cb_buy(cb)
+    if location:
+        cb = click(bot, f"buyat_{tariff}_{location}", uid=uid)
+        await bot.cb_buy_at(cb)
+    else:
+        cb = click(bot, f"buy_{tariff}", uid=uid)
+        await bot.cb_buy(cb)
     order = [o for o in bot.payment_store.orders.values() if o["tg_id"] == uid][-1]
     status, body = await fp.post_fk_notification(order["id"], order["amount_rub"],
                                                 method="post" if post else "get",
@@ -294,30 +314,64 @@ async def step_payment(bot):
     await bot.cb_tariffs(click(bot, "tariffs", uid=ADMIN))
     tariffs = last_edit(ADMIN)
     tariffs_text = tariffs.get("text", "")
-    check("в тарифах видны все 4 платных, а тестового пункта нет",
-          all(word in tariffs_text for word in ("Школьник", "Базовый", "Семейный", "Премиум"))
-          and "Тестовый период" not in tariffs_text,
-          " | ".join(w for w in ("Школьник", "Базовый", "Семейный", "Премиум") if w not in tariffs_text))
+    check("на первом экране — два типа подписки (по времени и по трафику), тестового пункта нет",
+          "По времени" in tariffs_text and "По трафику" in tariffs_text
+          and "Тестовый период" not in tariffs_text)
     check("в кнопках тарифов нет buy_trial",
           "buy_trial" not in buttons(last_edit(ADMIN)), str(buttons(last_edit(ADMIN))))
     check("есть напоминание про условия сервиса", "/terms" in tariffs_text)
     check("сказано, что оплата через FreeKassa и ключ придёт сразу",
           "FreeKassa" in tariffs_text and "после оплаты" in tariffs_text)
 
-    order_id = await pay_via_freekassa(bot, ADMIN, "basic")
+    # Шаг 2: уровни выбранного типа подписки
+    fp.TG["calls"].clear()
+    await bot.cb_tariff_kind(click(bot, "tkind_time", uid=ADMIN))
+    levels_text = last_edit(ADMIN).get("text", "")
+    check("шаг 2: показаны четыре уровня с ценами",
+          all(level in levels_text for level in ("Новичок", "Нетраннер", "Кибер-самурай", "Призрак")),
+          levels_text[:120].replace("\n", " "))
+    check("в уровнях видны трафик, срок, устройства и туннели",
+          "15 ГБ" in levels_text and "30 дней" in levels_text
+          and "устройств" in levels_text and "туннел" in levels_text)
+    check("кнопка возврата ведёт назад к типам", "tariffs" in buttons(last_edit(ADMIN)))
+
+    # Шаг 3 для многотуннельного тарифа: сервер не выбирается, сразу подтверждение
+    fp.TG["calls"].clear()
+    cb = click(bot, "tlvl_time_3", uid=ADMIN)
+    await bot.cb_tariff_level(cb)
+    confirm_text = last_edit(ADMIN).get("text", "")
+    check("шаг 3 (тариф на несколько туннелей): подтверждение без выбора сервера",
+          "Кибер-самурай" in confirm_text and "все серверы" in confirm_text
+          and not any(b.startswith("tlocs_") for b in buttons(last_edit(ADMIN))),
+          confirm_text[:120].replace("\n", " "))
+    check("в подтверждении есть цена, туннели и кнопка оплаты",
+          "Цена" in confirm_text and "Туннелей" in confirm_text
+          and f"buyat_time_3" in buttons(last_edit(ADMIN)))
+
+    order_id = await pay_via_freekassa(bot, ADMIN, "time_3")
     client = panel_client(ADMIN)
     check("после оплаты клиент создан в панели", client is not None)
     check("срок подписки 30 дней", 29 <= (days_left(client) or 0) <= 30,
           f"{days_left(client)} дн.")
+    check("тариф на несколько туннелей выдан во всех локациях сразу",
+          len(panel_subscriptions(ADMIN)) == 2
+          and panel_client_in(2, ADMIN) is not None,
+          f"записей: {len(panel_subscriptions(ADMIN))}")
+    check("клиенты в разных локациях — разные подключения панели",
+          {c["limitIp"] for c in panel_subscriptions(ADMIN)} == {5})
     key_msg = last_text(ADMIN)
-    check("доступ отправлен сообщением (ссылка-подписка)",
-          "/sub/" in key_msg and "ссылка-подписка" in key_msg,
+    check("доступ отправлен сообщением (ссылки-подписки по локациям)",
+          "/sub/" in key_msg and "ссылки-подписки" in key_msg,
           key_msg[:80].replace("\n", " "))
     check("отдельный ключ vless в сообщении не показывается", "vless://" not in key_msg)
     check("в сообщении нет внутреннего адреса панели",
           "XUI_URL" not in key_msg, key_msg[:70].replace("\n", " "))
     check("в сообщении есть тариф, срок и дата",
-          "Базовый" in key_msg and "Действует до" in key_msg)
+          "Кибер-самурай" in key_msg and "Действует до" in key_msg)
+    check("в сообщении перечислены оба сервера со своими ссылками",
+          "Стокгольм" in key_msg and "Варшава" in key_msg
+          and key_msg.count("/sub/") >= 2,
+          key_msg[:160].replace("\n", " "))
     check("кнопки после оплаты: инструкция, ключ, главное меню",
           {"help_menu", "profile", "main_menu"} <= set(buttons(last_sent(ADMIN))))
 
@@ -327,6 +381,9 @@ async def step_payment(bot):
     check("/profile показывает активную подписку", "Активна" in profile)
     check("/profile показывает срок и ссылку-подписку",
           "Действует до" in profile and "/sub/" in profile)
+    check("/profile перечисляет серверы тарифа",
+          "Серверы" in profile and "Stockholm" in profile and "Warsaw" in profile,
+          [line for line in profile.split("\n") if "Сервер" in line])
     check("в профиле остались тарифы, а кнопки теста нет",
           {"tariffs", "main_menu"} <= set(buttons(last_sent(ADMIN)))
           and "get_test_key_btn" not in buttons(last_sent(ADMIN)),
@@ -391,7 +448,7 @@ async def step_referral(bot):
           any("Тебя пригласили" in t for t in texts_to(FRIEND)))
 
     expiry_before = int(panel_client(ADMIN)["expiryTime"])
-    await pay_via_freekassa(bot, FRIEND, "basic", post=True)   # уведомление методом POST
+    await pay_via_freekassa(bot, FRIEND, "time_4", post=True)   # уведомление методом POST
     friend_client = panel_client(FRIEND)
     check("друг получил ключ через уведомление FreeKassa", friend_client is not None)
     check("другу добавили +3 дня к тарифу (33)",
@@ -441,12 +498,15 @@ async def step_admin_tools(bot):
 
     fp.TG["calls"].clear()
     await bot.cmd_inbounds(make_message(bot, ADMIN, "/inbounds"))
-    check("/inbounds показывает подключение из панели", "NL-Reality" in last_text(ADMIN))
+    inbounds_text = last_text(ADMIN)
+    check("/inbounds показывает подключения панели (обе локации)",
+          "Stockholm" in inbounds_text and "Warsaw" in inbounds_text,
+          inbounds_text[:120].replace("\n", " "))
 
     fp.TG["calls"].clear()
     revenue_before = bot.payment_store.stats()["rub"]
     expiry_before = int(panel_client(ADMIN)["expiryTime"])
-    await bot.cmd_test_pay(make_message(bot, ADMIN, "/test_pay school"))
+    await bot.cmd_test_pay(make_message(bot, ADMIN, "/test_pay time_3"))
     check("при живой подписке /test_pay отказывается её портить",
           "уже есть платная подписка" in last_text(ADMIN)
           and int(panel_client(ADMIN)["expiryTime"]) == expiry_before)
@@ -456,13 +516,13 @@ async def step_admin_tools(bot):
     check("/revoke по своему ID тоже работает", panel_client(ADMIN) is None)
 
     fp.TG["calls"].clear()
-    await bot.cmd_test_pay(make_message(bot, ADMIN, "/test_pay school"))
+    await bot.cmd_test_pay(make_message(bot, ADMIN, "/test_pay time_3"))
     # /test_pay присылает два сообщения: сначала ключ, потом отчёт с кнопкой удаления
     check("/test_pay выдаёт доступ без оплаты (админ)",
           panel_client(ADMIN) is not None
           and any("/sub/" in t for t in texts_to(ADMIN)[-3:]),
           last_text(ADMIN)[:80].replace("\n", " "))
-    check("выдан именно тариф school (30 дней)",
+    check("выдан именно тариф time_3 (30 дней, 100 ГБ)",
           29 <= (days_left(panel_client(ADMIN)) or 0) <= 30, f"{days_left(panel_client(ADMIN))} дн.")
     check("тестовая выдача не попала в выручку",
           bot.payment_store.stats()["rub"] == revenue_before)

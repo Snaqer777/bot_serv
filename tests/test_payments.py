@@ -25,6 +25,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aiohttp import web
 from panel import PANEL, load_bot, make_app, reset
 
+# --- Тарифы нового каталога -------------------------------------------------
+# В боте теперь сетка «тип подписки × уровень»: time_<уровень> (ограничение по
+# времени) и traffic_<уровень> (только трафик). В сценариях используем понятные
+# псевдонимы: цены, лимиты и сроки берём из bot.TARIFFS, чтобы тесты читались.
+BASIC = "time_4"       # 450 ₽, 30 дней, безлимитный трафик, 6 устройств
+FAMILY = "time_3"      # 250 ₽, 30 дней, 100 ГБ, 5 устройств
+SCHOOL = "time_1"      # 70 ₽, 15 дней, 15 ГБ, 1 устройство
+PREMIUM = "time_2"     # 130 ₽, 15 дней, 50 ГБ, 3 устройства
+TRAFFIC = "traffic_3"  # 300 ₽, без ограничения по времени, 100 ГБ, 5 устройств
+
+
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.types import Message, PreCheckoutQuery
@@ -312,7 +323,7 @@ def new_bot(env, store_file, admins=None):
         "PAYMENT_STORE_FILE": store_file,
         "PORT": str(WEBHOOK_PORT),
         "STARS_RUB_RATE": "1.6",
-        "STARS_BASIC": env.get("stars_basic"),
+        "STARS_TIME_4": env.get("stars_basic"),
     }
     bot = load_bot(PANEL_PORT, admins=env.get("admin_id") if "admin_id" in env else str(admins or TG_TG_ID), env=full_env)
     session = AiohttpSession()
@@ -415,17 +426,17 @@ async def test_stars_flow(store_file):
     bot = new_bot({"mode": "stars"}, store_file)
     email = f"tg-paid-{TG_TG_ID}"
 
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+    await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
     invoice = last_tg("sendInvoice")
     order_id = invoice.get("payload", "")
-    stars = bot.TARIFFS["basic"]["stars"]
+    stars = bot.TARIFFS[BASIC]["stars"]
     check("счёт выставлен в валюте XTR (звёзды)", invoice.get("currency") == "XTR")
     check("provider_token пустой/не передан — оплата звёздами без платёжного шлюза",
           not invoice.get("provider_token"))
-    check(f"цена Базового — {stars} ⭐️ ({bot.TARIFFS['basic']['price']} ₽ / 1.6)",
+    check(f"цена тарифа — {stars} ⭐️ ({bot.TARIFFS[BASIC]['price']} ₽ / 1.6)",
           invoice["prices"][0]["amount"] == stars,
           f"amount={invoice['prices'][0]['amount']}")
-    check("payload счёта = id заказа", order_id.startswith("basic-"))
+    check("payload счёта = id заказа", order_id.startswith(f"{BASIC}-"))
     check("клиента в панели ещё нет", panel_client(email) is None)
 
     await bot.on_pre_checkout(make_pre_checkout(bot, order_id, stars))
@@ -441,11 +452,11 @@ async def test_stars_flow(store_file):
     check("после оплаты клиент создан в панели", client is not None)
     check("срок подписки ~30 дней", client and 29 <= days_left(client) <= 30,
           f"{days_left(client) if client else '—'} дн.")
-    basic_ips = bot.TARIFFS["basic"]["ip_limit"]
+    basic_ips = bot.TARIFFS[BASIC]["ip_limit"]
     check(f"лимит устройств взят из тарифа ({basic_ips})", client and client.get("limitIp") == basic_ips)
-    check("трафик безлимитный (totalGB=0)", client and client.get("totalGB") == 0)
+    check("трафик безлимитный (totalGB=0) — уровень «Призрак» по времени", client and client.get("totalGB") == 0)
     check("tgId записан в панель", client and client.get("tgId") == TG_TG_ID)
-    check("в комментарии — id тарифа и дата", client and client["comment"].startswith("basic до "))
+    check("в комментарии — id тарифа и дата", client and client["comment"].startswith(f"{BASIC} до "))
     sent = [m for m in tg_calls("sendMessage") if str(m["params"].get("chat_id")) == str(TG_TG_ID)]
     key_text = sent[-1]["params"].get("text", "") if sent else ""
     check("ссылка-подписка отправлена пользователю",
@@ -458,12 +469,12 @@ async def test_stars_flow(store_file):
     check("покупателю-админу отдельное уведомление не дублируется",
           not any("Новая оплата" in m["params"].get("text", "") for m in tg_calls("sendMessage")))
 
-    await bot.start_checkout(5555, 5555, "family")
+    await bot.start_checkout(5555, 5555, FAMILY)
     order2 = last_tg("sendInvoice")["payload"]
-    check("счёт для второго пользователя создан", order2.startswith("family-5555-"))
-    await bot.on_pre_checkout(make_pre_checkout(bot, order2, bot.TARIFFS["family"]["stars"]))
+    check("счёт для второго пользователя создан", order2.startswith(f"{FAMILY}-5555-"))
+    await bot.on_pre_checkout(make_pre_checkout(bot, order2, bot.TARIFFS[FAMILY]["stars"]))
     await bot.on_successful_payment(make_message(bot, uid=5555, successful_payment={
-        "currency": "XTR", "total_amount": bot.TARIFFS["family"]["stars"], "invoice_payload": order2,
+        "currency": "XTR", "total_amount": bot.TARIFFS[FAMILY]["stars"], "invoice_payload": order2,
         "telegram_payment_charge_id": "tg-charge-u5555", "provider_payment_charge_id": "",
     }))
     check("второму пользователю выдан свой ключ", panel_client("tg-paid-5555") is not None)
@@ -480,7 +491,7 @@ async def test_stars_guards(store_file, bot, order_id):
     print("\n▶ 3. Защита от подделок и дублей (Stars)")
     email = f"tg-paid-{TG_TG_ID}"
 
-    await bot.on_pre_checkout(make_pre_checkout(bot, order_id, bot.TARIFFS["basic"]["stars"]))
+    await bot.on_pre_checkout(make_pre_checkout(bot, order_id, bot.TARIFFS[BASIC]["stars"]))
     answer = last_tg("answerPreCheckoutQuery")
     check("pre-checkout по оплаченному счёту отклонён",
           answer.get("ok") is False and "оплачен" in answer.get("error_message", ""))
@@ -489,13 +500,13 @@ async def test_stars_guards(store_file, bot, order_id):
     await bot.on_pre_checkout(make_pre_checkout(bot, "unknown-order-123", 10))
     check("pre-checkout по неизвестному счёту отклонён", last_tg("answerPreCheckoutQuery").get("ok") is False)
 
-    order = await bot.payment_store.create(bot.new_order(TG_TG_ID, "family"))
+    order = await bot.payment_store.create(bot.new_order(TG_TG_ID, FAMILY))
     await bot.on_pre_checkout(make_pre_checkout(bot, order["id"], 1))
     answer = last_tg("answerPreCheckoutQuery")
     check("подмена суммы отклонена", answer.get("ok") is False and "Сумма" in answer.get("error_message", ""))
 
     await bot.on_successful_payment(make_message(bot, successful_payment={
-        "currency": "XTR", "total_amount": bot.TARIFFS["basic"]["stars"], "invoice_payload": order_id,
+        "currency": "XTR", "total_amount": bot.TARIFFS[BASIC]["stars"], "invoice_payload": order_id,
         "telegram_payment_charge_id": "tg-charge-1", "provider_payment_charge_id": "",
     }))
     check("повторная оплата тем же платежом не создала второго клиента",
@@ -504,19 +515,19 @@ async def test_stars_guards(store_file, bot, order_id):
           f"{days_left(panel_client(email))} дн.")
 
     await bot.on_successful_payment(make_message(bot, successful_payment={
-        "currency": "XTR", "total_amount": bot.TARIFFS["basic"]["stars"], "invoice_payload": "nope-123",
+        "currency": "XTR", "total_amount": bot.TARIFFS[BASIC]["stars"], "invoice_payload": "nope-123",
         "telegram_payment_charge_id": "tg-charge-2", "provider_payment_charge_id": "",
     }))
     texts = [m["params"].get("text", "") for m in tg_calls("sendMessage")]
     check("оплата по неизвестному счёту обрабатывается без выдачи",
           len([e for e in PANEL["clients"] if e == email]) == 1 and any("не найден" in t for t in texts))
 
-    order2 = await bot.payment_store.create(bot.new_order(TG_TG_ID, "family"))
+    order2 = await bot.payment_store.create(bot.new_order(TG_TG_ID, FAMILY))
     saved_url = bot.XUI_URL
     bot.XUI_URL = "http://127.0.0.1:9"  # заведомо закрытый порт
     try:
         await bot.on_successful_payment(make_message(bot, successful_payment={
-            "currency": "XTR", "total_amount": bot.TARIFFS["family"]["stars"], "invoice_payload": order2["id"],
+            "currency": "XTR", "total_amount": bot.TARIFFS[FAMILY]["stars"], "invoice_payload": order2["id"],
             "telegram_payment_charge_id": "tg-charge-3", "provider_payment_charge_id": "",
         }))
     finally:
@@ -529,16 +540,16 @@ async def test_stars_guards(store_file, bot, order_id):
     check("пользователю сообщили о задержке выдачи", any("задержалась" in t for t in alerts))
 
     await bot.on_successful_payment(make_message(bot, successful_payment={
-        "currency": "XTR", "total_amount": bot.TARIFFS["family"]["stars"], "invoice_payload": order2["id"],
+        "currency": "XTR", "total_amount": bot.TARIFFS[FAMILY]["stars"], "invoice_payload": order2["id"],
         "telegram_payment_charge_id": "tg-charge-3", "provider_payment_charge_id": "",
     }))
     order2_final = await bot.payment_store.get(order2["id"])
     client2 = panel_client(email)
     check("повторная доставка платежа завершает выдачу (без повторного списания)",
           order2_final.get("provisioned") and client2 is not None)
-    expected_total = bot.TARIFFS["basic"]["days"] + bot.TARIFFS["family"]["days"]
-    check(f"срок продлён: {bot.TARIFFS['basic']['days']} дн. Базовый + "
-          f"{bot.TARIFFS['family']['days']} дн. Семейный ≈ {expected_total}",
+    expected_total = bot.TARIFFS[BASIC]["days"] + bot.TARIFFS[FAMILY]["days"]
+    check(f"срок продлён: {bot.TARIFFS[BASIC]['days']} дн. + "
+          f"{bot.TARIFFS[FAMILY]['days']} дн. ≈ {expected_total}",
           expected_total - 2 <= days_left(client2) <= expected_total, f"{days_left(client2)} дн.")
     check("на каждого покупателя — ровно одна запись в панели",
           sorted(PANEL["clients"]) == [f"tg-paid-{TG_TG_ID}", "tg-paid-5555"])
@@ -548,10 +559,10 @@ async def test_provider_flow(store_file):
     print("\n▶ 4. Оплата картой через платёжный токен BotFather (provider)")
     reset_all()
     bot = new_bot({"mode": "provider", "provider_token": "381764678:TEST:98765"}, store_file)
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "family")
+    await bot.start_checkout(TG_TG_ID, TG_TG_ID, FAMILY)
     invoice = last_tg("sendInvoice")
     order_id = invoice.get("payload", "")
-    family = bot.TARIFFS["family"]
+    family = bot.TARIFFS[FAMILY]
     family_total = family["price"] * 100
     check("валюта счёта — RUB", invoice.get("currency") == "RUB")
     check("provider_token подставлен из PAYMENT_PROVIDER_TOKEN",
@@ -583,7 +594,7 @@ async def test_provider_receipt_and_test_mode(store_file):
     test_token = "381764678:TEST:100037"
 
     bot = new_bot({"mode": "provider", "provider_token": "x:LIVE:12345"}, store_file)
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+    await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
     invoice = last_tg("sendInvoice")
     check("по умолчанию provider_data не передаётся (фискализация не подключена)",
           not invoice.get("provider_data"))
@@ -595,7 +606,7 @@ async def test_provider_receipt_and_test_mode(store_file):
     reset_all()
     bot = new_bot({"mode": "provider", "provider_token": test_token}, store_file)
     check("токен с :TEST: распознан как тестовый", bot.PROVIDER_TEST_MODE is True)
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+    await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
     texts = [m["params"].get("text", "") for m in tg_calls("sendMessage")]
     check("перед счётом отправлена подсказка с тестовой картой",
           any("5555 5555 5555 4477" in t and "Тестовый" in t for t in texts))
@@ -604,7 +615,7 @@ async def test_provider_receipt_and_test_mode(store_file):
     check("счёт всё равно выставлен тестовым токеном", invoice.get("provider_token") == test_token)
     order_id = invoice["payload"]
 
-    basic_total = bot.TARIFFS["basic"]["price"] * 100
+    basic_total = bot.TARIFFS[BASIC]["price"] * 100
     await bot.on_pre_checkout(make_pre_checkout(bot, order_id, basic_total, currency="RUB"))
     await bot.on_successful_payment(make_message(bot, successful_payment={
         "currency": "RUB", "total_amount": basic_total, "invoice_payload": order_id,
@@ -614,8 +625,8 @@ async def test_provider_receipt_and_test_mode(store_file):
 
     reset_all()
     bot = new_bot({"mode": "provider", "provider_token": "x:LIVE:12345", "send_receipt": "1"}, store_file)
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "family")
-    family = bot.TARIFFS["family"]
+    await bot.start_checkout(TG_TG_ID, TG_TG_ID, FAMILY)
+    family = bot.TARIFFS[FAMILY]
     invoice = last_tg("sendInvoice")
     raw_receipt = invoice["provider_data"]
     receipt = (raw_receipt if isinstance(raw_receipt, dict) else json.loads(raw_receipt))["receipt"]
@@ -646,10 +657,10 @@ async def test_yookassa_flow(store_file):
     bot = new_bot({"mode": "yookassa", "shop_id": SHOP_ID, "secret_key": SECRET_KEY}, store_file)
     runner = await bot.run_webhook_server()
     email = f"tg-paid-{TG_TG_ID}"
-    basic = bot.TARIFFS["basic"]
+    basic = bot.TARIFFS[BASIC]
 
     try:
-        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         _, auth, idem, body = [c for c in YK["calls"] if c[0] == "POST /payments"][-1]
         check("в ЮKassa ушёл POST /v3/payments с Basic auth магазина",
               auth == "Basic " + base64.b64encode(f"{SHOP_ID}:{SECRET_KEY}".encode()).decode())
@@ -657,7 +668,7 @@ async def test_yookassa_flow(store_file):
               body["amount"] == {"value": f"{basic['price']}.00", "currency": "RUB"})
         check("передан чек по 54-ФЗ (vat_code=1)",
               body.get("receipt", {}).get("items", [{}])[0].get("vat_code") == 1)
-        check("Idempotence-Key = id заказа", idem.startswith("basic-") and idem in bot.payment_store.orders)
+        check("Idempotence-Key = id заказа", idem.startswith(f"{BASIC}-") and idem in bot.payment_store.orders)
         check("metadata.telegram_id передана в платёж", body["metadata"]["tg_id"] == str(TG_TG_ID))
         check("указан return_url — адрес сервиса", body["confirmation"]["return_url"].startswith("http"))
 
@@ -694,7 +705,7 @@ async def test_yookassa_flow(store_file):
               "уже подтверждена" in json.dumps(cb.answers, ensure_ascii=False))
 
         expiry_before = int(panel_client(email)["expiryTime"])
-        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "family")
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, FAMILY)
         order2_id = [c for c in YK["calls"] if c[0] == "POST /payments"][-1][2]
         pid2 = YK["by_idem"][order2_id]
         yk_succeed(pid2, amount={"value": "1.00", "currency": "RUB"})
@@ -728,19 +739,19 @@ async def test_receipt_optional(store_file):
     print("\n▶ 5а. Чек 54-ФЗ в ЮKassa передаётся только когда включён")
     reset_all()
     bot = new_bot({"mode": "yookassa", "shop_id": SHOP_ID, "secret_key": SECRET_KEY, "vat": "1"}, store_file)
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+    await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
     body_with = [c for c in YK["calls"] if c[0] == "POST /payments"][-1][3]
     check("с YOOKASSA_VAT_CODE=1 чек уходит в платёж", "receipt" in body_with)
     check("в чеке указан vat_code и сумма", body_with["receipt"]["items"][0]["vat_code"] == 1
-          and body_with["receipt"]["items"][0]["amount"]["value"] == f"{bot.TARIFFS['basic']['price']}.00")
+          and body_with["receipt"]["items"][0]["amount"]["value"] == f"{bot.TARIFFS[BASIC]['price']}.00")
 
     reset_all()
     bot = new_bot({"mode": "yookassa", "shop_id": SHOP_ID, "secret_key": SECRET_KEY, "vat": "0"}, store_file)
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+    await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
     body_without = [c for c in YK["calls"] if c[0] == "POST /payments"][-1][3]
     check("без фискализации (vat=0) чек не передаётся — платёж не сломается", "receipt" not in body_without)
     check("платёж всё равно создан корректно",
-          body_without["amount"]["value"] == f"{bot.TARIFFS['basic']['price']}.00")
+          body_without["amount"]["value"] == f"{bot.TARIFFS[BASIC]['price']}.00")
 
 
 async def test_yookassa_oauth_webhook(store_file):
@@ -786,8 +797,8 @@ async def test_freekassa_signatures():
     check("режим FreeKassa и магазин из переменных",
           bot.PAYMENTS_MODE == "freekassa" and bot.freekassa_configured() is True)
 
-    order = bot.new_order(TG_TG_ID, "basic")
-    price = bot.TARIFFS["basic"]["price"]
+    order = bot.new_order(TG_TG_ID, BASIC)
+    price = bot.TARIFFS[BASIC]["price"]
     link = bot.freekassa_payment_url(order)
     params = fk_link_params(link)
     check("ссылка ведёт на платёжную страницу FreeKassa", link.startswith(bot.FREEKASSA_PAY_URL + "/?"))
@@ -802,16 +813,17 @@ async def test_freekassa_signatures():
 
     reset_all()
     bot_plain = new_bot({"mode": "freekassa", "sign_variant": "plain"}, store_file)
-    order_plain = bot_plain.new_order(TG_TG_ID, "basic")
+    order_plain = bot_plain.new_order(TG_TG_ID, BASIC)
     plain_params = fk_link_params(bot_plain.freekassa_payment_url(order_plain))
     check("старая формула (без валюты) тоже поддерживается",
           plain_params.get("s") == fk_sign_form(order_plain["id"], str(price), variant="plain"))
 
-    probe = {"MERCHANT_ID": FK_MERCHANT_ID, "AMOUNT": "249", "MERCHANT_ORDER_ID": "basic-1-2-ab12cd"}
+    probe_order = f"{BASIC}-1-2-ab12cd"
+    probe = {"MERCHANT_ID": FK_MERCHANT_ID, "AMOUNT": str(price), "MERCHANT_ORDER_ID": probe_order}
     check("подпись уведомления = md5(магазин:сумма:секрет2:заказ)",
-          bot.freekassa_sign_notify(probe) == fk_sign_notify("basic-1-2-ab12cd", 249))
+          bot.freekassa_sign_notify(probe) == fk_sign_notify(probe_order, price))
     check("подпись уведомления не совпадает с чужой подписью",
-          bot.freekassa_sign_notify(probe) != fk_sign_notify("basic-1-2-ab12cd", 249, secret="чужой"))
+          bot.freekassa_sign_notify(probe) != fk_sign_notify(probe_order, price, secret="чужой"))
     check("подписи ссылки и уведомления считаются разными словами",
           bot.freekassa_sign_form(order) != bot.freekassa_sign_notify(
               {"MERCHANT_ID": FK_MERCHANT_ID, "AMOUNT": str(price), "MERCHANT_ORDER_ID": order["id"]}))
@@ -820,7 +832,7 @@ async def test_freekassa_signatures():
     check("дробная сумма передаётся без хвостовых нулей",
           bot.freekassa_amount({"amount_rub": 150.50}) == "150.5")
     check("сумма из уведомления сверяется в копейках",
-          bot.freekassa_amount_matches(order, "249.00") is True)
+          bot.freekassa_amount_matches(order, f"{price}.00") is True)
     check("другая сумма не проходит", bot.freekassa_amount_matches(order, "1") is False)
     check("мусор вместо суммы не проходит", bot.freekassa_amount_matches(order, "abc") is False)
 
@@ -833,8 +845,8 @@ async def test_freekassa_flow(store_file):
     email = f"tg-paid-{TG_TG_ID}"
 
     try:
-        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
-        basic_price = bot.TARIFFS["basic"]["price"]
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
+        basic_price = bot.TARIFFS[BASIC]["price"]
         message = [m for m in tg_calls("sendMessage") if "Оплата тарифа" in m["params"].get("text", "")][-1]["params"]
         markup = json.dumps(message["reply_markup"], ensure_ascii=False)
         check("кнопка «Оплатить» ведёт на страницу FreeKassa", "pay.freekassa.ru" in markup)
@@ -886,26 +898,26 @@ async def test_freekassa_flow(store_file):
 
         # Вторая оплата — методом POST (в кабинете FK переключается одной галочкой)
         expiry_first = int(panel_client(email)["expiryTime"])
-        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "family")
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, FAMILY)
         order2 = [o for o in bot.payment_store.orders.values()][-1]
         status, body = await post_fk_notification(
-            order2["id"], bot.TARIFFS["family"]["price"], method="post", intid="555222")
+            order2["id"], bot.TARIFFS[FAMILY]["price"], method="post", intid="555222")
         check("уведомление методом POST обрабатывается так же", body.strip() == "YES")
-        family_days = bot.TARIFFS["family"]["days"]
+        family_days = bot.TARIFFS[FAMILY]["days"]
         added = round((int(panel_client(email)["expiryTime"]) - expiry_first) / 86_400_000, 1)
         check(f"вторая оплата продлила подписку на {family_days} дней", added == family_days, f"+{added} дн.")
 
         # Подмена суммы и чужой магазин
-        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "premium")
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, PREMIUM)
         order3 = [o for o in bot.payment_store.orders.values()][-1]
         expiry_before = int(panel_client(email)["expiryTime"])
         status, body = await post_fk_notification(order3["id"], 1)
         check("подмена суммы → ключ не выдан и «no»",
               body.strip() == "no" and int(panel_client(email)["expiryTime"]) == expiry_before)
-        status, body = await post_fk_notification(order3["id"], bot.TARIFFS["premium"]["price"],
+        status, body = await post_fk_notification(order3["id"], bot.TARIFFS[PREMIUM]["price"],
                                                  merchant="999999")
         check("уведомление другого магазина отклонено", body.strip() == "no")
-        status, body = await post_fk_notification(order3["id"], bot.TARIFFS["premium"]["price"],
+        status, body = await post_fk_notification(order3["id"], bot.TARIFFS[PREMIUM]["price"],
                                                  secret="чужое_секретное_слово")
         check("подпись чужим секретным словом отклонена", body.strip() == "no")
         check("подписка после подделок не изменилась",
@@ -921,10 +933,10 @@ async def test_freekassa_flow(store_file):
               int(panel_client(email)["expiryTime"]) == expiry_before)
 
         # Оплата третьего заказа всё же проходит и продлевает подписку
-        status, body = await post_fk_notification(order3["id"], bot.TARIFFS["premium"]["price"],
+        status, body = await post_fk_notification(order3["id"], bot.TARIFFS[PREMIUM]["price"],
                                                  intid="555333")
         check("оплата третьего заказа подтверждена", body.strip() == "YES")
-        premium_days = bot.TARIFFS["premium"]["days"]
+        premium_days = bot.TARIFFS[PREMIUM]["days"]
         added = round((int(panel_client(email)["expiryTime"]) - expiry_before) / 86_400_000, 1)
         check(f"третья оплата продлила подписку на {premium_days} дней", added == premium_days, f"+{added} дн.")
     finally:
@@ -945,10 +957,10 @@ async def test_freekassa_ip_check_and_errors(store_file):
         check("белый список IP FreeKassa задан",
               "168.119.157.136" in bot.FREEKASSA_ALLOWED_IPS and "136.243.38.147" in bot.FREEKASSA_ALLOWED_IPS)
 
-        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         order = [o for o in bot.payment_store.orders.values()][-1]
         status, body = await post_fk_notification(
-            order["id"], bot.TARIFFS["basic"]["price"], headers={"X-Real-IP": "8.8.8.8"})
+            order["id"], bot.TARIFFS[BASIC]["price"], headers={"X-Real-IP": "8.8.8.8"})
         check("без проверки IP уведомление принимается с любого адреса", body.strip() == "YES")
         check("ключ выдан", panel_client(email) is not None)
     finally:
@@ -962,14 +974,14 @@ async def test_freekassa_ip_check_and_errors(store_file):
     runner2 = await bot2.run_webhook_server()
     try:
         check("проверка IP включается переменной", bot2.FREEKASSA_CHECK_IP is True)
-        await bot2.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        await bot2.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         order2 = [o for o in bot2.payment_store.orders.values()][-1]
         status, body = await post_fk_notification(
-            order2["id"], bot2.TARIFFS["basic"]["price"], headers={"X-Real-IP": "8.8.8.8"})
+            order2["id"], bot2.TARIFFS[BASIC]["price"], headers={"X-Real-IP": "8.8.8.8"})
         check("уведомление с чужого IP отклонено (403)", status == 403 and body.startswith("no"), body[:30])
         check("с чужого IP ключ не выдан", panel_client(email) is None)
         status, body = await post_fk_notification(
-            order2["id"], bot2.TARIFFS["basic"]["price"],
+            order2["id"], bot2.TARIFFS[BASIC]["price"],
             headers={"X-Forwarded-For": f"{FK_ALLOWED_IP}, 172.16.0.1"}, intid="556677")
         check("уведомление с разрешённого IP принято (берём X-Forwarded-For)",
               body.strip() == "YES", body[:30])
@@ -981,7 +993,7 @@ async def test_freekassa_ip_check_and_errors(store_file):
     reset_all()
     bot3 = new_bot({"mode": "freekassa", "merchant": None, "secret1": None, "secret2": None}, store_file)
     try:
-        await bot3.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        await bot3.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         check("без ключей магазина ссылка не выдаётся", False)
     except bot3.PaymentError as exc:
         text = str(exc)
@@ -1008,7 +1020,7 @@ async def test_freekassa_test_mode_and_diagnostics(store_file):
 
     runner = await bot.run_webhook_server()
     try:
-        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         text = [m["params"].get("text", "") for m in tg_calls("sendMessage")][-1]
         check("в счёте есть пометка тестового режима", "Тестовый режим FreeKassa" in text, text[-90:])
 
@@ -1058,13 +1070,13 @@ async def test_duplicate_guard(store_file):
     runner = await bot.run_webhook_server()
     email = f"tg-paid-{TG_TG_ID}"
     try:
-        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         order = [o for o in bot.payment_store.orders.values()][-1]
         await post_fk_notification(order["id"], order["amount_rub"], intid="123456")
         check("первая оплата выдала ключ", panel_client(email) is not None)
 
         expiry_after_first = int(panel_client(email)["expiryTime"])
-        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "family")
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, FAMILY)
         order2 = [o for o in bot.payment_store.orders.values()][-1]
 
         cb = _FakeCallback(bot, f"checkpay_{order2['id']}")
@@ -1074,7 +1086,7 @@ async def test_duplicate_guard(store_file):
 
         await post_fk_notification(order2["id"], order2["amount_rub"], intid="123457")
         extended = int(panel_client(email)["expiryTime"])
-        family_days = bot.TARIFFS["family"]["days"]
+        family_days = bot.TARIFFS[FAMILY]["days"]
         check(f"уведомление продлевает подписку на {family_days} дней",
               round((extended - expiry_after_first) / 86_400_000, 1) == family_days,
               f"прибавка {round((extended - expiry_after_first) / 86_400_000, 1)} дн.")
@@ -1088,14 +1100,14 @@ async def test_freekassa_stats_and_labels(store_file):
     print("\n▶ 8г. FreeKassa: подписи тарифов и журнал заказов")
     reset_all()
     bot = new_bot({"mode": "freekassa"}, store_file)
-    premium_price = bot.TARIFFS["premium"]["price"]
+    premium_price = bot.TARIFFS[PREMIUM]["price"]
     check("цена тарифа показывается в рублях",
-          bot.tariff_price_label(bot.TARIFFS["premium"]) == f"{premium_price} ₽",
-          bot.tariff_price_label(bot.TARIFFS["premium"]))
+          bot.tariff_price_label(bot.TARIFFS[PREMIUM]) == f"{premium_price} ₽",
+          bot.tariff_price_label(bot.TARIFFS[PREMIUM]))
     check("бесплатный тариф остаётся бесплатным",
           bot.tariff_price_label(bot.TARIFFS["trial"]) == "Бесплатно")
 
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "premium")
+    await bot.start_checkout(TG_TG_ID, TG_TG_ID, PREMIUM)
     order = [o for o in bot.payment_store.orders.values()][-1]
     check("заказ сохранён на диск", os.path.exists(store_file))
     check("в заказе рублёвая валюта, режим freekassa и ссылка на оплату",
@@ -1111,7 +1123,7 @@ async def test_freekassa_stats_and_labels(store_file):
     stats = bot.payment_store.stats()
     check("оплаченный заказ попадает в рублёвую выручку",
           answer == "YES" and stats["rub"] == premium_price and stats["paid_count"] == 1, str(stats))
-    check("в разбивке по тарифам учтён premium", stats["by_tariff"].get("premium") == 1, str(stats["by_tariff"]))
+    check(f"в разбивке по тарифам учтён {PREMIUM}", stats["by_tariff"].get(PREMIUM) == 1, str(stats["by_tariff"]))
 
 
 # ---------------- сценарии: общие (продолжение) ----------------
@@ -1123,7 +1135,7 @@ async def test_yookassa_button_and_revoke(store_file):
     runner = await bot.run_webhook_server()
     email = f"tg-paid-{TG_TG_ID}"
     try:
-        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         order_id = [c for c in YK["calls"] if c[0] == "POST /payments"][-1][2]
         payment_id = YK["by_idem"][order_id]
 
@@ -1141,7 +1153,7 @@ async def test_yookassa_button_and_revoke(store_file):
         await bot.cb_check_payment(cb)
         check("чужой заказ не отдаётся по кнопке", any("не найден" in t for t in cb.answers))
 
-        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "premium")
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, PREMIUM)
         order3 = [c for c in YK["calls"] if c[0] == "POST /payments"][-1][2]
         YK["status_override"] = ("canceled", False)
         cb = _FakeCallback(bot, f"checkpay_{order3}")
@@ -1178,10 +1190,10 @@ async def test_persistence_and_off(store_file):
     print("\n▶ 10. Журнал заказов на диске, режим off и тариф trial")
     reset_all()
     bot = new_bot({"mode": "stars"}, store_file)
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+    await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
     order_id = last_tg("sendInvoice")["payload"]
     await bot.on_successful_payment(make_message(bot, successful_payment={
-        "currency": "XTR", "total_amount": bot.TARIFFS["basic"]["stars"], "invoice_payload": order_id,
+        "currency": "XTR", "total_amount": bot.TARIFFS[BASIC]["stars"], "invoice_payload": order_id,
         "telegram_payment_charge_id": "tg-charge-persist", "provider_payment_charge_id": "",
     }))
     check("журнал сохранён на диск", os.path.exists(store_file))
@@ -1190,12 +1202,12 @@ async def test_persistence_and_off(store_file):
     bot2 = new_bot({"mode": "stars"}, store_file)
     stats = bot2.payment_store.stats()
     check("после перезапуска журнал не потерялся",
-          stats["paid_count"] == 1 and stats["stars"] == bot2.TARIFFS["basic"]["stars"], f"{stats}")
+          stats["paid_count"] == 1 and stats["stars"] == bot2.TARIFFS[BASIC]["stars"], f"{stats}")
     order = await bot2.payment_store.get(order_id)
     check("заказ помечен как выданный (provisioned)", bool(order.get("provisioned")))
 
     await bot2.on_successful_payment(make_message(bot2, successful_payment={
-        "currency": "XTR", "total_amount": bot2.TARIFFS["basic"]["stars"], "invoice_payload": order_id,
+        "currency": "XTR", "total_amount": bot2.TARIFFS[BASIC]["stars"], "invoice_payload": order_id,
         "telegram_payment_charge_id": "tg-charge-persist", "provider_payment_charge_id": "",
     }))
     check("после перезапуска дубль платежа не продлевает подписку",
@@ -1205,7 +1217,7 @@ async def test_persistence_and_off(store_file):
 
     bot3 = new_bot({"mode": "stars"}, store_file + ".lost")
     await bot3.on_successful_payment(make_message(bot3, successful_payment={
-        "currency": "XTR", "total_amount": bot3.TARIFFS["basic"]["stars"], "invoice_payload": order_id,
+        "currency": "XTR", "total_amount": bot3.TARIFFS[BASIC]["stars"], "invoice_payload": order_id,
         "telegram_payment_charge_id": "tg-charge-persist", "provider_payment_charge_id": "",
     }))
     check("при потерянном журнале платёж не выдаётся повторно (защита по панели)",
@@ -1214,7 +1226,7 @@ async def test_persistence_and_off(store_file):
 
     bot4 = new_bot({"mode": "off"}, store_file)
     try:
-        await bot4.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        await bot4.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         check("в режиме off счёт не выставляется", False)
     except bot4.PaymentError as exc:
         check("в режиме off понятная ошибка с подсказкой", "PAYMENTS_MODE" in str(exc))
@@ -1226,19 +1238,19 @@ async def test_persistence_and_off(store_file):
         check("trial ведёт на бесплатный тестовый доступ", True)
 
     bot_stars = new_bot({"mode": "stars"}, store_file)
-    stars_label = bot_stars.tariff_price_label(bot_stars.TARIFFS["premium"])
+    stars_label = bot_stars.tariff_price_label(bot_stars.TARIFFS[PREMIUM])
     check("в Stars цена показывается в звёздах", "⭐" in stars_label, stars_label)
     check("STARS_<ТАРИФ> считается из рублей по курсу",
-          bot_stars.TARIFFS["basic"]["stars"] == round(bot_stars.TARIFFS["basic"]["price"] / 1.6))
+          bot_stars.TARIFFS[BASIC]["stars"] == round(bot_stars.TARIFFS[BASIC]["price"] / 1.6))
 
     bot_rub = new_bot({"mode": "yookassa", "shop_id": SHOP_ID, "secret_key": SECRET_KEY}, store_file)
-    rub_label = bot_rub.tariff_price_label(bot_rub.TARIFFS["premium"])
+    rub_label = bot_rub.tariff_price_label(bot_rub.TARIFFS[PREMIUM])
     check("в ЮKassa цена показывается в рублях", rub_label.endswith("₽"), rub_label)
 
     bot_override = new_bot({"mode": "stars", "stars_basic": "50"}, store_file)
-    check("переменная STARS_BASIC=50 даёт ровно 50 звёзд", bot_override.TARIFFS["basic"]["stars"] == 50)
+    check("переменная STARS_TIME_4=50 даёт ровно 50 звёзд", bot_override.TARIFFS[BASIC]["stars"] == 50)
     check("при переопределении остальные тарифы пересчитываются",
-          bot_override.TARIFFS["family"]["stars"] == round(bot_override.TARIFFS["family"]["price"] / 1.6))
+          bot_override.TARIFFS[FAMILY]["stars"] == round(bot_override.TARIFFS[FAMILY]["price"] / 1.6))
 
 
 async def test_diagnostics(store_file):
@@ -1246,7 +1258,7 @@ async def test_diagnostics(store_file):
     reset_all()
     bot = new_bot({"mode": "provider", "provider_token": None}, store_file)
     try:
-        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         check("без provider token счёт не выставляется", False)
     except bot.PaymentError as exc:
         check("подсказка про PAYMENT_PROVIDER_TOKEN", "PAYMENT_PROVIDER_TOKEN" in str(exc))
@@ -1254,7 +1266,7 @@ async def test_diagnostics(store_file):
     reset_all()
     bot2 = new_bot({"mode": "yookassa", "shop_id": SHOP_ID, "secret_key": "wrong_key"}, store_file)
     try:
-        await bot2.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        await bot2.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         check("ошибка авторизации ЮKassa обрабатывается", False)
     except bot2.PaymentError as exc:
         text = str(exc)
@@ -1265,18 +1277,18 @@ async def test_diagnostics(store_file):
     bot4 = new_bot({"mode": "yookassa", "shop_id": SHOP_ID, "secret_key": SECRET_KEY,
                     "api_url": "http://127.0.0.1:9/v3"}, store_file)
     try:
-        await bot4.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        await bot4.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         check("недоступность ЮKassa обрабатывается", False)
     except bot4.PaymentError as exc:
         check("недоступность ЮKassa → понятная ошибка", "недоступна" in str(exc))
 
     reset_all()
     bot5 = new_bot({"mode": "stars"}, store_file)
-    await bot5.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+    await bot5.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
     order_id = last_tg("sendInvoice")["payload"]
     TG["fail_send"] = {"sendMessage"}
     await bot5.on_successful_payment(make_message(bot5, successful_payment={
-        "currency": "XTR", "total_amount": bot5.TARIFFS["basic"]["stars"], "invoice_payload": order_id,
+        "currency": "XTR", "total_amount": bot5.TARIFFS[BASIC]["stars"], "invoice_payload": order_id,
         "telegram_payment_charge_id": "tg-charge-fail", "provider_payment_charge_id": "",
     }))
     TG["fail_send"].clear()
@@ -1288,7 +1300,7 @@ async def test_diagnostics(store_file):
     expiry_before = int(panel_client(f"tg-paid-{TG_TG_ID}")["expiryTime"])
     TG["calls"].clear()
     await bot5.on_successful_payment(make_message(bot5, successful_payment={
-        "currency": "XTR", "total_amount": bot5.TARIFFS["basic"]["stars"], "invoice_payload": order_id,
+        "currency": "XTR", "total_amount": bot5.TARIFFS[BASIC]["stars"], "invoice_payload": order_id,
         "telegram_payment_charge_id": "tg-charge-fail", "provider_payment_charge_id": "",
     }))
     check("повторная доставка досылает недоставленную подписку",
@@ -1307,7 +1319,7 @@ async def test_simulated_payment(store_file):
     # По умолчанию (боевой режим) проверка выключена
     bot = new_bot({"mode": "freekassa", "allow_test_pay": None}, store_file)
     check("в боевом режиме проверка без оплаты по умолчанию выключена", bot.test_pay_enabled() is False)
-    msg = make_message(bot, text="/test_pay basic")
+    msg = make_message(bot, text=f"/test_pay {BASIC}")
     await bot.cmd_test_pay(msg)
     check("выключенная проверка подсказывает переменную",
           "PAYMENTS_ALLOW_TEST_PAY=1" in _last_api_text() and panel_client(email) is None)
@@ -1325,18 +1337,18 @@ async def test_simulated_payment(store_file):
     msg = make_message(bot, text="/test_pay")
     await bot.cmd_test_pay(msg)
     markup = json.dumps(tg_calls("sendMessage")[-1]["params"].get("reply_markup", {}), ensure_ascii=False)
-    check("без аргумента показаны тарифы кнопками", "testpay_run_basic" in markup and "testpay_run_premium" in markup)
+    check("без аргумента показаны тарифы кнопками", f"testpay_run_{BASIC}" in markup and f"testpay_run_{PREMIUM}" in markup)
 
-    msg = make_message(bot, text="/test_pay basic")
+    msg = make_message(bot, text=f"/test_pay {BASIC}")
     await bot.cmd_test_pay(msg)
     client = panel_client(email)
     check("ключ выдан без оплаты (клиент создан в панели)", client is not None)
     check("срок взят из тарифа: 30 дней", client and 29 <= days_left(client) <= 30,
           f"{days_left(client) if client else '—'} дн.")
-    basic_ips = bot.TARIFFS["basic"]["ip_limit"]
-    check(f"лимиты взяты из тарифа ({basic_ips} устройства, безлимитный трафик)",
+    basic_ips = bot.TARIFFS[BASIC]["ip_limit"]
+    check(f"лимиты взяты из тарифа ({basic_ips} устройств, безлимитный трафик)",
           client and client.get("limitIp") == basic_ips and client.get("totalGB") == 0)
-    check("в панели сохранился id тарифа и дата", client and client["comment"].startswith("basic до "))
+    check("в панели сохранился id тарифа и дата", client and client["comment"].startswith(f"{BASIC} до "))
 
     texts = [m["params"].get("text", "") for m in tg_calls("sendMessage")]
     key_text = [t for t in texts if "🧪" in t and "/sub/" in t]
@@ -1358,7 +1370,7 @@ async def test_simulated_payment(store_file):
           not [o for o in bot.payment_store.orders.values() if o.get("payment_url")])
 
     # Кнопка выбора тарифа: пока тестовый ключ на месте — проверка отказывается его портить
-    cb = _FakeCallback(bot, "testpay_run_family")
+    cb = _FakeCallback(bot, f"testpay_run_{FAMILY}")
     await bot.cb_testpay_run(cb)
     check("повторная проверка при живом ключе отклоняется с понятным текстом",
           any("уже есть платная подписка" in t for t in cb.message.sent))
@@ -1375,9 +1387,9 @@ async def test_simulated_payment(store_file):
           "удалена из панели" in json.dumps(cb.message.sent, ensure_ascii=False))
 
     # После удаления кнопкой можно проверить другой тариф
-    cb = _FakeCallback(bot, "testpay_run_family")
+    cb = _FakeCallback(bot, f"testpay_run_{FAMILY}")
     await bot.cb_testpay_run(cb)
-    family_days = bot.TARIFFS["family"]["days"]
+    family_days = bot.TARIFFS[FAMILY]["days"]
     check(f"после удаления проверка другого тарифа выдаёт ключ на {family_days} дней",
           family_days - 1 <= days_left(panel_client(email)) <= family_days,
           f"{days_left(panel_client(email))} дн.")
@@ -1385,17 +1397,17 @@ async def test_simulated_payment(store_file):
     # Защита: обычный пользователь не может ни выдать, ни удалить
     reset_all()
     bot = new_bot({"mode": "freekassa", "allow_test_pay": "1"}, store_file)
-    other = make_message(bot, uid=777, text="/test_pay basic")
+    other = make_message(bot, uid=777, text=f"/test_pay {BASIC}")
     await bot.cmd_test_pay(other)
     check("обычному пользователю /test_pay недоступна",
           "только администратору" in _last_api_text() and panel_client(f"tg-paid-777") is None)
 
-    cb = _FakeCallback(bot, "testpay_run_basic", uid=777)
+    cb = _FakeCallback(bot, f"testpay_run_{BASIC}", uid=777)
     await bot.cb_testpay_run(cb)
     check("обычному пользователю кнопка выдачи недоступна",
           cb.answers and "Только для администратора" in cb.answers[0])
 
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+    await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
     order_real = [o for o in bot.payment_store.orders.values()][-1]["id"]
     cb = _FakeCallback(bot, f"testpay_del_{order_real}")
     await bot.cb_testpay_del(cb)
@@ -1405,7 +1417,7 @@ async def test_simulated_payment(store_file):
     # Настоящую подписку проверочная выдача не трогает
     reset_all()
     bot = new_bot({"mode": "freekassa", "allow_test_pay": "1"}, store_file)
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+    await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
     real_order = [o for o in bot.payment_store.orders.values()][-1]
     answer, _ = await bot.process_freekassa_notification(
         fk_params(real_order["id"], real_order["amount_rub"], intid="909090"))
@@ -1414,7 +1426,7 @@ async def test_simulated_payment(store_file):
     real_expiry = int(panel_client(email)["expiryTime"])
 
     simulated_before = len([o for o in bot.payment_store.orders.values() if o.get("simulated")])
-    msg = make_message(bot, text="/test_pay family")
+    msg = make_message(bot, text=f"/test_pay {FAMILY}")
     await bot.cmd_test_pay(msg)
     check("при живой подписке проверка отказывается её портить",
           "уже есть платная подписка" in _last_api_text(), "")
@@ -1426,7 +1438,7 @@ async def test_simulated_payment(store_file):
     # После снятия подписки проверка снова доступна
     rvk = make_message(bot, text=f"/revoke {TG_TG_ID}")
     await bot.cmd_revoke(rvk)
-    msg = make_message(bot, text="/test_pay premium")
+    msg = make_message(bot, text=f"/test_pay {PREMIUM}")
     await bot.cmd_test_pay(msg)
     check("после /revoke проверочная выдача снова работает", panel_client(email) is not None)
 
@@ -1465,7 +1477,7 @@ async def test_admin_access(store_file):
     # Второй админ из списка может работать с командой
     reset_all()
     bot = new_bot({"mode": "freekassa", "allow_test_pay": "1", "admin_id": f"{TG_TG_ID},777"}, store_file)
-    msg = make_message(bot, uid=777, text="/test_pay basic")
+    msg = make_message(bot, uid=777, text=f"/test_pay {BASIC}")
     await bot.cmd_test_pay(msg)
     check("второй админ из списка получил ключ через /test_pay", panel_client("tg-paid-777") is not None)
 
@@ -1701,9 +1713,9 @@ async def test_subscription_link(store_file):
 
     try:
         # 1. Обычный случай: сервис подписок на порту панели, ссылка проверена
-        await bot.start_checkout(tg_id, tg_id, "basic")
+        await bot.start_checkout(tg_id, tg_id, BASIC)
         order = [o for o in bot.payment_store.orders.values()][-1]
-        status, body = await post_fk_notification(order["id"], bot.TARIFFS["basic"]["price"])
+        status, body = await post_fk_notification(order["id"], bot.TARIFFS[BASIC]["price"])
         client = panel_client(f"tg-paid-{tg_id}")
         check("оплата прошла, клиент создан", body == "YES" and client is not None, body)
 
@@ -1724,10 +1736,10 @@ async def test_subscription_link(store_file):
 
         # 2. Адрес проверяется один раз и кэшируется (не дёргаем панель на каждой выдаче)
         PANEL["calls"].clear()
-        await bot.start_checkout(tg_id + 1, tg_id + 1, "basic")
+        await bot.start_checkout(tg_id + 1, tg_id + 1, BASIC)
         order2 = [o for o in bot.payment_store.orders.values()][-1]
         # intid у каждого уведомления свой: по нему бот отсекает повторные доставки
-        await post_fk_notification(order2["id"], bot.TARIFFS["basic"]["price"], intid="987655")
+        await post_fk_notification(order2["id"], bot.TARIFFS[BASIC]["price"], intid="987655")
         check("второй заказ тоже выдан",
               panel_client(f"tg-paid-{tg_id + 1}") is not None)
         check("повторная выдача обошлась без новых запросов настроек",
@@ -1742,7 +1754,7 @@ async def test_subscription_link(store_file):
         reset_all()
         reset(sub={"enable": False, "port": None, "path": "/sub/", "domain": "", "uri": ""})
         off = new_bot({"mode": "freekassa"}, store_file + ".off")
-        await off.start_checkout(tg_id, tg_id, "basic")
+        await off.start_checkout(tg_id, tg_id, BASIC)
         order3 = [o for o in off.payment_store.orders.values()][-1]
         info3 = await off.fulfill_order(order3, charge_id="test-sub-off")
         check("при выключенном сервисе подписок ссылки нет", info3["info"]["sub_link"] is None)
@@ -1821,7 +1833,7 @@ async def test_promo_tariff(store_file):
     callbacks = [button.callback_data for row in kb.inline_keyboard for button in row]
     labels = " | ".join(button.text for row in kb.inline_keyboard for button in row)
     check("в кнопках тарифов есть промо", "buy_promo" in callbacks, str(callbacks))
-    check("промо подписан как бесплатный пункт", "Бесплатно" in labels, labels[:160])
+    check("промо подписан как бесплатный пункт", "бесплатно" in labels.lower(), labels[:160])
     screen = _FakeCallback(bot, "tariffs")
     await bot.cb_tariffs(screen)
     tariffs_text = screen.message.sent[-1] if screen.message.sent else ""
@@ -1910,9 +1922,9 @@ async def test_promo_tariff(store_file):
     paid = new_bot({"mode": "freekassa"}, store_file + ".paid")
     runner = await paid.run_webhook_server()
     try:
-        await paid.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        await paid.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         order = [o for o in paid.payment_store.orders.values()][-1]
-        status, body = await post_fk_notification(order["id"], paid.TARIFFS["basic"]["price"])
+        status, body = await post_fk_notification(order["id"], paid.TARIFFS[BASIC]["price"])
         check("платная подписка активирована", body == "YES" and panel_client(email) is not None, body)
         total_before = panel_client(email)["totalGB"]
         paid_refused = False
@@ -1951,7 +1963,7 @@ async def test_cancel_order(store_file):
     email = f"tg-paid-{TG_TG_ID}"
 
     try:
-        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "basic")
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         order = [o for o in bot.payment_store.orders.values()][-1]
         order_id = order["id"]
         check("свежий заказ ждёт оплаты", order["status"] == "pending")
