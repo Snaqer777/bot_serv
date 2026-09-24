@@ -44,6 +44,7 @@ PANEL_PORT = 8744
 TG_PORT = 8745
 YK_PORT = 8746
 WEBHOOK_PORT = 8747
+EGRESS_STUB_PORT = 8751
 TG_TG_ID = 4242
 SHOP_ID = "123456"
 SECRET_KEY = "test_secret_key_abc"
@@ -649,6 +650,8 @@ async def test_provider_receipt_and_test_mode(store_file):
     text = _last_api_text()
     check("/panel_debug показывает тестовый токен", "тестовый токен" in text)
     check("/panel_debug показывает передачу чека", "передаётся в provider_data" in text)
+    check("/panel_debug показывает исходящий IP сервиса (для whitelist у платёжек)",
+          "Исходящий IP:" in text, [line for line in text.split("\n") if "Исходящий" in line][:1])
 
 
 async def test_yookassa_flow(store_file):
@@ -1253,6 +1256,45 @@ async def test_persistence_and_off(store_file):
           bot_override.TARIFFS[FAMILY]["stars"] == round(bot_override.TARIFFS[FAMILY]["price"] / 1.6))
 
 
+async def test_egress_ip(store_file):
+    print("\n▶ 12а. Исходящий IP сервиса: определение и отказ без сети")
+    reset_all()
+    bot = new_bot({"mode": "freekassa"}, store_file)
+
+    ip = await bot.fetch_egress_ip(timeout=6)
+    check("исходящий IP определяется (внешний сервис отвечает) либо честно пусто",
+          ip == "" or ("." in ip or ":" in ip), repr(ip))
+    if ip:
+        check("в адресе нет лишних пробелов и разметки",
+              ip == ip.strip() and " " not in ip and "<" not in ip, repr(ip))
+
+    unreachable = await bot.fetch_egress_ip(timeout=1, urls=("http://127.0.0.1:9/ip",))
+    check("недоступный сервис не ломает диагностику — просто пустая строка", unreachable == "", repr(unreachable))
+
+    # Локальный сервис-заглушка: успешный путь одинаков и с любым внешним сервисом
+    async def ip_page(request):
+        return web.Response(text="203.0.113.7\n")
+
+    stub = web.Application()
+    stub.router.add_get("/ip", ip_page)
+    stub_runner = web.AppRunner(stub)
+    await stub_runner.setup()
+    stub_port = EGRESS_STUB_PORT
+    await web.TCPSite(stub_runner, "127.0.0.1", stub_port).start()
+    try:
+        got = await bot.fetch_egress_ip(timeout=3, urls=(f"http://127.0.0.1:{stub_port}/ip",))
+    finally:
+        await stub_runner.cleanup()
+    check("адрес от сервиса читается и очищается от пробелов и перевода строки",
+          got == "203.0.113.7", repr(got))
+    check("строка диагностики подставляет найденный адрес",
+          "<code>203.0.113.7</code>" in bot.egress_ip_line("203.0.113.7"))
+    check("строка для бота объясняет, что адрес меняется при деплое",
+          "меняется при каждом деплое" in bot.egress_ip_line("1.2.3.4"))
+    check("без адреса строка сообщает, что определить не удалось",
+          "не удалось" in bot.egress_ip_line(""))
+
+
 async def test_diagnostics(store_file):
     print("\n▶ 11. Диагностика: провайдеры, сбои, доставка ключа")
     reset_all()
@@ -1554,6 +1596,8 @@ async def test_freekassa_self_check(store_file):
         check("отчёт подсказывает кнопку «Проверить статус»", "Проверить статус" in text)
         check("отчёт проверяет доступность страницы оплаты",
               "Доступность страницы оплаты" in text)
+        check("отчёт показывает исходящий IP бота (нужен, если платёжка просит whitelist)",
+              "Исходящий IP бота:" in text, [line for line in text.split("\n") if "Исходящий" in line][:1])
         check("если домен не отвечает — подсказано зеркало pay.kassa.shop",
               "Доступность страницы оплаты: отвечает ✅" in text
               or "pay.kassa.shop" in text, text[-260:])
@@ -2120,6 +2164,7 @@ async def main():
         await test_freekassa_stats_and_labels(store_for("freekassa_stats"))
         await test_yookassa_button_and_revoke(store_for("yookassa_btn"))
         await test_persistence_and_off(store_for("persist"))
+        await test_egress_ip(store_for("egress"))
         await test_diagnostics(store_for("diag"))
         await test_panel_debug(store_for("debug"))
         await test_simulated_payment(store_for("simulate"))

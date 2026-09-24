@@ -4172,6 +4172,53 @@ async def simulate_successful_payment(chat_id: int, tg_id: int, tariff_key: str,
     return result
 
 
+# Куда стучаться за внешним (исходящим) IP сервиса. Нужен, если платёжная система,
+# провайдер или партнёрский сервис просит белый список адресов.
+EGRESS_IP_URLS = (
+    "https://api.ipify.org",
+    "https://ifconfig.me/ip",
+    "https://ipinfo.io/ip",
+)
+
+
+async def fetch_egress_ip(timeout: float = 5.0, urls: tuple[str, ...] | None = None) -> str:
+    """
+    Внешний (исходящий) IP, с которого сервис ходит в интернет.
+
+    На Railway адрес динамический: он выдаётся из общего пула и меняется при каждом
+    деплое и рестарте. Свой постоянный адрес даёт только Railway Pro (Static Outbound
+    IPs) или внешний прокси с фиксированным IP — если платёжка требует whitelist,
+    надёжнее положиться на подпись запроса, а не на адрес.
+
+    Пустая строка — определить не удалось (нет сети или сервисы недоступны).
+    """
+    for url in urls or EGRESS_IP_URLS:
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as session:
+                async with session.get(url, headers={"User-Agent": BROWSER_UA}) as resp:
+                    if resp.status != 200:
+                        continue
+                    ip = (await resp.text()).strip()
+                    if 0 < len(ip) <= 45 and " " not in ip and "<" not in ip:
+                        return ip
+        except Exception as exc:
+            logger.debug("Не удалось определить исходящий IP через %s: %s", url, exc)
+    return ""
+
+
+def egress_ip_line(ip: str) -> str:
+    """Строка про исходящий IP для диагностики: что это и зачем нужен."""
+    if not ip:
+        return "• <b>Исходящий IP:</b> ⚠️ определить не удалось (нет сети или сервисы недоступны)"
+    return (
+        f"• <b>Исходящий IP:</b> <code>{escape(ip)}</code> "
+        "<i>(с этого адреса бот обращается к платёжным системам и внешним API; "
+        "на Railway он меняется при каждом деплое)</i>"
+    )
+
+
 async def freekassa_self_check() -> str:
     """
     Проверяет настройки FreeKassa без денег: ключи, подписи, адреса и вебхук.
@@ -4196,6 +4243,13 @@ async def freekassa_self_check() -> str:
             if FREEKASSA_CHECK_IP
             else "выключена (на Railway так и нужно: защищает подпись SIGN)"
         )
+    )
+    egress_ip = await fetch_egress_ip()
+    lines.append(
+        "• Исходящий IP бота: "
+        + (f"<code>{escape(egress_ip)}</code>" if egress_ip else "⚠️ определить не удалось")
+        + " — если платёжный сервис просит белый список адресов, укажи этот; "
+        "на Railway он меняется при каждом деплое"
     )
 
     if not freekassa_configured():
@@ -5691,10 +5745,12 @@ async def cmd_panel_debug(message: Message):
         ", ".join(str(value) for value in ADMIN_IDS) if ADMIN_IDS
         else "⚠️ не задан (админ-команды открыты всем — укажи свой ID)"
     )
+    egress_ip = await fetch_egress_ip()
     lines = [
         "🔍 <b>Диагностика подключения к 3x-ui:</b>\n",
         f"• <b>Админы (ADMIN_ID):</b> <code>{escape(admins_note)}</code> — твой ID <code>{message.from_user.id}</code>",
         f"• <b>URL:</b> <code>{escape(XUI_URL)}</code>",
+        egress_ip_line(egress_ip),
         f"• <b>Прокси:</b> <code>{escape(str(XUI_PROXY or 'нет'))}</code>",
         f"• <b>Логин:</b> <code>{escape(XUI_USERNAME or 'не задан')}</code>",
         f"• <b>API Token:</b> <code>{'задан' if XUI_TOKEN else 'не задан'}</code>",
