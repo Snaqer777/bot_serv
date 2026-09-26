@@ -71,6 +71,16 @@ def tg_calls(method):
     return [c for c in TG["calls"] if c["method"] == method]
 
 
+def markup_data(markup) -> str:
+    """Текст кнопок разметки — чтобы проверять, какая кнопка показана пользователю."""
+    rows = getattr(markup, "inline_keyboard", None)
+    if rows:
+        return " ".join(
+            str(getattr(button, "callback_data", "") or "") for row in rows for button in row
+        )
+    return json.dumps(markup or {}, ensure_ascii=False)
+
+
 def last_tg(method):
     items = tg_calls(method)
     return items[-1]["params"] if items else {}
@@ -335,6 +345,7 @@ def new_bot(env, store_file, admins=None):
         "PLATEGA_METHOD": env.get("method"),
         "PLATEGA_RETURN_URL": env.get("return_url"),
         "PLATEGA_FAILED_URL": env.get("failed_url"),
+        "PLATEGA_AMOUNT_TOLERANCE_PERCENT": env.get("tolerance"),
         "PUBLIC_BASE_URL": f"http://127.0.0.1:{WEBHOOK_PORT}",
         "PAYMENTS_ALLOW_TEST_PAY": env.get("allow_test_pay"),
         "PROMO_ENABLED": env.get("promo_enabled"),
@@ -879,10 +890,29 @@ async def test_platega_api_and_amounts():
           and isinstance(bot.platega_amount({"amount_rub": 249}), int))
     check("дробная сумма округляется до копеек",
           bot.platega_amount({"amount_rub": 150.5}) == 150.5)
-    check("сумма из callback сверяется в копейках",
+    check("оплата ровно по цене тарифа проходит",
           bot.platega_amount_matches(order, f"{price}.00") is True)
-    check("другая сумма не проходит", bot.platega_amount_matches(order, 1) is False)
+    check("сумма с копейками (переплата) проходит: касса добавила комиссию плательщика",
+          bot.platega_amount_matches(order, price + 5.6) is True)
+    check("переплата в разы тоже проходит — деньги клиента уже списаны",
+          bot.platega_amount_matches(order, price * 2) is True)
+    check("недоплата НЕ проходит: заказ не покрыт",
+          bot.platega_amount_matches(order, price - 1) is False)
+    check("символическая сумма не проходит", bot.platega_amount_matches(order, 1) is False)
     check("мусор вместо суммы не проходит", bot.platega_amount_matches(order, "abc") is False)
+    check("сумма в рублях разбирается из строки и запятой",
+          bot.platega_paid_amount("75,60") == 75.6 and bot.platega_paid_amount(None) is None)
+
+    check("по умолчанию люфта вниз нет: 0 %", bot.PLATEGA_AMOUNT_TOLERANCE_PERCENT == 0)
+
+    # Люфт вниз нужен только тем, у кого касса присылает сумму за вычетом комиссии
+    tolerant = new_bot({"mode": "platega", "tolerance": "5"}, store_file)
+    check("PLATEGA_AMOUNT_TOLERANCE_PERCENT=5 принимает недоплату до 5 %",
+          tolerant.platega_amount_matches(order, price * 0.96) is True)
+    check("...но не больше: 10 % уже отказ",
+          tolerant.platega_amount_matches(order, price * 0.9) is False)
+    check("ровно на границе люфта (95 %) оплата принимается",
+          tolerant.platega_amount_matches(order, price * 0.95) is True)
 
     # Заголовки callback — единственная защита, поэтому сравниваем оба значения
     check("верные X-MerchantId/X-Secret принимаются",
@@ -964,6 +994,24 @@ async def test_platega_flow(store_file):
         check("повтор не создаёт второго клиента",
               len([e for e in PANEL["clients"] if e == email]) == 1)
 
+        # Оплата с комиссией плательщика: касса добавила к счёту 5.6 ₽ (70 ₽ + 8 %)
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, SCHOOL)
+        order_fee = [o for o in bot.payment_store.orders.values()][-1]
+        fee_price = bot.TARIFFS[SCHOOL]["price"]
+        expiry_before_fee = int(panel_client(email)["expiryTime"])
+        status, body = await post_platega_callback(order_fee["id"], fee_price + 5.6,
+                                                   transaction_id=str(order_fee["payment_id"]))
+        check("оплата с комиссией плательщика принимается (200)",
+              status == 200 and body.strip() == "ok", f"{status} {body[:40]}")
+        saved_fee = await bot.payment_store.get(order_fee["id"])
+        check("ключ выдан, заказ оплачен", saved_fee["status"] == "paid" and panel_client(email) is not None)
+        check("фактически оплаченная сумма сохранена в заказе",
+              abs(float(saved_fee.get("paid_amount") or 0) - (fee_price + 5.6)) < 0.01,
+              str(saved_fee.get("paid_amount")))
+        school_days = bot.TARIFFS[SCHOOL]["days"]
+        added = round((int(panel_client(email)["expiryTime"]) - expiry_before_fee) / 86_400_000, 1)
+        check(f"подписка продлена на {school_days} дней несмотря на переплату", added == school_days, f"+{added} дн.")
+
         # Вторая оплата — другой тариф
         expiry_first = int(panel_client(email)["expiryTime"])
         await bot.start_checkout(TG_TG_ID, TG_TG_ID, FAMILY)
@@ -981,9 +1029,11 @@ async def test_platega_flow(store_file):
         expiry_before = int(panel_client(email)["expiryTime"])
         status, body = await post_platega_callback(order3["id"], 1,
                                                    transaction_id=str(order3["payment_id"]))
-        check("подмена суммы → ключ не выдан и отказ 400",
+        check("недоплата → ключ не выдан и отказ 400",
               status == 400 and int(panel_client(email)["expiryTime"]) == expiry_before,
               f"{status} {body[:40]}")
+        check("в отказе сказано, что оплачено меньше стоимости заказа",
+              "меньше стоимости" in body, body[:60])
         status, body = await post_platega_callback(order3["id"], bot.TARIFFS[PREMIUM]["price"],
                                                    currency="USD",
                                                    transaction_id=str(order3["payment_id"]))
@@ -1165,6 +1215,99 @@ async def test_platega_diagnostics(store_file):
         check("/payments: показан Merchant ID", PLAT_MERCHANT_ID in payments_text)
         check("/payments: показан Callback URL", PLAT_WEBHOOK_PATH in payments_text)
         check("/payments: показана выручка в рублях", "Выручка" in payments_text)
+
+        # Ожидающий заказ: админ видит его в /payments и может перепроверить оплату кнопкой
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, PREMIUM)
+        pending = [o for o in bot.payment_store.orders.values()][-1]
+        expiry_before = int(panel_client(f"tg-paid-{TG_TG_ID}")["expiryTime"])
+        PLAT["status_override"] = "PENDING"
+
+        msg = make_message(bot, text="/payments")
+        await bot.cmd_payments(msg)
+        markup = markup_data(tg_calls("sendMessage")[-1]["params"].get("reply_markup"))
+        check("в /payments есть кнопка перепроверки ожидающего заказа",
+              f"checkorder_{pending['id']}" in markup, markup[:140])
+
+        cb = _FakeCallback(bot, f"checkorder_{pending['id']}")
+        await bot.cb_admin_check_order(cb)
+        check("пока касса не подтвердила — ключ не выдан",
+              int(panel_client(f"tg-paid-{TG_TG_ID}")["expiryTime"]) == expiry_before,
+              json.dumps(cb.message.sent, ensure_ascii=False)[:90])
+
+        cb = _FakeCallback(bot, f"checkorder_{pending['id']}", uid=777)
+        await bot.cb_admin_check_order(cb)
+        check("обычному пользователю админская перепроверка недоступна",
+              any("Только для администратора" in a for a in cb.answers), str(cb.answers))
+
+        PLAT["status_override"] = "CONFIRMED"
+        cb = _FakeCallback(bot, f"checkorder_{pending['id']}")
+        await bot.cb_admin_check_order(cb)
+        premium_days = bot.TARIFFS[PREMIUM]["days"]
+        added = round((int(panel_client(f"tg-paid-{TG_TG_ID}")["expiryTime"]) - expiry_before) / 86_400_000, 1)
+        check("админская перепроверка выдала ключ по подтверждённой оплате", added == premium_days, f"+{added} дн.")
+        check("админу сказано, что ключ выдан",
+              any("Оплата подтверждена" in t for t in cb.message.sent),
+              json.dumps(cb.message.sent, ensure_ascii=False)[:90])
+        check("клиенту ушло сообщение с ссылкой-подпиской",
+              any("/sub/" in m["params"].get("text", "")
+                  for m in tg_calls("sendMessage")
+                  if str(m["params"].get("chat_id")) == str(TG_TG_ID)))
+        PLAT["status_override"] = None
+
+        msg = make_message(bot, text="/payments")
+        await bot.cmd_payments(msg)
+        check("после выдачи в /payments видно фактически оплаченную сумму заказа с комиссией",
+              "оплачено" in _last_api_text(), [ln for ln in _last_api_text().split(chr(10)) if "оплачено" in ln][:1])
+
+        # Расхождение суммы: платёж подтверждён, но пришло меньше цены заказа.
+        # Бот ключ не выдаёт, зато админ видит точные суммы и может выдать доступ кнопкой.
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
+        short = [o for o in bot.payment_store.orders.values()][-1]
+        PLAT["transactions"][str(short["payment_id"])]["paymentDetails"]["amount"] = short["amount_rub"] - 5
+        PLAT["status_override"] = "CONFIRMED"
+        expiry_before = int(panel_client(f"tg-paid-{TG_TG_ID}")["expiryTime"])
+
+        cb = _FakeCallback(bot, f"checkorder_{short['id']}")
+        await bot.cb_admin_check_order(cb)
+        shortfall_text = "\n".join(cb.message.sent)
+        check("недоплата: админ видит точные суммы платежа и заказа",
+              "меньше стоимости" in shortfall_text
+              and f"{short['amount_rub'] - 5:.2f}".replace(".00", "") in shortfall_text,
+              shortfall_text[:120])
+        check("недоплата: ключ не выдан",
+              int(panel_client(f"tg-paid-{TG_TG_ID}")["expiryTime"]) == expiry_before)
+        markup = markup_data(tg_calls("sendMessage")[-1]["params"].get("reply_markup"))
+        check("недоплата: админу предложена ручная выдача ключа",
+              f"forcerelease_{short['id']}" in markup, markup[:140])
+
+        cb = _FakeCallback(bot, f"forcerelease_{short['id']}", uid=777)
+        await bot.cb_force_release_order(cb)
+        check("обычному пользователю ручная выдача недоступна",
+              any("Только для администратора" in a for a in cb.answers), str(cb.answers))
+
+        cb = _FakeCallback(bot, f"forcerelease_{short['id']}")
+        await bot.cb_force_release_order(cb)
+        basic_days = bot.TARIFFS[BASIC]["days"]
+        added = round((int(panel_client(f"tg-paid-{TG_TG_ID}")["expiryTime"]) - expiry_before) / 86_400_000, 1)
+        check("ручная выдача админом: ключ выдан и подписка активирована",
+              added == basic_days, f"+{added} дн.")
+        saved_short = await bot.payment_store.get(short["id"])
+        check("в заказе отмечены ручная выдача, автор и фактическая сумма",
+              saved_short.get("manual_release") is True
+              and saved_short.get("manual_release_by") == TG_TG_ID
+              and abs(float(saved_short.get("paid_amount") or 0) - (short["amount_rub"] - 5)) < 0.01,
+              str({k: saved_short.get(k) for k in ("manual_release", "manual_release_by", "paid_amount")}))
+        check("админам ушло уведомление о ручной выдаче",
+              any("Ручная выдача" in m["params"].get("text", "") for m in tg_calls("sendMessage")),
+              json.dumps(tg_calls("sendMessage")[-1]["params"], ensure_ascii=False)[:120])
+
+        # Пришедший позже callback по тому же заказу ничего не ломает и не продлевает подписку дважды
+        status, body = await post_platega_callback(short["id"], short["amount_rub"] - 5,
+                                                   transaction_id=str(short["payment_id"]))
+        added = round((int(panel_client(f"tg-paid-{TG_TG_ID}")["expiryTime"]) - expiry_before) / 86_400_000, 1)
+        check("повторный callback после ручной выдачи: 200 ok и без второго продления",
+              status == 200 and body.strip() == "ok" and added == basic_days, f"{status} +{added} дн.")
+        PLAT["status_override"] = None
     finally:
         await runner.cleanup()
 

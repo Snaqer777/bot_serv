@@ -360,6 +360,13 @@ PLATEGA_METHODS = {
     14: "SberPay",
 }
 
+# Допустимая недоплата в процентах от цены тарифа. Оплата «с запасом» принимается
+# всегда (способы оплаты добавляют к счёту комиссию плательщика: тариф 70 ₽, а с карты
+# списывается 75,6 ₽ — деньги у клиента списаны, ключ выдаём). Ненулевое значение нужно
+# только если касса присылает сумму за вычетом комиссии (нетто) и клиент платит ровно
+# цену: тогда, например, 5 примет оплату от 95 % суммы заказа. Больше 90 не применяется.
+PLATEGA_AMOUNT_TOLERANCE_PERCENT = _int_env("PLATEGA_AMOUNT_TOLERANCE_PERCENT", 0)
+
 # Куда Platega вернёт плательщика после успешной оплаты и после неудачи.
 # Пусто — используется ссылка на бота (клиент возвращается прямо в Telegram).
 PLATEGA_RETURN_URL = (os.getenv("PLATEGA_RETURN_URL") or "").strip()
@@ -3187,6 +3194,29 @@ class YooKassaClient:
             return False
 
 
+async def platega_confirmed_amount(order: dict) -> float | None:
+    """
+    Сумма подтверждённого платежа Platega — или None, если платежа нет / он не подтверждён.
+
+    Нужна для ручной выдачи: когда оплата есть, но её сумма меньше цены заказа, бот сам
+    ключ не выдаёт и решает администратор (кнопка «Выдать ключ вручную» в перепроверке
+    заказа из /payments).
+    """
+    if order.get("mode") != "platega":
+        return None
+    transaction_id = str(order.get("payment_id") or "").strip()
+    if not transaction_id:
+        return None
+    try:
+        data = await platega_transaction(transaction_id)
+    except Exception as exc:
+        logger.warning("Не удалось проверить платёж Platega %s: %s", transaction_id, exc)
+        return None
+    if str(data.get("status") or "").strip().upper() != "CONFIRMED":
+        return None
+    return platega_paid_amount((data.get("paymentDetails") or {}).get("amount"))
+
+
 def provider_mode_title() -> str:
     """Описание платёжного токена BotFather: тестовый он или боевой."""
     if not PAYMENT_PROVIDER_TOKEN:
@@ -3220,7 +3250,24 @@ async def recheck_order_payment(order: dict) -> tuple[str, str]:
         if status == "CONFIRMED":
             amount = (data.get("paymentDetails") or {}).get("amount")
             if not platega_amount_matches(order, amount):
-                return "error", "⚠️ Сумма оплаты не совпала с заказом — напиши в поддержку."
+                paid = platega_paid_amount(amount)
+                paid_label = f"{paid:.2f} ₽".replace(".00", "") if paid is not None else "неизвестна"
+                return (
+                    "error",
+                    f"⚠️ Оплачено меньше стоимости заказа: <b>{escape(paid_label)}</b> "
+                    f"вместо <b>{order['amount_rub']} ₽</b>.\n\n"
+                    "Если деньги списались полностью — напиши в поддержку, проверим платёж "
+                    f"по номеру заказа <code>{escape(order['id'])}</code>.",
+                )
+            paid_rub = platega_paid_amount(amount)
+            if paid_rub is not None and round(paid_rub * 100) != order_amount(order):
+                # Переплата = комиссия платёжного способа. Запоминаем факт, чтобы он был
+                # виден в /payments (в выручке бот считает по цене тарифа).
+                logger.info(
+                    "Platega: заказ %s оплачен на %.2f ₽ при цене тарифа %s ₽ (разница — комиссия способа оплаты)",
+                    order["id"], paid_rub, order["amount_rub"],
+                )
+                await payment_store.update(order["id"], paid_amount=paid_rub)
             return "paid", status
         if status in ("CANCELED", "CHARGEBACKED"):
             return "canceled", status
@@ -3303,13 +3350,32 @@ def platega_amount(order: dict) -> float | int:
     return int(price) if price == int(price) else round(price, 2)
 
 
-def platega_amount_matches(order: dict, amount) -> bool:
-    """Совпадает ли оплаченная сумма с заказом (сравниваем в копейках)."""
+def platega_paid_amount(amount) -> float | None:
+    """Оплаченная сумма в рублях (None, если в платёжке мусор вместо числа)."""
     try:
-        paid_kop = round(float(str(amount).replace(",", ".")) * 100)
+        return round(float(str(amount).replace(",", ".")), 2)
     except (TypeError, ValueError):
+        return None
+
+
+def platega_amount_matches(order: dict, amount) -> bool:
+    """
+    Хватает ли оплаченной суммы на заказ (сравниваем в копейках).
+
+    Переплата — нормальная ситуация, и отказывать из-за неё нельзя: способы оплаты
+    добавляют к счёту комиссию плательщика (тариф 70 ₽, а с карты списывается 75,6 ₽),
+    и касса сообщает именно эту сумму. Поэтому принимаем всё, что не меньше цены
+    заказа; недоплата не проходит — она не покрывает заказ. Небольшой люфт вниз можно
+    разрешить переменной PLATEGA_AMOUNT_TOLERANCE_PERCENT (по умолчанию 0).
+    """
+    paid_rub = platega_paid_amount(amount)
+    if paid_rub is None:
         return False
-    return abs(paid_kop - order_amount(order)) <= 1
+    minimum_kop = order_amount(order)
+    if PLATEGA_AMOUNT_TOLERANCE_PERCENT > 0:
+        percent = min(PLATEGA_AMOUNT_TOLERANCE_PERCENT, 90)
+        minimum_kop = round(minimum_kop * (100 - percent) / 100)
+    return round(paid_rub * 100) >= minimum_kop
 
 
 def platega_credentials_valid(merchant_id: str | None, secret: str | None) -> bool:
@@ -3506,12 +3572,43 @@ async def process_platega_callback(
         logger.info("Platega: промежуточный статус %s по заказу %s", status or "—", order["id"])
         return 200, f"статус {status or '—'} — ждём оплату"
 
+    if order.get("status") == "paid":
+        # Platega может повторить callback — ключ уже выдан, просто подтверждаем приём.
+        # Так же отвечаем на callback о заказе, который админ выдал вручную при расхождении
+        # суммы: иначе касса считала бы уведомление непринятым и повторяла бы его ~15 минут.
+        logger.info("Platega: повторный callback по заказу %s — уже оплачен", order["id"])
+        await payment_store.update(order["id"], payment_id=transaction_id or order.get("payment_id"))
+        return 200, "заказ уже оплачен, повторный callback подтверждён"
+
+    paid_rub = platega_paid_amount(payload_body.get("amount"))
+    underpaid = paid_rub is not None and round(paid_rub * 100) < order_amount(order)
     if not platega_amount_matches(order, payload_body.get("amount")):
         logger.error(
-            "Platega: сумма %s не совпадает с заказом %s (%s ₽)",
+            "Platega: оплачено %s ₽ — меньше суммы заказа %s (%s ₽), ключ не выдаю",
             payload_body.get("amount"), order["id"], order["amount_rub"],
         )
-        return 400, "сумма платежа не совпадает с заказом"
+        return 400, "сумма платежа меньше стоимости заказа"
+    if paid_rub is not None and round(paid_rub * 100) != order_amount(order):
+        # Разница — комиссия платёжного способа: её берёт не бот, а касса. Сохраняем
+        # фактическую сумму, чтобы она была видна в /payments и в статистике поддержки.
+        over = paid_rub - float(order["amount_rub"])
+        logger.info(
+            "Platega: заказ %s оплачен на %.2f ₽ (цена тарифа %.2f ₽, разница %+.2f ₽ — комиссия платёжного способа)",
+            order["id"], paid_rub, float(order["amount_rub"]), over,
+        )
+        await payment_store.update(order["id"], paid_amount=paid_rub)
+        if underpaid:
+            # Недоплата прошла только при разрешённом люфте (PLATEGA_AMOUNT_TOLERANCE_PERCENT):
+            # клиент получит доступ, но админ должен знать, что денег пришло меньше тарифа.
+            await notify_admins(
+                "⚠️ <b>Platega: оплата меньше цены тарифа.</b>\n\n"
+                f"• Заказ: <code>{escape(order['id'])}</code>\n"
+                f"• Тариф: {escape(order.get('tariff_name') or '—')} — {order['amount_rub']} ₽\n"
+                f"• Оплачено: <b>{paid_rub:.2f} ₽</b>\n"
+                f"• Пользователь: TG <code>{order['tg_id']}</code>\n\n"
+                "Ключ выдан (люфт задан переменной <code>PLATEGA_AMOUNT_TOLERANCE_PERCENT</code>). "
+                "Убери переменную или поставь 0, если недоплата недопустима."
+            )
 
     currency = str(payload_body.get("currency") or PLATEGA_CURRENCY).strip().upper()
     if currency and currency != PLATEGA_CURRENCY:
@@ -3528,12 +3625,6 @@ async def process_platega_callback(
             "(при необходимости верните оплату в кабинете Platega и снимите подписку /revoke).",
             order["id"],
         )
-    if order.get("status") == "paid":
-        # Platega может повторить callback — ключ уже выдан, просто подтверждаем приём.
-        logger.info("Platega: повторный callback по заказу %s — уже оплачен", order["id"])
-        await payment_store.update(order["id"], payment_id=transaction_id or order.get("payment_id"))
-        return 200, "заказ уже оплачен, повторный callback подтверждён"
-
     await payment_store.update(
         order["id"],
         payment_id=transaction_id or order["id"],
@@ -6568,6 +6659,160 @@ async def cb_check_payment(cb: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data.startswith("checkorder_"))
+async def cb_admin_check_order(cb: CallbackQuery):
+    """
+    Перепроверка оплаты заказа администратором (кнопка в /payments).
+
+    Нужна, когда клиент оплатил, а ключ не пришёл: вебхук не дошёл, заказ отменён,
+    сумма пришла с комиссией и раньше не проходила проверку или сообщение клиента
+    потерялось в переписке. Бот спрашивает статус у платёжной системы тем же путём,
+    что и клиентская кнопка «Проверить оплату», и выдаёт доступ, если оплата есть.
+    """
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Только для администратора — /myid покажет твой ID.", show_alert=True)
+        return
+
+    order_id = cb.data.removeprefix("checkorder_")
+    order = await payment_store.get(order_id)
+    if order is None:
+        await cb.answer("Заказ не найден.", show_alert=True)
+        return
+    if order.get("status") == "paid":
+        await cb.answer("Заказ уже оплачен ✅", show_alert=True)
+        return
+
+    await cb.answer("Проверяю оплату в платёжной системе...")
+    state, details = await recheck_order_payment(order)
+
+    if state == "paid":
+        try:
+            result = await fulfill_order(order, charge_id=order_charge_id(order) or f"manual-{order_id}")
+        except Exception as exc:
+            logger.exception("Админская проверка оплаты: выдача не удалась: %s", exc)
+            await cb.message.answer(
+                "✅ Оплата подтверждена, но выдача ключа задержалась — жду восстановления панели.\n"
+                f"Номер заказа: <code>{escape(order_id)}</code>",
+                parse_mode="HTML",
+            )
+            return
+        await cb.message.answer(
+            ("✅ Оплата подтверждена — ключ выдан, клиент получил доступ."
+             if result.get("info") else "✅ Оплата уже была учтена, ключ выдан ранее.")
+            + f"\nНомер заказа: <code>{escape(order_id)}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if state == "canceled":
+        await payment_store.update(order_id, status="canceled")
+        await cb.message.answer(
+            f"❌ По заказу <code>{escape(order_id)}</code> оплаты нет: платёж отменён или счёт истёк.",
+            parse_mode="HTML",
+        )
+        return
+
+    if state == "error":
+        confirmed = await platega_confirmed_amount(order)
+        if confirmed is not None:
+            # Платёж подтверждён, но сумма меньше цены заказа: решение принимает человек.
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                text=f"✅ Выдать ключ вручную (оплачено {confirmed:.2f} ₽)".replace(".00", ""),
+                callback_data=f"forcerelease_{order_id}",
+            )]])
+            await cb.message.answer(
+                details + "\n\nЕсли оплата верная (например, касса удержала комиссию) — выдай "
+                "ключ вручную: клиент получит доступ, а факт ручной выдачи попадёт в лог "
+                "и в уведомление остальным администраторам.",
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
+            return
+        await cb.message.answer(details, parse_mode="HTML")
+        return
+
+    await cb.message.answer(
+        f"⏳ Заказ <code>{escape(order_id)}</code> пока не оплачен (статус: <b>{escape(str(details))}</b>).\n"
+        "Если клиент говорит, что заплатил, — проверьте транзакцию в кабинете Platega "
+        "по номеру платежа в заказе.",
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("forcerelease_"))
+async def cb_force_release_order(cb: CallbackQuery):
+    """
+    Ручная выдача ключа администратором при расхождении суммы.
+
+    Бывает, что платёж подтверждён, а сумма меньше цены заказа (касса удержала комиссию
+    или платёж пришёл частично). Клиент оплатил — бросать его нельзя, поэтому админ может
+    выдать доступ кнопкой. Перед выдачей бот ещё раз спрашивает статус у Platega: если
+    подтверждения нет, ключ не выдаётся. О выдаче уведомляются все администраторы.
+    """
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Только для администратора — /myid покажет твой ID.", show_alert=True)
+        return
+
+    order_id = cb.data.removeprefix("forcerelease_")
+    order = await payment_store.get(order_id)
+    if order is None:
+        await cb.answer("Заказ не найден.", show_alert=True)
+        return
+    if order.get("status") == "paid":
+        await cb.answer("Заказ уже оплачен ✅", show_alert=True)
+        return
+
+    await cb.answer("Проверяю платёж...")
+    confirmed = await platega_confirmed_amount(order)
+
+    if confirmed is None:
+        await cb.message.answer(
+            f"❌ Платёж по заказу <code>{escape(order_id)}</code> сейчас не подтверждён — "
+            "ключ выдать нельзя. Проверь транзакцию в кабинете Platega.",
+            parse_mode="HTML",
+        )
+        return
+
+    logger.warning(
+        "Ручная выдача ключа: заказ %s, оплачено %.2f ₽ при цене %s ₽, администратор %s",
+        order_id, confirmed, order["amount_rub"], cb.from_user.id,
+    )
+    await payment_store.update(
+        order_id,
+        paid_amount=confirmed,
+        manual_release=True,
+        manual_release_by=cb.from_user.id,
+        manual_release_at=int(time.time()),
+    )
+
+    try:
+        await fulfill_order(order, charge_id=order_charge_id(order) or f"manual-{order_id}")
+    except Exception as exc:
+        logger.exception("Ручная выдача по заказу %s не удалась: %s", order_id, exc)
+        await cb.message.answer(
+            "⚠️ Оплата проверена, но панель не отдала доступ — попробуй ещё раз через пару минут.",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        await notify_admins(
+            "🧑✈️ <b>Ручная выдача ключа.</b>\n\n"
+            f"• Заказ: <code>{escape(order_id)}</code>\n"
+            f"• Тариф: {escape(order.get('tariff_name') or '—')} — {order['amount_rub']} ₽\n"
+            f"• Оплачено: <b>{confirmed:.2f} ₽</b>\n"
+            f"• Клиент: TG <code>{order['tg_id']}</code>\n"
+            f"• Выдал админ: <code>{cb.from_user.id}</code>"
+        )
+    except Exception as exc:
+        logger.warning("Не удалось уведомить админов о ручной выдаче: %s", exc)
+
+    await cb.message.answer(
+        f"✅ Ключ выдан, клиент получил доступ.\nНомер заказа: <code>{escape(order_id)}</code>",
+        parse_mode="HTML",
+    )
+
+
 async def cmd_payments(message: Message):
     """Статистика оплат и диагностика платёжного режима (только админ)."""
     if not is_admin(message.from_user.id):
@@ -6642,9 +6887,15 @@ async def cmd_payments(message: Message):
         for order in recent:
             icons = {"paid": "✅", "pending": "⏳", "canceled": "❌", "failed": "⚠️"}
             amount = f"{order['amount_stars']} ⭐️" if order["currency"] == "XTR" else f"{order['amount_rub']} ₽"
+            paid = order.get("paid_amount")
+            paid_note = (
+                f" <i>(оплачено {paid:.2f} ₽ — комиссия платёжного способа)</i>".replace(".00", "")
+                if paid and round(float(paid) * 100) != order_amount(order) else ""
+            )
             lines.append(
                 f"{icons.get(order.get('status'), '❔')} <code>{escape(order['id'])}</code> — "
                 f"{escape(order.get('tariff_name', '?'))}, {amount}, TG <code>{order['tg_id']}</code>"
+                + paid_note
                 + (" <i>(ключ выдан)</i>" if order.get("provisioned") else "")
             )
 
@@ -6655,7 +6906,15 @@ async def cmd_payments(message: Message):
         )
 
     # Кнопки проверок показываем только в тестовом режиме — в боевом их нет.
+    # Отдельно — перепроверка ожидающих заказов: если клиент оплатил, а ключ не пришёл
+    # (вебхук не дошёл, сумма пришла с комиссией), админ выдаёт доступ одной кнопкой.
     keyboard = []
+    pending_orders = [o for o in recent if o.get("status") == "pending"]
+    for order in pending_orders[:3]:
+        keyboard.append([InlineKeyboardButton(
+            text=f"🔄 Проверить оплату: {order.get('tariff_name') or order['id']}",
+            callback_data=f"checkorder_{order['id']}",
+        )])
     if test_tools_enabled():
         keyboard.append([InlineKeyboardButton(text="🧪 Проверить выдачу ключа без оплаты",
                                               callback_data="testpay_menu")])
