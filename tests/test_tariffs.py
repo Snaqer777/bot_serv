@@ -28,7 +28,7 @@ from aiohttp import web
 from panel import PANEL, client_of, clients_named, load_bot, make_app, reset
 import test_payments as tp
 from test_payments import (TG, TG_TG_ID, check, make_message, new_bot, reset_all,
-                           tg_calls, _FakeCallback, post_fk_notification)
+                           tg_calls, _FakeCallback, post_platega_callback)
 
 # --- Таблица владельца: тип × уровень ---------------------------------------
 # (цена, трафик ГБ, дней, устройств, туннелей); traffic_gb = 0 — без ограничения.
@@ -75,7 +75,7 @@ def days_left(client):
 async def test_catalog(store_file):
     print("\n▶ 1. Каталог тарифов совпадает с утверждённой таблицей")
     reset_all()
-    bot = new_bot({"mode": "freekassa"}, store_file)
+    bot = new_bot({"mode": "platega"}, store_file)
 
     check("в каталоге ровно 8 платных тарифов — 4 уровня × 2 типа",
           bot.paid_tariff_keys() == [f"time_{n}" for n in range(1, 5)]
@@ -125,7 +125,7 @@ async def test_catalog(store_file):
 async def test_three_steps(store_file):
     print("\n▶ 2. Три шага: тип подписки → уровень → сервер")
     reset_all()
-    bot = new_bot({"mode": "freekassa"}, store_file)
+    bot = new_bot({"mode": "platega"}, store_file)
 
     # Шаг 1
     await bot.cb_tariffs(_FakeCallback(bot, "tariffs"))
@@ -219,7 +219,7 @@ async def test_three_steps(store_file):
 async def test_delivery_by_location(store_file):
     print("\n▶ 3. Выдача: один туннель — выбранный сервер, 2+ — все локации")
     reset_all()
-    bot = new_bot({"mode": "freekassa"}, store_file)
+    bot = new_bot({"mode": "platega"}, store_file)
     runner = await bot.run_webhook_server()
     email = f"tg-paid-{TG_TG_ID}"
     try:
@@ -237,8 +237,8 @@ async def _delivery_body(bot, email):
     check("в счёте указан выбранный сервер", "Варшава" in pay_msg.get("text", ""),
           pay_msg.get("text", "")[:120].replace("\n", " "))
 
-    status, body = await post_fk_notification(order["id"], order["amount_rub"], intid="700001")
-    check("оплата подтверждена", status == 200 and body.strip() == "YES")
+    status, body = await post_platega_callback(order["id"], order["amount_rub"], transaction_id="700001")
+    check("оплата подтверждена", status == 200 and body.strip() == "ok")
     check("подписка создана только в выбранной локации (Варшава)",
           client_of(email, 2) is not None and client_of(email, 1) is None,
           f"Стокгольм={client_of(email, 1)}, Варшава={client_of(email, 2)}")
@@ -257,8 +257,8 @@ async def _delivery_body(bot, email):
     order2 = [o for o in bot.payment_store.orders.values()][-1]
     check("у многотуннельного тарифа локация в заказе не указана",
           not order2.get("location"), str(order2.get("location")))
-    status, body = await post_fk_notification(order2["id"], order2["amount_rub"], intid="700002")
-    check("вторая оплата подтверждена", body.strip() == "YES")
+    status, body = await post_platega_callback(order2["id"], order2["amount_rub"], transaction_id="700002")
+    check("вторая оплата подтверждена", status == 200 and body.strip() == "ok")
     subs = clients_named(email)
     check("подписка выдана в обе локации сразу", len(subs) == 2,
           f"записей: {len(subs)} — {[c['id'] for c in subs]}")
@@ -283,7 +283,7 @@ async def _delivery_body(bot, email):
 async def test_traffic_tariff(store_file):
     print("\n▶ 4. Тариф «по трафику»: без срока, лимит трафика из тарифа")
     reset_all()
-    bot = new_bot({"mode": "freekassa"}, store_file)
+    bot = new_bot({"mode": "platega"}, store_file)
     runner = await bot.run_webhook_server()
     email = f"tg-paid-{TG_TG_ID}"
     try:
@@ -301,8 +301,9 @@ async def _traffic_body(bot, email):
     check("в счёте видны трафик и выбранный сервер",
           "50 ГБ" in pay_text and "Стокгольм" in pay_text)
 
-    status, body = await post_fk_notification(order["id"], order["amount_rub"], intid="700003")
-    check("оплата подтверждена", body.strip() == "YES")
+    status, body = await post_platega_callback(order["id"], order["amount_rub"],
+                                               transaction_id="700003")
+    check("оплата подтверждена", status == 200 and body.strip() == "ok")
     client = client_of(email, 1)
     check("подписка создана в выбранной локации", client is not None)
     check("срок не ограничен (expiryTime = 0), пока не израсходован трафик",
@@ -311,7 +312,7 @@ async def _traffic_body(bot, email):
           round(client["totalGB"] / (1024 ** 3)) == 50, str(client["totalGB"]))
     check("устройств — 3 из тарифа", client["limitIp"] == 3, str(client["limitIp"]))
     check("в комментарии клиента — тариф, «без ограничения по времени» и платёж",
-          client["comment"].startswith("traffic_2 без ограничения по времени | fk-"),
+          client["comment"].startswith("traffic_2 без ограничения по времени | platega-"),
           client["comment"])
     key_text = [m["params"]["text"] for m in tg_calls("sendMessage") if "/sub/" in m["params"].get("text", "")][-1]
     check("клиенту сказано, что срок не ограничен",
@@ -325,7 +326,7 @@ async def _traffic_body(bot, email):
 async def test_test_pay_locations(store_file):
     print("\n▶ 5. /test_pay: тариф и сервер")
     reset_all()
-    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1"}, store_file)
+    bot = new_bot({"mode": "platega", "allow_test_pay": "1"}, store_file)
     email = f"tg-paid-{TG_TG_ID}"
 
     await bot.cmd_test_pay(make_message(bot, text="/test_pay"))
@@ -365,7 +366,7 @@ async def test_test_pay_locations(store_file):
 async def test_locations_diag(store_file):
     print("\n▶ 6. Локации в /myid и /panel_debug, привязка по переменным и по названию")
     reset_all()
-    bot = new_bot({"mode": "freekassa", "admin_tools": "1", "allow_test_pay": "1"}, store_file)
+    bot = new_bot({"mode": "platega", "admin_tools": "1", "allow_test_pay": "1"}, store_file)
 
     await bot.cmd_myid(make_message(bot, text="/myid"))
     myid_text = tp._last_api_text()
@@ -419,7 +420,8 @@ async def test_locations_diag(store_file):
 
 async def main():
     runners = []
-    for port, app in ((tp.PANEL_PORT, make_app()), (tp.TG_PORT, tp.make_tg_app())):
+    for port, app in ((tp.PANEL_PORT, make_app()), (tp.TG_PORT, tp.make_tg_app()),
+                      (tp.PLAT_PORT, tp.make_platega_app())):
         runner = web.AppRunner(app)
         await runner.setup()
         await web.TCPSite(runner, "127.0.0.1", port).start()

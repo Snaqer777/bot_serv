@@ -1,10 +1,10 @@
 """
-Тесты оплаты подписок: Telegram Stars, карта через BotFather, ЮKassa и FreeKassa.
+Тесты оплаты подписок: Telegram Stars, карта через BotFather, ЮKassa и Platega.
 
 Каждый сценарий гоняется целиком, без моков внутри логики бота:
   • фейковая панель 3x-ui (panel.py) — куда реально выдаётся ключ;
   • фейковый Telegram Bot API — куда реально уходят счета и сообщения;
-  • фейковый API ЮKassa и эмуляция уведомлений FreeKassa;
+  • фейковый API ЮKassa и фейковый API Platega с её callback-уведомлениями;
   • настоящий HTTP-сервер вебхуков бота (run_webhook_server).
 
 Главная проверка: ключ выдаётся ТОЛЬКО по подтверждённой оплате и ровно один раз.
@@ -45,13 +45,13 @@ TG_PORT = 8745
 YK_PORT = 8746
 WEBHOOK_PORT = 8747
 EGRESS_STUB_PORT = 8751
+PLAT_PORT = 8752
 TG_TG_ID = 4242
 SHOP_ID = "123456"
 SECRET_KEY = "test_secret_key_abc"
-FK_MERCHANT_ID = "14248"
-FK_SECRET1 = "secret_word_one"
-FK_SECRET2 = "secret_word_two"
-FK_ALLOWED_IP = "10.0.0.7"
+PLAT_MERCHANT_ID = "6f0d1c8e-6a17-4a0e-9c46-2f0f0a5b8e21"
+PLAT_SECRET = "platega_api_secret_xyz"
+PLAT_WEBHOOK_PATH = "/platega/webhook"
 
 FAILURES = []
 
@@ -204,6 +204,66 @@ def make_yk_app():
     return app
 
 
+# ---------------- фейковый API Platega ----------------
+
+PLAT = {"transactions": {}, "calls": [], "status_override": None, "break_auth": False}
+
+
+def make_platega_app():
+    app = web.Application()
+
+    def auth_ok(request):
+        return (request.headers.get("X-MerchantId") == PLAT_MERCHANT_ID
+                and request.headers.get("X-Secret") == PLAT_SECRET)
+
+    async def create_transaction(request):
+        raw = await request.text()
+        body = json.loads(raw or "{}")
+        PLAT["calls"].append(("POST /v2/transaction/process", dict(request.headers), body))
+        if PLAT["break_auth"] or not auth_ok(request):
+            return web.json_response({"message": "Unauthorized"}, status=401)
+
+        transaction_id = f"tx-{len(PLAT['transactions']) + 1:03d}-{uuid.uuid4().hex[:8]}"
+        PLAT["transactions"][transaction_id] = {
+            "id": transaction_id,
+            "status": "PENDING",
+            "paymentDetails": dict(body.get("paymentDetails") or {}),
+            "payload": body.get("payload"),
+            "paymentMethod": body.get("paymentMethod"),
+        }
+        return web.json_response({
+            "transactionId": transaction_id,
+            "status": "PENDING",
+            "url": f"http://127.0.0.1:{PLAT_PORT}/pay/{transaction_id}",
+            "expiresIn": "00:15:00",
+            "rate": 1,
+        })
+
+    async def get_transaction(request):
+        tid = request.match_info["id"]
+        PLAT["calls"].append(("GET /transaction", dict(request.headers), tid))
+        if not auth_ok(request):
+            return web.json_response({"message": "Unauthorized"}, status=401)
+        transaction = PLAT["transactions"].get(tid)
+        if transaction is None:
+            return web.json_response({"message": "Not found"}, status=404)
+        result = dict(transaction)
+        if PLAT["status_override"]:
+            result["status"] = PLAT["status_override"]
+        return web.json_response(result)
+
+    async def balance_all(request):
+        PLAT["calls"].append(("GET /balance/all", dict(request.headers), None))
+        if not auth_ok(request):
+            return web.json_response({"message": "Unauthorized"}, status=401)
+        return web.json_response({"RUB": 12345.67})
+
+    app.router.add_post("/v2/transaction/process", create_transaction)
+    app.router.add_get("/transaction/{id}", get_transaction)
+    app.router.add_get("/balance/all", balance_all)
+    return app
+
+
 def yk_succeed(payment_id, amount=None, metadata=None):
     """Помечает платёж в фейковой ЮKassa успешным (как после реальной оплаты)."""
     payment = YK["payments"][payment_id]
@@ -216,75 +276,41 @@ def yk_succeed(payment_id, amount=None, metadata=None):
     return payment
 
 
-# ---------------- FreeKassa: подписи, ссылка и уведомления ----------------
-# Повторяем то, что делает сама FreeKassa: считаем подписи независимо от бота
-# (своими формулами из документации) и шлём уведомления на вебхук бота.
+# ---------------- Platega: API, callback и сверка суммы ----------------
+# Повторяем то, что делает сама Platega: фейковый API принимает транзакции с
+# заголовками X-MerchantId/X-Secret, отдаёт ссылку на оплату и статус, а callback
+# с тем же секретом сообщает боту об оплате.
 
-def fk_amount(value) -> str:
-    """Сумма в том виде, в каком её передаёт бот: без лишних нулей."""
-    price = float(value)
-    return str(int(price)) if price == int(price) else f"{price:.2f}".rstrip("0").rstrip(".")
-
-
-def fk_sign_form(order_id, amount, *, merchant=FK_MERCHANT_ID, secret=FK_SECRET1,
-                 currency="RUB", variant="currency") -> str:
-    """Подпись ссылки на оплату — первым секретным словом (формула из документации FK)."""
-    parts = [merchant, amount]
-    if variant == "plain":
-        parts.append(secret)
-    else:
-        parts += [secret, currency]
-    parts.append(order_id)
-    return hashlib.md5(":".join(parts).encode()).hexdigest()
-
-
-def fk_sign_notify(order_id, amount, *, merchant=FK_MERCHANT_ID, secret=FK_SECRET2) -> str:
-    """Подпись уведомления — вторым секретным словом: md5(магазин:сумма:секрет2:заказ)."""
-    return hashlib.md5(f"{merchant}:{amount}:{secret}:{order_id}".encode()).hexdigest()
-
-
-def fk_params(order_id, amount, *, merchant=FK_MERCHANT_ID, secret=FK_SECRET2, intid="987654",
-              extra=None) -> dict:
-    """Параметры уведомления FreeKassa о платеже (как их шлёт сама FK)."""
-    amount = fk_amount(amount)
-    params = {
-        "MERCHANT_ID": merchant,
-        "AMOUNT": amount,
-        "intid": intid,
-        "MERCHANT_ORDER_ID": order_id,
-        "P_EMAIL": "buyer@example.com",
-        "P_PHONE": "79990001122",
-        "CUR_ID": "1",
-        "payer_account": "411111xxxxxx1111",
-        "commission": "0",
-        "us_tg": str(TG_TG_ID),
+def platega_body(order_id, amount, *, status="CONFIRMED", transaction_id="987654",
+                 currency="RUB", payment_method=11, extra=None) -> dict:
+    """Тело callback Platega об оплате (как его шлёт сама касса)."""
+    price = float(amount)
+    body = {
+        "id": transaction_id,
+        "amount": int(price) if price == int(price) else price,
+        "currency": currency,
+        "status": status,
+        "paymentMethod": payment_method,
+        "payload": order_id,
+        "metadata": {"userId": str(TG_TG_ID), "userName": "tester"},
     }
-    params.update(extra or {})
-    params["SIGN"] = fk_sign_notify(order_id, amount, merchant=merchant, secret=secret)
-    return params
+    body.update(extra or {})
+    return body
 
 
-async def post_fk_notification(order_id, amount, *, method="get", merchant=FK_MERCHANT_ID,
-                               secret=FK_SECRET2, sign=None, intid="987654", extra=None,
-                               headers=None):
-    """Отправляет уведомление FreeKassa на вебхук бота и возвращает (статус, ответ)."""
+async def post_platega_callback(order_id, amount, *, status="CONFIRMED", transaction_id="987654",
+                                merchant=PLAT_MERCHANT_ID, secret=PLAT_SECRET, currency="RUB",
+                                payment_method=11, extra=None, headers=None):
+    """Отправляет callback Platega на вебхук бота и возвращает (статус, тело ответа)."""
     import aiohttp
-    params = fk_params(order_id, amount, merchant=merchant, secret=secret, intid=intid, extra=extra)
-    if sign is not None:
-        params["SIGN"] = sign
-    url = f"http://127.0.0.1:{WEBHOOK_PORT}/freekassa/webhook"
+    body = platega_body(order_id, amount, status=status, transaction_id=transaction_id,
+                        currency=currency, payment_method=payment_method, extra=extra)
+    request_headers = {"X-MerchantId": merchant or "", "X-Secret": secret or ""}
+    request_headers.update(headers or {})
+    url = f"http://127.0.0.1:{WEBHOOK_PORT}{PLAT_WEBHOOK_PATH}"
     async with aiohttp.ClientSession() as s:
-        if method == "post":
-            async with s.post(url, data=params, headers=headers or {}) as resp:
-                return resp.status, await resp.text()
-        async with s.get(url, params=params, headers=headers or {}) as resp:
+        async with s.post(url, json=body, headers=request_headers) as resp:
             return resp.status, await resp.text()
-
-
-def fk_link_params(pay_url) -> dict:
-    """Разбирает ссылку на оплату, которую бот отдал пользователю."""
-    query = urlsplit(pay_url).query
-    return {key: values[0] for key, values in parse_qs(query).items()}
 
 
 # ---------------- инфраструктура ----------------
@@ -302,15 +328,13 @@ def new_bot(env, store_file, admins=None):
         "YOOKASSA_API_URL": env.get("api_url") or f"http://127.0.0.1:{YK_PORT}/v3",
         "YOOKASSA_TEST": "1",
         "YOOKASSA_VAT_CODE": env.get("vat", "1"),
-        "FREEKASSA_MERCHANT_ID": env.get("merchant", FK_MERCHANT_ID),
-        "FREEKASSA_SECRET1": env.get("secret1", FK_SECRET1),
-        "FREEKASSA_SECRET2": env.get("secret2", FK_SECRET2),
-        "FREEKASSA_PAY_URL": env.get("pay_url") or "https://pay.freekassa.ru/",
-        "FREEKASSA_CURRENCY": env.get("currency") or "RUB",
-        "FREEKASSA_SIGN_VARIANT": env.get("sign_variant"),
-        "FREEKASSA_TEST": env.get("fk_test"),
-        "FREEKASSA_CHECK_IP": env.get("check_ip"),
-        "FREEKASSA_ALLOWED_IPS": env.get("allowed_ips"),
+        "PLATEGA_MERCHANT_ID": env.get("merchant", PLAT_MERCHANT_ID),
+        "PLATEGA_SECRET": env.get("secret", PLAT_SECRET),
+        "PLATEGA_API_URL": env.get("api_url") or f"http://127.0.0.1:{PLAT_PORT}",
+        "PLATEGA_CURRENCY": env.get("currency") or "RUB",
+        "PLATEGA_METHOD": env.get("method"),
+        "PLATEGA_RETURN_URL": env.get("return_url"),
+        "PLATEGA_FAILED_URL": env.get("failed_url"),
         "PUBLIC_BASE_URL": f"http://127.0.0.1:{WEBHOOK_PORT}",
         "PAYMENTS_ALLOW_TEST_PAY": env.get("allow_test_pay"),
         "PROMO_ENABLED": env.get("promo_enabled"),
@@ -384,6 +408,10 @@ def reset_all():
     TG["calls"].clear()
     TG["fail_send"].clear()
     TG["balance"] = 0
+    PLAT["transactions"].clear()
+    PLAT["calls"].clear()
+    PLAT["status_override"] = None
+    PLAT["break_auth"] = False
     YK["payments"].clear()
     YK["webhooks"].clear()
     YK["calls"].clear()
@@ -397,7 +425,7 @@ def reset_all():
 async def test_mode_detection(store_file):
     print("\n▶ 1. Определение режима оплаты по переменным окружения")
     bot = new_bot({"mode": None, "provider_token": None, "shop_id": None, "secret_key": None,
-                   "merchant": None, "secret1": None, "secret2": None}, store_file)
+                   "merchant": None, "secret": None}, store_file)
     check("по умолчанию — Telegram Stars", bot.PAYMENTS_MODE == "stars" and bot.payments_enabled())
 
     bot = new_bot({"mode": None, "provider_token": "381764678:TEST:12345", "shop_id": None, "secret_key": None}, store_file)
@@ -408,8 +436,8 @@ async def test_mode_detection(store_file):
     check("test_-ключ распознан как тестовый магазин", bot.YOOKASSA_TEST is True)
 
     bot = new_bot({"mode": None, "provider_token": None, "shop_id": None, "secret_key": None}, store_file)
-    check("магазин FreeKassa без PAYMENTS_MODE → режим freekassa", bot.PAYMENTS_MODE == "freekassa")
-    check("FreeKassa распознана как настроенная", bot.freekassa_configured() is True)
+    check("ключи Platega без PAYMENTS_MODE → режим platega", bot.PAYMENTS_MODE == "platega")
+    check("Platega распознана как настроенная", bot.platega_configured() is True)
 
     bot = new_bot({"mode": "off", "provider_token": "x", "shop_id": SHOP_ID, "secret_key": SECRET_KEY}, store_file)
     check("PAYMENTS_MODE=off выключает оплату", not bot.payments_enabled())
@@ -417,8 +445,9 @@ async def test_mode_detection(store_file):
     bot = new_bot({"mode": "stars", "provider_token": None, "shop_id": SHOP_ID, "secret_key": SECRET_KEY}, store_file)
     check("явный PAYMENTS_MODE=stars приоритетнее ключей ЮKassa", bot.PAYMENTS_MODE == "stars")
 
-    bot = new_bot({"mode": "freekassa", "provider_token": None, "shop_id": None, "secret_key": None}, store_file)
-    check("явный PAYMENTS_MODE=freekassa выбран", bot.PAYMENTS_MODE == "freekassa")
+    bot = new_bot({"mode": "platega", "provider_token": None, "shop_id": None, "secret_key": None}, store_file)
+    check("явный PAYMENTS_MODE=platega выбран", bot.PAYMENTS_MODE == "platega")
+    check("режим Platega узнаётся по названию", "Platega" in bot.payments_mode_title())
 
 
 async def test_stars_flow(store_file):
@@ -789,61 +818,89 @@ async def test_yookassa_oauth_webhook(store_file):
             await runner.cleanup()
 
 
-# ---------------- сценарии: FreeKassa ----------------
+# ---------------- сценарии: Platega ----------------
 
-async def test_freekassa_signatures():
-    print("\n▶ 6. FreeKassa: подписи, ссылка на оплату и сверка суммы")
-    store_file = os.path.join(tempfile.mkdtemp(prefix="fk-sign-"), "payments.json")
+async def test_platega_api_and_amounts():
+    print("\n▶ 6. Platega: авторизация, создание транзакции и сверка суммы")
+    store_file = os.path.join(tempfile.mkdtemp(prefix="plat-api-"), "payments.json")
     reset_all()
-    bot = new_bot({"mode": "freekassa"}, store_file)
+    bot = new_bot({"mode": "platega"}, store_file)
 
-    check("режим FreeKassa и магазин из переменных",
-          bot.PAYMENTS_MODE == "freekassa" and bot.freekassa_configured() is True)
+    check("режим Platega и ключи из переменных",
+          bot.PAYMENTS_MODE == "platega" and bot.platega_configured() is True)
+    check("адрес API взят из переменной PLATEGA_API_URL",
+          bot.PLATEGA_API_URL == f"http://127.0.0.1:{PLAT_PORT}")
+    check("валюта по умолчанию — RUB", bot.PLATEGA_CURRENCY == "RUB")
+    check("способ оплаты по умолчанию выбирает плательщик (PLATEGA_METHOD пуст)",
+          bot.PLATEGA_METHOD is None)
+    headers = bot.platega_headers()
+    check("в запросах уходят заголовки X-MerchantId и X-Secret",
+          headers.get("X-MerchantId") == PLAT_MERCHANT_ID and headers.get("X-Secret") == PLAT_SECRET)
 
     order = bot.new_order(TG_TG_ID, BASIC)
     price = bot.TARIFFS[BASIC]["price"]
-    link = bot.freekassa_payment_url(order)
-    params = fk_link_params(link)
-    check("ссылка ведёт на платёжную страницу FreeKassa", link.startswith(bot.FREEKASSA_PAY_URL + "/?"))
-    check("в ссылке есть магазин, номер заказа, сумма и валюта",
-          params.get("m") == FK_MERCHANT_ID and params.get("o") == order["id"]
-          and params.get("oa") == str(price) and params.get("currency") == "RUB", str(params))
-    check("подпись ссылки совпадает с формулой FreeKassa (md5(m:oa:секрет1:валюта:o))",
-          params.get("s") == fk_sign_form(order["id"], str(price)))
-    check("в ссылке передан telegram_id (вернётся в уведомлении)",
-          params.get("us_tg") == str(TG_TG_ID))
-    check("язык страницы оплаты — русский", params.get("lang") == "ru")
+    data = await bot.platega_create_payment(order)
+    check("API вернула транзакцию и ссылку на оплату",
+          bool(data.get("transactionId")) and bool(bot.platega_payment_url(data)), str(data)[:90])
+    check("ссылка ведёт на платёжную страницу Platega",
+          bot.platega_payment_url(data).startswith(f"http://127.0.0.1:{PLAT_PORT}/pay/"))
+    check("у транзакции статус PENDING и срок действия ссылки",
+          data.get("status") == "PENDING" and data.get("expiresIn") == "00:15:00")
+
+    method, sent_headers, body = [c for c in PLAT["calls"] if c[0].startswith("POST")][-1]
+    check("бот обратился к /v2/transaction/process", method == "POST /v2/transaction/process")
+    check("в запросе переданы наши заголовки авторизации",
+          sent_headers.get("X-MerchantId") == PLAT_MERCHANT_ID
+          and sent_headers.get("X-Secret") == PLAT_SECRET)
+    check("сумма и валюта переданы в paymentDetails",
+          body["paymentDetails"] == {"amount": price, "currency": "RUB"}, str(body.get("paymentDetails")))
+    check("номер заказа передан в payload и orderId (виден в кабинете Platega)",
+          body.get("payload") == order["id"] and body.get("orderId") == order["id"])
+    check("в описании платежа — название тарифа",
+          bot.TARIFFS[BASIC]["name"] in str(body.get("description")), str(body.get("description"))[:60])
+    check("в metadata передан Telegram ID покупателя",
+          str((body.get("metadata") or {}).get("userId")) == str(TG_TG_ID), str(body.get("metadata")))
+    check("return и failedUrl заданы (клиент возвращается в бота)",
+          str(body.get("return", "")).startswith(("https://t.me/", "http"))
+          and body.get("return") == body.get("failedUrl"), str(body.get("return")))
+    check("method не передаётся, если PLATEGA_METHOD не задан", "paymentMethod" not in body)
 
     reset_all()
-    bot_plain = new_bot({"mode": "freekassa", "sign_variant": "plain"}, store_file)
-    order_plain = bot_plain.new_order(TG_TG_ID, BASIC)
-    plain_params = fk_link_params(bot_plain.freekassa_payment_url(order_plain))
-    check("старая формула (без валюты) тоже поддерживается",
-          plain_params.get("s") == fk_sign_form(order_plain["id"], str(price), variant="plain"))
+    fixed = new_bot({"mode": "platega", "method": "11"}, store_file)
+    fixed_data = await fixed.platega_create_payment(fixed.new_order(TG_TG_ID, BASIC))
+    _, _, fixed_body = [c for c in PLAT["calls"] if c[0].startswith("POST")][-1]
+    check("PLATEGA_METHOD=11 фиксирует способ оплаты (карточный эквайринг)",
+          fixed_body.get("paymentMethod") == 11 and bool(fixed_data.get("url")),
+          str(fixed_body.get("paymentMethod")))
 
-    probe_order = f"{BASIC}-1-2-ab12cd"
-    probe = {"MERCHANT_ID": FK_MERCHANT_ID, "AMOUNT": str(price), "MERCHANT_ORDER_ID": probe_order}
-    check("подпись уведомления = md5(магазин:сумма:секрет2:заказ)",
-          bot.freekassa_sign_notify(probe) == fk_sign_notify(probe_order, price))
-    check("подпись уведомления не совпадает с чужой подписью",
-          bot.freekassa_sign_notify(probe) != fk_sign_notify(probe_order, price, secret="чужой"))
-    check("подписи ссылки и уведомления считаются разными словами",
-          bot.freekassa_sign_form(order) != bot.freekassa_sign_notify(
-              {"MERCHANT_ID": FK_MERCHANT_ID, "AMOUNT": str(price), "MERCHANT_ORDER_ID": order["id"]}))
+    # Суммы: целые — без «.0», копейки — с двумя знаками
+    check("целая сумма уходит как int (249, а не 249.0)",
+          bot.platega_amount({"amount_rub": 249}) == 249
+          and isinstance(bot.platega_amount({"amount_rub": 249}), int))
+    check("дробная сумма округляется до копеек",
+          bot.platega_amount({"amount_rub": 150.5}) == 150.5)
+    check("сумма из callback сверяется в копейках",
+          bot.platega_amount_matches(order, f"{price}.00") is True)
+    check("другая сумма не проходит", bot.platega_amount_matches(order, 1) is False)
+    check("мусор вместо суммы не проходит", bot.platega_amount_matches(order, "abc") is False)
 
-    check("целая сумма передаётся без лишних нулей", bot.freekassa_amount({"amount_rub": 249}) == "249")
-    check("дробная сумма передаётся без хвостовых нулей",
-          bot.freekassa_amount({"amount_rub": 150.50}) == "150.5")
-    check("сумма из уведомления сверяется в копейках",
-          bot.freekassa_amount_matches(order, f"{price}.00") is True)
-    check("другая сумма не проходит", bot.freekassa_amount_matches(order, "1") is False)
-    check("мусор вместо суммы не проходит", bot.freekassa_amount_matches(order, "abc") is False)
+    # Заголовки callback — единственная защита, поэтому сравниваем оба значения
+    check("верные X-MerchantId/X-Secret принимаются",
+          bot.platega_credentials_valid(PLAT_MERCHANT_ID, PLAT_SECRET) is True)
+    check("чужой Merchant ID отклоняется",
+          bot.platega_credentials_valid("чужой-магазин", PLAT_SECRET) is False)
+    check("чужой секрет отклоняется",
+          bot.platega_credentials_valid(PLAT_MERCHANT_ID, "чужой_секрет") is False)
+    check("пустые заголовки отклоняются", bot.platega_credentials_valid("", "") is False)
+    check("без настроенных ключей не принимается ничего",
+          new_bot({"mode": "platega", "merchant": None, "secret": None},
+                  store_file).platega_credentials_valid(PLAT_MERCHANT_ID, PLAT_SECRET) is False)
 
 
-async def test_freekassa_flow(store_file):
-    print("\n▶ 7. FreeKassa: ссылка на оплату → уведомление → выдача ключа")
+async def test_platega_flow(store_file):
+    print("\n▶ 7. Platega: ссылка на оплату → callback → выдача ключа")
     reset_all()
-    bot = new_bot({"mode": "freekassa"}, store_file)
+    bot = new_bot({"mode": "platega"}, store_file)
     runner = await bot.run_webhook_server()
     email = f"tg-paid-{TG_TG_ID}"
 
@@ -852,204 +909,261 @@ async def test_freekassa_flow(store_file):
         basic_price = bot.TARIFFS[BASIC]["price"]
         message = [m for m in tg_calls("sendMessage") if "Оплата тарифа" in m["params"].get("text", "")][-1]["params"]
         markup = json.dumps(message["reply_markup"], ensure_ascii=False)
-        check("кнопка «Оплатить» ведёт на страницу FreeKassa", "pay.freekassa.ru" in markup)
-        check("в ссылке нет двойного слэша перед параметрами",
-              "pay.freekassa.ru//?" not in markup and "ru/?m=" in markup,
-              markup[markup.find("pay.freekassa.ru"):][:48])
+        check("кнопка «Оплатить» ведёт на платёжную страницу Platega",
+              f"http://127.0.0.1:{PLAT_PORT}/pay/" in markup)
         check("есть кнопка «Проверить оплату»", "checkpay_" in markup)
         check("есть кнопка «Отменить заказ»", "cancelorder_" in markup)
         check(f"в сообщении видна сумма ({basic_price} ₽)", f"{basic_price} ₽" in message.get("text", ""))
+        check("в сообщении показан срок действия ссылки", "00:15:00" in message.get("text", ""))
 
         order = [o for o in bot.payment_store.orders.values()][-1]
         order_id = order["id"]
-        check("заказ сохранён со ссылкой на оплату и валютой RUB",
-              order["payment_url"].startswith(bot.FREEKASSA_PAY_URL) and order["currency"] == "RUB")
+        transaction_id = str(order["payment_id"])
+        check("заказ сохранён с id транзакции Platega, ссылкой и валютой RUB",
+              transaction_id.startswith("tx-") and order["currency"] == "RUB"
+              and order["payment_url"].startswith(f"http://127.0.0.1:{PLAT_PORT}/pay/"))
         check("ключ до оплаты не выдан", panel_client(email) is None)
 
-        # Уведомление с поддельной подписью
-        status, body = await post_fk_notification(order_id, basic_price, sign="deadbeef")
-        check("уведомление с неверной подписью не подтверждается",
-              status == 200 and body.strip() == "no", body[:40])
-        check("поддельное уведомление ключ не выдало", panel_client(email) is None)
+        # Чужие заголовки — уведомление не принимается
+        status, body = await post_platega_callback(order_id, basic_price, secret="чужой_секрет")
+        check("callback с чужим X-Secret отклонён (401)", status == 401, f"{status} {body[:40]}")
+        check("поддельный callback ключ не выдал", panel_client(email) is None)
 
-        # Уведомление по неизвестному заказу
-        status, body = await post_fk_notification("unknown-order-777", basic_price)
-        check("уведомление по неизвестному заказу отклонено", body.strip() == "no")
+        # Неизвестный заказ
+        status, body = await post_platega_callback("unknown-order-777", basic_price)
+        check("callback по неизвестному заказу отклонён (404)", status == 404, f"{status} {body[:40]}")
 
-        # Настоящая оплата (метод GET, как по умолчанию в кабинете FK)
-        status, body = await post_fk_notification(order_id, basic_price, intid="555111")
-        check("уведомление FreeKassa принято и подтверждено «YES»",
-              status == 200 and body.strip() == "YES", body[:40])
+        # Промежуточный статус PENDING: ждём, ничего не выдаём
+        status, body = await post_platega_callback(order_id, basic_price, status="PENDING",
+                                                   transaction_id=transaction_id)
+        check("статус PENDING принят, но ключ не выдан", status == 200 and panel_client(email) is None,
+              f"{status} {body[:40]}")
+
+        # Настоящая оплата
+        status, body = await post_platega_callback(order_id, basic_price, transaction_id=transaction_id)
+        check("callback со статусом CONFIRMED принят (200)", status == 200, f"{status} {body[:40]}")
         client = panel_client(email)
         check("ключ выдан после подтверждённой оплаты", client is not None)
         check("срок 30 дней", client and 29 <= days_left(client) <= 30,
               f"{days_left(client) if client else '—'} дн.")
-        check("в комментарии клиента — номер операции FreeKassa",
-              client and "fk-555111" in str(client.get("comment")), str((client or {}).get("comment")))
+        check("в комментарии клиента — id транзакции Platega",
+              client and f"platega-{transaction_id}" in str(client.get("comment")),
+              str((client or {}).get("comment")))
         saved = await bot.payment_store.get(order_id)
-        check("заказ помечен оплаченным, сохранён intid",
-              saved["status"] == "paid" and saved.get("intid") == "555111")
-        check("номер операции записан как платёж заказа",
-              bot.order_charge_id(saved) == "fk-555111", bot.order_charge_id(saved))
+        check("заказ помечен оплаченным, id транзакции сохранён",
+              saved["status"] == "paid" and saved.get("payment_id") == transaction_id)
+        check("id транзакции записан как платёж заказа",
+              bot.order_charge_id(saved) == f"platega-{transaction_id}", bot.order_charge_id(saved))
+        check("способ оплаты из callback сохранён в заказе",
+              str(saved.get("payment_method")) == "11", str(saved.get("payment_method")))
 
-        # Дубль уведомления (FK повторяет, пока не получит YES)
-        status, body = await post_fk_notification(order_id, basic_price, intid="555111")
-        check("повтор уведомления снова подтверждается «YES»", body.strip() == "YES")
+        # Повтор callback (Platega повторяет, если не получила 200)
+        status, body = await post_platega_callback(order_id, basic_price, transaction_id=transaction_id)
+        check("повтор callback снова подтверждается (200)", status == 200 and body.strip() == "ok", body[:40])
         check("повтор не продлевает подписку", 29 <= days_left(panel_client(email)) <= 30)
         check("повтор не создаёт второго клиента",
               len([e for e in PANEL["clients"] if e == email]) == 1)
 
-        # Вторая оплата — методом POST (в кабинете FK переключается одной галочкой)
+        # Вторая оплата — другой тариф
         expiry_first = int(panel_client(email)["expiryTime"])
         await bot.start_checkout(TG_TG_ID, TG_TG_ID, FAMILY)
         order2 = [o for o in bot.payment_store.orders.values()][-1]
-        status, body = await post_fk_notification(
-            order2["id"], bot.TARIFFS[FAMILY]["price"], method="post", intid="555222")
-        check("уведомление методом POST обрабатывается так же", body.strip() == "YES")
+        status, body = await post_platega_callback(
+            order2["id"], bot.TARIFFS[FAMILY]["price"], transaction_id=str(order2["payment_id"]))
+        check("вторая оплата принята", status == 200, f"{status} {body[:40]}")
         family_days = bot.TARIFFS[FAMILY]["days"]
         added = round((int(panel_client(email)["expiryTime"]) - expiry_first) / 86_400_000, 1)
         check(f"вторая оплата продлила подписку на {family_days} дней", added == family_days, f"+{added} дн.")
 
-        # Подмена суммы и чужой магазин
+        # Подмена суммы, валюты и возврат средств
         await bot.start_checkout(TG_TG_ID, TG_TG_ID, PREMIUM)
         order3 = [o for o in bot.payment_store.orders.values()][-1]
         expiry_before = int(panel_client(email)["expiryTime"])
-        status, body = await post_fk_notification(order3["id"], 1)
-        check("подмена суммы → ключ не выдан и «no»",
-              body.strip() == "no" and int(panel_client(email)["expiryTime"]) == expiry_before)
-        status, body = await post_fk_notification(order3["id"], bot.TARIFFS[PREMIUM]["price"],
-                                                 merchant="999999")
-        check("уведомление другого магазина отклонено", body.strip() == "no")
-        status, body = await post_fk_notification(order3["id"], bot.TARIFFS[PREMIUM]["price"],
-                                                 secret="чужое_секретное_слово")
-        check("подпись чужим секретным словом отклонена", body.strip() == "no")
-        check("подписка после подделок не изменилась",
-              int(panel_client(email)["expiryTime"]) == expiry_before)
+        status, body = await post_platega_callback(order3["id"], 1,
+                                                   transaction_id=str(order3["payment_id"]))
+        check("подмена суммы → ключ не выдан и отказ 400",
+              status == 400 and int(panel_client(email)["expiryTime"]) == expiry_before,
+              f"{status} {body[:40]}")
+        status, body = await post_platega_callback(order3["id"], bot.TARIFFS[PREMIUM]["price"],
+                                                   currency="USD",
+                                                   transaction_id=str(order3["payment_id"]))
+        check("чужая валюта отклонена", status == 400 and body.strip() != "ok", f"{status} {body[:40]}")
+        status, body = await post_platega_callback(order2["id"], bot.TARIFFS[FAMILY]["price"],
+                                                   status="CHARGEBACKED",
+                                                   transaction_id=str(order2["payment_id"]))
+        charged_back = await bot.payment_store.get(order2["id"])
+        check("статус CHARGEBACKED принят и помечен в заказе",
+              status == 200 and charged_back.get("chargeback") is True, f"{status} {body[:40]}")
+        check("при возврате средств подписку автоматически не снимают",
+              panel_client(email) is not None)
+        check("админу отправлено предупреждение о возврате",
+              any("возврат средств по оплаченному заказу" in m["params"].get("text", "").lower()
+                  for m in tg_calls("sendMessage")),
+              json.dumps([m["params"].get("text", "")[:40] for m in tg_calls("sendMessage")],
+                         ensure_ascii=False)[:120])
 
-        # Кнопка «Проверить оплату»: у FreeKassa нет запроса статуса — ждём уведомление
-        cb = _FakeCallback(bot, f"checkpay_{order3['id']}")
+        # Отмена платежа на стороне Platega
+        status, body = await post_platega_callback(order3["id"], bot.TARIFFS[PREMIUM]["price"],
+                                                   status="CANCELED",
+                                                   transaction_id=str(order3["payment_id"]))
+        canceled = await bot.payment_store.get(order3["id"])
+        check("статус CANCELED переводит заказ в «отменён»",
+              status == 200 and canceled["status"] == "canceled", f"{status} {canceled['status']}")
+
+        # Кнопка «Проверить оплату»: бот сам спрашивает статус у Platega
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, PREMIUM)
+        order4 = [o for o in bot.payment_store.orders.values()][-1]
+        PLAT["status_override"] = "PENDING"
+        cb = _FakeCallback(bot, f"checkpay_{order4['id']}")
         await bot.cb_check_payment(cb)
-        check("кнопка объясняет, что статус приходит уведомлением",
-              any("FreeKassa" in t and "уведомлени" in t.lower() for t in cb.message.sent),
-              json.dumps(cb.message.sent, ensure_ascii=False)[:80])
-        check("кнопка не выдала ключ вместо оплаты",
-              int(panel_client(email)["expiryTime"]) == expiry_before)
+        check("пока Platega не подтвердила — бот ждёт и не выдаёт ключ",
+              int(panel_client(email)["expiryTime"]) == expiry_before
+              and any("Platega" in t for t in cb.message.sent),
+              json.dumps(cb.message.sent, ensure_ascii=False)[:90])
+        check("статус запрошен у API (GET /transaction/{id})",
+              any(c[0] == "GET /transaction" for c in PLAT["calls"]))
 
-        # Оплата третьего заказа всё же проходит и продлевает подписку
-        status, body = await post_fk_notification(order3["id"], bot.TARIFFS[PREMIUM]["price"],
-                                                 intid="555333")
-        check("оплата третьего заказа подтверждена", body.strip() == "YES")
+        PLAT["status_override"] = "CONFIRMED"
+        cb = _FakeCallback(bot, f"checkpay_{order4['id']}")
+        await bot.cb_check_payment(cb)
         premium_days = bot.TARIFFS[PREMIUM]["days"]
         added = round((int(panel_client(email)["expiryTime"]) - expiry_before) / 86_400_000, 1)
-        check(f"третья оплата продлила подписку на {premium_days} дней", added == premium_days, f"+{added} дн.")
+        check(f"подтверждение через кнопку выдаёт ключ и продлевает подписку на {premium_days} дней",
+              added == premium_days, f"+{added} дн.")
+        PLAT["status_override"] = None
     finally:
         if runner is not None:
             await runner.cleanup()
 
 
-async def test_freekassa_ip_check_and_errors(store_file):
-    print("\n▶ 8. FreeKassa: проверка IP уведомлений и понятные ошибки")
+async def test_platega_credentials_and_errors(store_file):
+    print("\n▶ 8. Platega: защита callback и понятные ошибки")
     reset_all()
-    bot = new_bot({"mode": "freekassa"}, store_file)
+    bot = new_bot({"mode": "platega"}, store_file)
     runner = await bot.run_webhook_server()
     email = f"tg-paid-{TG_TG_ID}"
 
     try:
-        check("по умолчанию проверка IP выключена (Railway прячет IP за прокси)",
-              bot.FREEKASSA_CHECK_IP is False)
-        check("белый список IP FreeKassa задан",
-              "168.119.157.136" in bot.FREEKASSA_ALLOWED_IPS and "136.243.38.147" in bot.FREEKASSA_ALLOWED_IPS)
+        # Callback без заголовков авторизации — отказ ещё до обращения к журналу заказов
+        status, body = await post_platega_callback("unknown", 100, merchant="", secret="")
+        check("callback без X-MerchantId/X-Secret отклонён (401)", status == 401, f"{status} {body[:40]}")
+
+        status, body = await post_platega_callback("unknown", 100, merchant=PLAT_MERCHANT_ID, secret="")
+        check("callback без X-Secret отклонён", status == 401)
+
+        status, body = await post_platega_callback("unknown", 100, merchant="", secret=PLAT_SECRET)
+        check("callback без X-MerchantId отклонён", status == 401)
+
+        status, body = await post_platega_callback("unknown", 100, merchant=PLAT_MERCHANT_ID,
+                                                   secret=PLAT_SECRET)
+        check("callback с верными заголовками, но неизвестным заказом → 404", status == 404)
 
         await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         order = [o for o in bot.payment_store.orders.values()][-1]
-        status, body = await post_fk_notification(
-            order["id"], bot.TARIFFS[BASIC]["price"], headers={"X-Real-IP": "8.8.8.8"})
-        check("без проверки IP уведомление принимается с любого адреса", body.strip() == "YES")
+        status, body = await post_platega_callback(order["id"], bot.TARIFFS[BASIC]["price"],
+                                                   extra={"id": "tx-чужая"})
+        check("верные заголовки + наша сумма → оплата принята", status == 200 and body.strip() == "ok",
+              f"{status} {body[:40]}")
         check("ключ выдан", panel_client(email) is not None)
     finally:
         await runner.cleanup()
 
-    # Проверка IP включена: доверяем только белым адресам
+    # Платёжная система недоступна: понятный текст вместо трейсбека
     reset_all()
-    ip_store = os.path.join(tempfile.mkdtemp(prefix="fk-ip-"), "payments.json")
-    bot2 = new_bot({"mode": "freekassa", "check_ip": "1",
-                    "allowed_ips": f"{FK_ALLOWED_IP},168.119.157.136"}, ip_store)
-    runner2 = await bot2.run_webhook_server()
+    broken_store = os.path.join(tempfile.mkdtemp(prefix="plat-broken-"), "payments.json")
+    bot2 = new_bot({"mode": "platega", "api_url": "http://127.0.0.1:9"}, broken_store)
     try:
-        check("проверка IP включается переменной", bot2.FREEKASSA_CHECK_IP is True)
         await bot2.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
-        order2 = [o for o in bot2.payment_store.orders.values()][-1]
-        status, body = await post_fk_notification(
-            order2["id"], bot2.TARIFFS[BASIC]["price"], headers={"X-Real-IP": "8.8.8.8"})
-        check("уведомление с чужого IP отклонено (403)", status == 403 and body.startswith("no"), body[:30])
-        check("с чужого IP ключ не выдан", panel_client(email) is None)
-        status, body = await post_fk_notification(
-            order2["id"], bot2.TARIFFS[BASIC]["price"],
-            headers={"X-Forwarded-For": f"{FK_ALLOWED_IP}, 172.16.0.1"}, intid="556677")
-        check("уведомление с разрешённого IP принято (берём X-Forwarded-For)",
-              body.strip() == "YES", body[:30])
-        check("ключ выдан после уведомления с белого IP", panel_client(email) is not None)
-    finally:
-        await runner2.cleanup()
+        check("при недоступном API ссылка не выдаётся", False)
+    except bot2.PaymentError as exc:
+        text = str(exc)
+        check("сказано, что Platega не ответила, и предложено повторить",
+              "Platega" in text and ("повтор" in text or "минуту" in text), " ".join(text.split())[:90])
+    failed = [o for o in bot2.payment_store.orders.values()]
+    check("неудачный заказ помечен failed и не висит в ожидании",
+          bool(failed) and all(o["status"] == "failed" for o in failed), str([o["status"] for o in failed]))
 
-    # Без магазина и секретных слов ссылка не формируется — вместо трейсбека понятный текст
+    # Ключи не заданы — подсказка, где их взять
     reset_all()
-    bot3 = new_bot({"mode": "freekassa", "merchant": None, "secret1": None, "secret2": None}, store_file)
+    bot3 = new_bot({"mode": "platega", "merchant": None, "secret": None}, broken_store)
     try:
         await bot3.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         check("без ключей магазина ссылка не выдаётся", False)
     except bot3.PaymentError as exc:
         text = str(exc)
         check("подсказано, какие переменные задать",
-              all(name in text for name in ("FREEKASSA_MERCHANT_ID", "FREEKASSA_SECRET1", "FREEKASSA_SECRET2")),
+              all(name in text for name in ("PLATEGA_MERCHANT_ID", "PLATEGA_SECRET")),
               " ".join(text.split())[:80])
-        check("подсказана команда проверки настроек", "/freekassa_check" in text)
+        check("подсказана команда проверки настроек", "/platega_check" in text)
+        check("подсказано, где взять ключи в кабинете Platega", "Интеграция" in text or "Настройки" in text)
 
+    # Отказ авторизации на стороне кассы
     reset_all()
-    bot4 = new_bot({"mode": "freekassa", "secret2": None}, store_file)
-    answer, note = await bot4.process_freekassa_notification(
-        {"MERCHANT_ID": FK_MERCHANT_ID, "AMOUNT": "249", "MERCHANT_ORDER_ID": "basic-1-2-ab12cd",
-         "SIGN": fk_sign_notify("basic-1-2-ab12cd", 249)})
-    check("без второго секретного слова уведомление честно не подтверждается",
-          answer == "no" and "FREEKASSA_SECRET2" in note, note)
+    bot4 = new_bot({"mode": "platega", "secret": "неверный_ключ"}, broken_store)
+    PLAT["break_auth"] = True
+    try:
+        await bot4.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
+        check("при отказе кассы ссылка не выдаётся", False)
+    except bot4.PaymentError as exc:
+        text = str(exc)
+        check("отказ авторизации объяснён понятным текстом",
+              "Platega" in text and "401" in text, " ".join(text.split())[:90])
+    finally:
+        PLAT["break_auth"] = False
+
+    # Статус транзакции: ошибки API превращаются в понятный текст, а не в трейсбек
+    status_bot = new_bot({"mode": "platega"}, broken_store)
+    try:
+        await status_bot.platega_transaction("tx-none")
+        check("неизвестная транзакция: понятная ошибка вместо падения", False)
+    except status_bot.PaymentError as exc:
+        check("неизвестная транзакция: понятная ошибка вместо падения",
+              "Platega" in str(exc), str(exc)[:60])
+
+    unknown = await status_bot.recheck_order_payment(
+        {"id": "x-1", "mode": "platega", "payment_id": "tx-none", "amount_rub": 70,
+         "currency": "RUB", "tg_id": TG_TG_ID})
+    check("кнопка «Проверить оплату» на неизвестном платеже не выдаёт ключ",
+          unknown[0] == "error", str(unknown))
 
 
-async def test_freekassa_test_mode_and_diagnostics(store_file):
-    print("\n▶ 8б. FreeKassa: тестовый режим и диагностика")
+async def test_platega_diagnostics(store_file):
+    print("\n▶ 8б. Platega: диагностика в /panel_debug и /payments")
     reset_all()
-    bot = new_bot({"mode": "freekassa", "fk_test": "1", "admin_tools": "1"}, store_file)
-    check("тестовый режим распознан", bot.FREEKASSA_TEST is True)
-    check("в тестовом режиме проверочные команды включаются сами", bot.test_pay_enabled() is True)
+    bot = new_bot({"mode": "platega", "admin_tools": "1"}, store_file)
 
     runner = await bot.run_webhook_server()
     try:
         await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
-        text = [m["params"].get("text", "") for m in tg_calls("sendMessage")][-1]
-        check("в счёте есть пометка тестового режима", "Тестовый режим FreeKassa" in text, text[-90:])
-
         order = [o for o in bot.payment_store.orders.values()][-1]
-        status, body = await post_fk_notification(order["id"], order["amount_rub"], intid="700001")
-        check("в тестовом режиме ключ тоже выдаётся",
-              body.strip() == "YES" and panel_client(f"tg-paid-{TG_TG_ID}") is not None)
+        status, body = await post_platega_callback(order["id"], order["amount_rub"],
+                                                   transaction_id=str(order["payment_id"]))
+        check("оплата принята, ключ выдан",
+              status == 200 and panel_client(f"tg-paid-{TG_TG_ID}") is not None, f"{status} {body[:30]}")
 
         stats = bot.payment_store.stats()
-        check("оплата FreeKassa попала в рублёвую выручку",
+        check("оплата Platega попала в рублёвую выручку",
               stats["paid_count"] == 1 and stats["rub"] == order["amount_rub"], str(stats))
 
         msg = make_message(bot, text="/panel_debug")
         await bot.cmd_panel_debug(msg)
         diag = _last_api_text()
-        check("/panel_debug: показан магазин FK", FK_MERCHANT_ID in diag)
-        check("/panel_debug: показан тестовый режим", "тестовый режим" in diag)
-        check("/panel_debug: показан адрес уведомлений", "/freekassa/webhook" in diag)
-        check("/panel_debug: показана валюта и формула подписи", "RUB" in diag and "currency" in diag)
-        check("/panel_debug: подсказана проверка без оплаты", "/freekassa_check" in diag)
+        check("/panel_debug: показан Merchant ID", PLAT_MERCHANT_ID in diag)
+        check("/panel_debug: показан адрес API и валюта",
+              f"http://127.0.0.1:{PLAT_PORT}" in diag and "RUB" in diag)
+        check("/panel_debug: показан способ оплаты", "плательщик" in diag.lower())
+        check("/panel_debug: показан Callback URL",
+              f"http://127.0.0.1:{WEBHOOK_PORT}{PLAT_WEBHOOK_PATH}" in diag)
+        check("/panel_debug: сказано про защиту заголовками",
+              "X-MerchantId" in diag and "X-Secret" in diag)
+        check("/panel_debug: подсказана проверка без оплаты", "/platega_check" in diag)
 
         msg = make_message(bot, text="/payments")
         await bot.cmd_payments(msg)
         payments_text = _last_api_text()
-        check("/payments: показан режим FreeKassa", "FreeKassa" in payments_text)
-        check("/payments: показан магазин", FK_MERCHANT_ID in payments_text)
+        check("/payments: показан режим Platega", "Platega" in payments_text)
+        check("/payments: показан Merchant ID", PLAT_MERCHANT_ID in payments_text)
+        check("/payments: показан Callback URL", PLAT_WEBHOOK_PATH in payments_text)
         check("/payments: показана выручка в рублях", "Выручка" in payments_text)
     finally:
         await runner.cleanup()
@@ -1058,15 +1172,16 @@ async def test_freekassa_test_mode_and_diagnostics(store_file):
 async def test_duplicate_guard(store_file):
     print("\n▶ 7б. Защита от повторной выдачи по комментарию клиента")
     reset_all()
-    bot = new_bot({"mode": "freekassa"}, store_file)
+    bot = new_bot({"mode": "platega"}, store_file)
 
-    comment = "basic до 17.10.2026 | fk-123456"
+    comment = "basic до 17.10.2026 | platega-123456"
     check("полный ref из комментария распознаётся",
-          bot.comment_has_payment_ref(comment, "fk-123456") is True)
+          bot.comment_has_payment_ref(comment, "platega-123456") is True)
     check("короткий номер операции не совпадает с цифрами даты (баг «2» в «17.10.2026»)",
           bot.comment_has_payment_ref(comment, "2") is False)
     check("пустой ref не считается совпадением", bot.comment_has_payment_ref(comment, "") is False)
-    check("пустой комментарий не считается совпадением", bot.comment_has_payment_ref(None, "fk-123456") is False)
+    check("пустой комментарий не считается совпадением",
+          bot.comment_has_payment_ref(None, "platega-123456") is False)
     check("старый формат комментария (без «|») тоже проверяется",
           bot.comment_has_payment_ref("tg-charge-1", "tg-charge-1") is True)
 
@@ -1075,34 +1190,36 @@ async def test_duplicate_guard(store_file):
     try:
         await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         order = [o for o in bot.payment_store.orders.values()][-1]
-        await post_fk_notification(order["id"], order["amount_rub"], intid="123456")
+        await post_platega_callback(order["id"], order["amount_rub"], transaction_id="123456")
         check("первая оплата выдала ключ", panel_client(email) is not None)
 
         expiry_after_first = int(panel_client(email)["expiryTime"])
         await bot.start_checkout(TG_TG_ID, TG_TG_ID, FAMILY)
         order2 = [o for o in bot.payment_store.orders.values()][-1]
 
+        PLAT["status_override"] = "PENDING"
         cb = _FakeCallback(bot, f"checkpay_{order2['id']}")
         await bot.cb_check_payment(cb)
-        check("без уведомления оплата не подтверждается",
+        check("без подтверждения оплата не считается прошедшей",
               int(panel_client(email)["expiryTime"]) == expiry_after_first)
+        PLAT["status_override"] = None
 
-        await post_fk_notification(order2["id"], order2["amount_rub"], intid="123457")
+        await post_platega_callback(order2["id"], order2["amount_rub"], transaction_id="123457")
         extended = int(panel_client(email)["expiryTime"])
         family_days = bot.TARIFFS[FAMILY]["days"]
-        check(f"уведомление продлевает подписку на {family_days} дней",
+        check(f"callback продлевает подписку на {family_days} дней",
               round((extended - expiry_after_first) / 86_400_000, 1) == family_days,
               f"прибавка {round((extended - expiry_after_first) / 86_400_000, 1)} дн.")
-        check("в комментарии клиента — номер последней операции FreeKassa",
-              "fk-123457" in str(panel_client(email)["comment"]), str(panel_client(email)["comment"]))
+        check("в комментарии клиента — id последней транзакции",
+              "platega-123457" in str(panel_client(email)["comment"]), str(panel_client(email)["comment"]))
     finally:
         await runner.cleanup()
 
 
-async def test_freekassa_stats_and_labels(store_file):
-    print("\n▶ 8г. FreeKassa: подписи тарифов и журнал заказов")
+async def test_platega_stats_and_labels(store_file):
+    print("\n▶ 8г. Platega: подписи тарифов и журнал заказов")
     reset_all()
-    bot = new_bot({"mode": "freekassa"}, store_file)
+    bot = new_bot({"mode": "platega"}, store_file)
     premium_price = bot.TARIFFS[PREMIUM]["price"]
     check("цена тарифа показывается в рублях",
           bot.tariff_price_label(bot.TARIFFS[PREMIUM]) == f"{premium_price} ₽",
@@ -1113,19 +1230,20 @@ async def test_freekassa_stats_and_labels(store_file):
     await bot.start_checkout(TG_TG_ID, TG_TG_ID, PREMIUM)
     order = [o for o in bot.payment_store.orders.values()][-1]
     check("заказ сохранён на диск", os.path.exists(store_file))
-    check("в заказе рублёвая валюта, режим freekassa и ссылка на оплату",
-          order["currency"] == "RUB" and order["mode"] == "freekassa"
-          and order["payment_url"].startswith(bot.FREEKASSA_PAY_URL))
+    check("в заказе рублёвая валюта, режим platega и ссылка на оплату",
+          order["currency"] == "RUB" and order["mode"] == "platega"
+          and order["payment_url"].startswith(f"http://127.0.0.1:{PLAT_PORT}/pay/"))
 
     stats = bot.payment_store.stats()
     check("неоплаченный заказ не попадает в выручку",
           stats["paid_count"] == 0 and stats["rub"] == 0, str(stats))
 
-    answer, _ = await bot.process_freekassa_notification(
-        fk_params(order["id"], premium_price, intid="321321"))
+    code, note = await bot.process_platega_callback(
+        platega_body(order["id"], premium_price, transaction_id="321321"),
+        PLAT_MERCHANT_ID, PLAT_SECRET)
     stats = bot.payment_store.stats()
     check("оплаченный заказ попадает в рублёвую выручку",
-          answer == "YES" and stats["rub"] == premium_price and stats["paid_count"] == 1, str(stats))
+          code == 200 and stats["rub"] == premium_price and stats["paid_count"] == 1, str(stats))
     check(f"в разбивке по тарифам учтён {PREMIUM}", stats["by_tariff"].get(PREMIUM) == 1, str(stats["by_tariff"]))
 
 
@@ -1259,7 +1377,7 @@ async def test_persistence_and_off(store_file):
 async def test_egress_ip(store_file):
     print("\n▶ 12а. Исходящий IP сервиса: определение и отказ без сети")
     reset_all()
-    bot = new_bot({"mode": "freekassa"}, store_file)
+    bot = new_bot({"mode": "platega"}, store_file)
 
     ip = await bot.fetch_egress_ip(timeout=6)
     check("исходящий IP определяется (внешний сервис отвечает) либо честно пусто",
@@ -1359,21 +1477,16 @@ async def test_simulated_payment(store_file):
     email = f"tg-paid-{TG_TG_ID}"
 
     # По умолчанию (боевой режим) проверка выключена
-    bot = new_bot({"mode": "freekassa", "allow_test_pay": None}, store_file)
+    bot = new_bot({"mode": "platega", "allow_test_pay": None}, store_file)
     check("в боевом режиме проверка без оплаты по умолчанию выключена", bot.test_pay_enabled() is False)
     msg = make_message(bot, text=f"/test_pay {BASIC}")
     await bot.cmd_test_pay(msg)
     check("выключенная проверка подсказывает переменную",
           "PAYMENTS_ALLOW_TEST_PAY=1" in _last_api_text() and panel_client(email) is None)
 
-    # В тестовом режиме FreeKassa включается автоматически
-    reset_all()
-    bot = new_bot({"mode": "freekassa", "fk_test": "1"}, store_file)
-    check("в тестовом режиме FreeKassa проверка включается сама", bot.test_pay_enabled() is True)
-
     # Включённая проверка: полный путь выдачи без денег
     reset_all()
-    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1"}, store_file)
+    bot = new_bot({"mode": "platega", "allow_test_pay": "1"}, store_file)
     check("проверка включена переменной PAYMENTS_ALLOW_TEST_PAY", bot.test_pay_enabled() is True)
 
     msg = make_message(bot, text="/test_pay")
@@ -1408,7 +1521,7 @@ async def test_simulated_payment(store_file):
           stats["paid_count"] == 0 and stats["rub"] == 0 and stats["stars"] == 0,
           f"paid_count={stats['paid_count']}")
 
-    check("ссылка на оплату в FreeKassa не создавалась (денег не нужно)",
+    check("ссылка на оплату в Platega не создавалась (денег не нужно)",
           not [o for o in bot.payment_store.orders.values() if o.get("payment_url")])
 
     # Кнопка выбора тарифа: пока тестовый ключ на месте — проверка отказывается его портить
@@ -1438,7 +1551,7 @@ async def test_simulated_payment(store_file):
 
     # Защита: обычный пользователь не может ни выдать, ни удалить
     reset_all()
-    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1"}, store_file)
+    bot = new_bot({"mode": "platega", "allow_test_pay": "1"}, store_file)
     other = make_message(bot, uid=777, text=f"/test_pay {BASIC}")
     await bot.cmd_test_pay(other)
     check("обычному пользователю /test_pay недоступна",
@@ -1458,13 +1571,14 @@ async def test_simulated_payment(store_file):
 
     # Настоящую подписку проверочная выдача не трогает
     reset_all()
-    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1"}, store_file)
+    bot = new_bot({"mode": "platega", "allow_test_pay": "1"}, store_file)
     await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
     real_order = [o for o in bot.payment_store.orders.values()][-1]
-    answer, _ = await bot.process_freekassa_notification(
-        fk_params(real_order["id"], real_order["amount_rub"], intid="909090"))
+    code, _ = await bot.process_platega_callback(
+        platega_body(real_order["id"], real_order["amount_rub"], transaction_id="909090"),
+        PLAT_MERCHANT_ID, PLAT_SECRET)
     check("для проверки защиты настоящая оплата прошла",
-          answer == "YES" and panel_client(email) is not None)
+          code == 200 and panel_client(email) is not None)
     real_expiry = int(panel_client(email)["expiryTime"])
 
     simulated_before = len([o for o in bot.payment_store.orders.values() if o.get("simulated")])
@@ -1490,13 +1604,13 @@ async def test_admin_access(store_file):
     reset_all()
 
     # Один админ
-    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1", "admin_id": str(TG_TG_ID)}, store_file)
+    bot = new_bot({"mode": "platega", "allow_test_pay": "1", "admin_id": str(TG_TG_ID)}, store_file)
     check("один ID: владелец — админ", bot.is_admin(TG_TG_ID) is True)
     check("один ID: чужой — не админ", bot.is_admin(777) is False)
 
     # Несколько админов через запятую
     reset_all()
-    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1", "admin_id": f"{TG_TG_ID}, 777"}, store_file)
+    bot = new_bot({"mode": "platega", "allow_test_pay": "1", "admin_id": f"{TG_TG_ID}, 777"}, store_file)
     check("список ID: первый админ", bot.is_admin(TG_TG_ID) is True)
     check("список ID: второй админ", bot.is_admin(777) is True)
     check("список ID: посторонний не админ", bot.is_admin(999) is False)
@@ -1504,28 +1618,28 @@ async def test_admin_access(store_file):
 
     # Странности формата
     reset_all()
-    bot = new_bot({"mode": "freekassa", "admin_id": f" +{TG_TG_ID} ; 777 ", "allow_test_pay": "1"}, store_file)
+    bot = new_bot({"mode": "platega", "admin_id": f" +{TG_TG_ID} ; 777 ", "allow_test_pay": "1"}, store_file)
     check("плюс, точка с запятой и пробелы не мешают", bot.ADMIN_IDS == [TG_TG_ID, 777], str(bot.ADMIN_IDS))
 
     reset_all()
-    bot = new_bot({"mode": "freekassa", "admin_id": "@username", "allow_test_pay": "1"}, store_file)
+    bot = new_bot({"mode": "platega", "admin_id": "@username", "allow_test_pay": "1"}, store_file)
     check("мусорный ADMIN_ID: не блокирует владельца (команды открыты), как и у старых команд",
           bot.is_admin(TG_TG_ID) is True and bot.ADMIN_IDS == [])
 
     reset_all()
-    bot = new_bot({"mode": "freekassa", "admin_id": "", "allow_test_pay": "1"}, store_file)
+    bot = new_bot({"mode": "platega", "admin_id": "", "allow_test_pay": "1"}, store_file)
     check("пустой ADMIN_ID: команды открыты всем (бот предупредит при старте)", bot.is_admin(777) is True)
 
     # Второй админ из списка может работать с командой
     reset_all()
-    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1", "admin_id": f"{TG_TG_ID},777"}, store_file)
+    bot = new_bot({"mode": "platega", "allow_test_pay": "1", "admin_id": f"{TG_TG_ID},777"}, store_file)
     msg = make_message(bot, uid=777, text=f"/test_pay {BASIC}")
     await bot.cmd_test_pay(msg)
     check("второй админ из списка получил ключ через /test_pay", panel_client("tg-paid-777") is not None)
 
     # Отказ содержит диагностику
     reset_all()
-    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1", "admin_id": str(TG_TG_ID)}, store_file)
+    bot = new_bot({"mode": "platega", "allow_test_pay": "1", "admin_id": str(TG_TG_ID)}, store_file)
     msg = make_message(bot, uid=555, text="/test_pay basic")
     await bot.cmd_test_pay(msg)
     text = _last_api_text()
@@ -1537,7 +1651,7 @@ async def test_admin_access(store_file):
     # Некорректный ADMIN_ID (@username вместо ID): владельца не блокируем,
     # но честно говорим об этом в /myid — иначе легко решить, что «бот меня не признал»
     reset_all()
-    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1", "admin_id": "@username"}, store_file)
+    bot = new_bot({"mode": "platega", "allow_test_pay": "1", "admin_id": "@username"}, store_file)
     check("мусорный ADMIN_ID не блокирует админ-команды (нельзя запереть себя вне бота)",
           bot.is_admin(555) is True)
     msg = make_message(bot, uid=555, text="/myid")
@@ -1548,14 +1662,14 @@ async def test_admin_access(store_file):
     check("/myid подсказывает формат списка админов", "111,222" in text)
 
     reset_all()
-    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1", "admin_id": ""}, store_file)
+    bot = new_bot({"mode": "platega", "allow_test_pay": "1", "admin_id": ""}, store_file)
     msg = make_message(bot, uid=555, text="/myid")
     await bot.cmd_myid(msg)
     check("/myid отдельно сообщает, что ADMIN_ID не задана", "не задана" in _last_api_text())
 
     # /myid отвечает всем и объясняет статус
     reset_all()
-    bot = new_bot({"mode": "freekassa", "admin_id": str(TG_TG_ID)}, store_file)
+    bot = new_bot({"mode": "platega", "admin_id": str(TG_TG_ID)}, store_file)
     msg = make_message(bot, uid=555, text="/myid")
     await bot.cmd_myid(msg)
     text = _last_api_text()
@@ -1573,65 +1687,64 @@ async def test_admin_access(store_file):
           "ADMIN_ID" in _last_api_text() and str(TG_TG_ID) in _last_api_text())
 
 
-async def test_freekassa_self_check(store_file):
-    print("\n▶ 14. Проверка настроек FreeKassa без денег (/freekassa_check)")
+async def test_platega_self_check(store_file):
+    print("\n▶ 14. Проверка настроек Platega без денег (/platega_check)")
     reset_all()
-    bot = new_bot({"mode": "freekassa", "merchant": None, "secret1": None, "secret2": None}, store_file)
-    text = await bot.freekassa_self_check()
+    bot = new_bot({"mode": "platega", "merchant": None, "secret": None}, store_file)
+    text = await bot.platega_self_check()
     check("без ключей отчёт объясняет, где их взять",
-          "FREEKASSA_MERCHANT_ID" in text and "Настройки магазина" in text)
+          "PLATEGA_MERCHANT_ID" in text and "PLATEGA_SECRET" in text and "Интеграция" in text)
 
     reset_all()
-    bot = new_bot({"mode": "freekassa"}, store_file)
+    bot = new_bot({"mode": "platega"}, store_file)
     runner = await bot.run_webhook_server()
     try:
-        text = await bot.freekassa_self_check()
-        check("отчёт показывает магазин", FK_MERCHANT_ID in text)
-        check("отчёт подтверждает обе подписи", text.count("✅") >= 2, f"✅ ×{text.count('✅')}")
-        check("отчёт показывает URL оповещения для кабинета FK",
-              f"http://127.0.0.1:{WEBHOOK_PORT}/freekassa/webhook" in text)
-        check("отчёт показывает адрес возврата на бота", "t.me/" in text)
-        check("отчёт напоминает про галочку «Подтверждение платежа»",
-              "Подтверждение платежа" in text)
-        check("отчёт подсказывает кнопку «Проверить статус»", "Проверить статус" in text)
-        check("отчёт проверяет доступность страницы оплаты",
-              "Доступность страницы оплаты" in text)
+        text = await bot.platega_self_check()
+        check("отчёт показывает Merchant ID", PLAT_MERCHANT_ID in text)
+        check("отчёт говорит, что ключи приняты (проверка через API)",
+              "ключи приняты" in text, [ln for ln in text.split("\n") if "API" in ln][:2])
+        check("отчёт показывает адрес API", f"http://127.0.0.1:{PLAT_PORT}" in text)
+        check("отчёт показывает Callback URL для кабинета Platega",
+              f"http://127.0.0.1:{WEBHOOK_PORT}{PLAT_WEBHOOK_PATH}" in text)
+        check("отчёт показывает адрес возврата (Return URL) для кабинета Platega",
+              "Return URL" in text and ("t.me/" in text or "http" in text))
+        check("отчёт напоминает про HTTPS и доверенный сертификат",
+              "HTTPS" in text and "сертификат" in text.lower())
+        check("отчёт напоминает про 200 и повторы callback",
+              "200" in text and "повтор" in text.lower())
+        check("отчёт напоминает про заголовки X-MerchantId / X-Secret",
+              "X-MerchantId" in text and "X-Secret" in text)
         check("отчёт показывает исходящий IP бота (нужен, если платёжка просит whitelist)",
               "Исходящий IP бота:" in text, [line for line in text.split("\n") if "Исходящий" in line][:1])
-        check("если домен не отвечает — подсказано зеркало pay.kassa.shop",
-              "Доступность страницы оплаты: отвечает ✅" in text
-              or "pay.kassa.shop" in text, text[-260:])
-        # Домен из переменной может быть с хвостовым слэшем или без — ссылка одинаково верная
-        reset_all()
-        mirror = new_bot({"mode": "freekassa", "pay_url": "https://pay.kassa.shop"}, store_file)
-        probe = {"id": "probe-1", "tg_id": 0, "amount_rub": 99, "currency": "RUB"}
-        url_no_slash = mirror.freekassa_payment_url(probe)
-        check("домен без хвостового слэша даёт ссылку вида /?m=",
-              url_no_slash.startswith("https://pay.kassa.shop/?m="), url_no_slash[:60])
-        reset_all()
-        mirror_slash = new_bot({"mode": "freekassa", "pay_url": "https://pay.kassa.shop/"}, store_file)
-        check("домен с хвостовым слэшем не даёт «//»",
-              mirror_slash.freekassa_payment_url(probe).startswith("https://pay.kassa.shop/?m="))
-
         check("отчёт ведёт к первой настоящей оплате",
               "первая настоящая оплата" in text and "PAYMENTS_ALLOW_TEST_PAY=1" in text)
-        check("самопроверка сервера прошла (healthz отвечает)", "Самопроверка сервера: ✅" in text, text[-200:])
+        check("самопроверка сервера прошла (healthz отвечает)",
+              "Самопроверка сервера: ✅" in text, text[-200:])
+        check("в адрес API реально ушёл запрос балансов",
+              any(c[0] == "GET /balance/all" for c in PLAT["calls"]))
 
-        msg = make_message(bot, text="/freekassa_check")
-        await bot.cmd_freekassa_check(msg)
-        check("команда /freekassa_check присылает отчёт", "Проверка FreeKassa" in _last_api_text())
+        msg = make_message(bot, text="/platega_check")
+        await bot.cmd_platega_check(msg)
+        check("команда /platega_check присылает отчёт", "Проверка Platega" in _last_api_text())
 
-        other = make_message(bot, uid=777, text="/freekassa_check")
-        await bot.cmd_freekassa_check(other)
-        check("обычному пользователю /freekassa_check недоступна",
+        other = make_message(bot, uid=777, text="/platega_check")
+        await bot.cmd_platega_check(other)
+        check("обычному пользователю /platega_check недоступна",
               "только администратору" in _last_api_text())
     finally:
         await runner.cleanup()
 
+    # Неверный ключ: отчёт честно говорит, что делать
+    reset_all()
+    bot_bad = new_bot({"mode": "platega", "secret": "неверный"}, store_file)
+    text = await bot_bad.platega_self_check()
+    check("с неверным ключом отчёт показывает ошибку связи",
+          "Связь с API: ❌" in text, [ln for ln in text.split("\n") if "Связь" in ln][:1])
+
     reset_all()
     bot_stars = new_bot({"mode": "stars"}, store_file)
-    msg = make_message(bot_stars, text="/freekassa_check")
-    await bot_stars.cmd_freekassa_check(msg)
+    msg = make_message(bot_stars, text="/platega_check")
+    await bot_stars.cmd_platega_check(msg)
     check("в другом режиме команда честно говорит, что не нужна",
           "режим оплаты" in _last_api_text())
 
@@ -1639,23 +1752,25 @@ async def test_freekassa_self_check(store_file):
 async def test_myid_payments_diag(store_file):
     print("\n▶ 14б. /myid показывает состояние оплаты и почему проверки скрыты")
     reset_all()
-    bot = new_bot({"mode": "freekassa", "fk_test": "1", "admin_tools": "1"}, store_file)
+    bot = new_bot({"mode": "platega", "allow_test_pay": "1", "admin_tools": "1"}, store_file)
 
     await bot.cmd_myid(make_message(bot, text="/myid"))
     text = _last_api_text()
-    check("/myid: видно режим оплаты", "FreeKassa" in text, text[-120:].replace("\n", " | "))
-    check("/myid: видно ID магазина", FK_MERCHANT_ID in text)
-    check("/myid: видно, что секретные слова заданы", "заданы ✅" in text)
-    check("/myid: видно, что включён тестовый режим FK", "Тестовый режим FK" in text)
-    check("/myid: показан адрес для «URL оповещения»", "/freekassa/webhook" in text)
-    check("/myid: видно, что диагностика /freekassa_check доступна",
-          "/freekassa_check" in text and "доступна" in text)
+    check("/myid: видно режим оплаты", "Platega" in text, text[-120:].replace("\n", " | "))
+    check("/myid: видно Merchant ID", PLAT_MERCHANT_ID in text)
+    check("/myid: видно, что API-ключ задан", "задан ✅" in text)
+    check("/myid: видна валюта", "RUB" in text)
+    check("/myid: показан Callback URL", PLAT_WEBHOOK_PATH in text)
+    check("/myid: видно, что защита — заголовки X-MerchantId / X-Secret",
+          "X-MerchantId" in text and "X-Secret" in text)
+    check("/myid: видно, что диагностика /platega_check доступна",
+          "/platega_check" in text and "доступна" in text)
     check("/myid: сказано, что выдача без оплаты включена",
           "/test_pay" in text and "включена" in text)
 
     # ADMIN_TOOLS=0 — команда проверки не отвечает, и /myid объясняет почему
     reset_all()
-    bot = new_bot({"mode": "freekassa", "fk_test": "1", "admin_tools": "0"}, store_file)
+    bot = new_bot({"mode": "platega", "admin_tools": "0"}, store_file)
     await bot.cmd_myid(make_message(bot, text="/myid"))
     text = _last_api_text()
     check("/myid: сказано, что выдача без оплаты скрыта", "скрыта" in text)
@@ -1664,32 +1779,32 @@ async def test_myid_payments_diag(store_file):
 
     # Проверки разрешены, но TEST_TOOLS=0 их прячет
     reset_all()
-    bot = new_bot({"mode": "freekassa", "allow_test_pay": "1", "admin_tools": "1", "test_tools": "0"}, store_file)
+    bot = new_bot({"mode": "platega", "allow_test_pay": "1", "admin_tools": "1", "test_tools": "0"}, store_file)
     await bot.cmd_myid(make_message(bot, text="/myid"))
     text = _last_api_text()
     check("/myid: TEST_TOOLS=0 назван причиной", "TEST_TOOLS=0" in text and "скрыта" in text)
 
     # Проверки скрыты, потому что не включён тестовый режим
     reset_all()
-    bot = new_bot({"mode": "freekassa", "admin_tools": "1"}, store_file)
+    bot = new_bot({"mode": "platega", "admin_tools": "1"}, store_file)
     await bot.cmd_myid(make_message(bot, text="/myid"))
     text = _last_api_text()
     check("/myid: подсказано, как включить выдачу без оплаты",
           "PAYMENTS_ALLOW_TEST_PAY=1" in text and "скрыта" in text)
-    check("/myid: диагностика /freekassa_check в бою доступна",
-          "/freekassa_check" in text and "доступна" in text)
+    check("/myid: диагностика /platega_check в бою доступна",
+          "/platega_check" in text and "доступна" in text)
 
     # Магазин не задан — видно прямо в подсказке
     reset_all()
-    bot = new_bot({"mode": "freekassa", "merchant": None, "secret1": None, "secret2": None,
+    bot = new_bot({"mode": "platega", "merchant": None, "secret": None,
                    "admin_tools": "1"}, store_file)
     await bot.cmd_myid(make_message(bot, text="/myid"))
     text = _last_api_text()
-    check("/myid: видно, что магазин не задан", "не задан ❌" in text)
+    check("/myid: видно, что Merchant ID не задан", "не задан ❌" in text)
 
     # Контакт поддержки из переменной перекрывает стандартный — видно в /myid и в разделе
     reset_all()
-    bot = new_bot({"mode": "freekassa", "admin_tools": "1",
+    bot = new_bot({"mode": "platega", "admin_tools": "1",
                    "support_username": "@Support_Test"}, store_file)
     await bot.cmd_myid(make_message(bot, text="/myid"))
     text = _last_api_text()
@@ -1702,49 +1817,39 @@ async def test_myid_payments_diag(store_file):
 
     # Обычному пользователю диагностика оплаты не показывается
     reset_all()
-    bot = new_bot({"mode": "freekassa", "admin_tools": "1", "admin_id": str(TG_TG_ID)}, store_file)
+    bot = new_bot({"mode": "platega", "admin_tools": "1", "admin_id": str(TG_TG_ID)}, store_file)
     await bot.cmd_myid(make_message(bot, uid=555, text="/myid"))
     text = _last_api_text()
     check("обычный пользователь не видит диагностику оплаты",
-          "/freekassa_check" not in text and FK_MERCHANT_ID not in text)
+          "/platega_check" not in text and PLAT_MERCHANT_ID not in text)
 
 
 async def test_production_handlers(store_file):
-    print("\n▶ 14в. Боевой режим: /freekassa_check есть у админа, /test_pay — нет")
+    print("\n▶ 14в. Боевой режим: /platega_check есть у админа, /test_pay — нет")
     reset_all()
-    prod = new_bot({"mode": "freekassa", "admin_tools": "1"}, store_file)
+    prod = new_bot({"mode": "platega", "admin_tools": "1"}, store_file)
     handlers = {h.callback.__name__ for h in prod.dp.message.handlers}
-    check("боевой режим: диагностика FreeKassa зарегистрирована",
-          "cmd_freekassa_check" in handlers, str(sorted(handlers)))
+    check("боевой режим: диагностика Platega зарегистрирована",
+          "cmd_platega_check" in handlers, str(sorted(handlers)))
     check("боевой режим: выдача ключа без оплаты не зарегистрирована",
           "cmd_test_pay" not in handlers)
     check("боевой режим: кнопки проверок скрыты", not prod.test_tools_enabled())
-    check("боевой режим: /freekassa_check указана в /myid", prod.admin_tools_enabled())
+    check("боевой режим: выдача без оплаты не разрешена",
+          prod.test_pay_enabled() is False)
 
     # администратору диагностика отвечает и без тестовых флагов
-    msg = make_message(prod, text="/freekassa_check")
-    await prod.cmd_freekassa_check(msg)
-    check("боевой режим: /freekassa_check отвечает", "Проверка FreeKassa" in _last_api_text())
-    check("боевой режим: в отчёте сказано «боевой режим»",
-          "боевой режим" in _last_api_text())
-    check("боевой режим: напоминание выключить тест в кабинете",
-          "выключена" in _last_api_text() and "FREEKASSA_TEST" in _last_api_text())
-
-    # в тестовом режиме — отдельная памятка и команда выдачи без оплаты
-    reset_all()
-    test_bot = new_bot({"mode": "freekassa", "fk_test": "1", "admin_tools": "1"}, store_file)
-    check("тестовый режим: выдача без оплаты зарегистрирована",
-          "cmd_test_pay" in {h.callback.__name__ for h in test_bot.dp.message.handlers})
-    await test_bot.cmd_freekassa_check(make_message(test_bot, text="/freekassa_check"))
-    check("тестовый режим: в отчёте сказано «тестовый режим»",
-          "тестовый режим" in _last_api_text())
+    msg = make_message(prod, text="/platega_check")
+    await prod.cmd_platega_check(msg)
+    check("боевой режим: /platega_check отвечает", "Проверка Platega" in _last_api_text())
+    check("боевой режим: в отчёте видны ключи и API",
+          PLAT_MERCHANT_ID in _last_api_text() and f"http://127.0.0.1:{PLAT_PORT}" in _last_api_text())
 
 
 async def test_subscription_link(store_file):
     print("\n▶ 14е. Ссылка-подписка: адрес сервиса подписок, проверка и запасной ключ")
     reset_all()
     reset(sub={"enable": True, "port": None, "path": "/sub/", "domain": "", "uri": ""})
-    bot = new_bot({"mode": "freekassa"}, store_file + ".base")
+    bot = new_bot({"mode": "platega"}, store_file + ".base")
     runner = await bot.run_webhook_server()
     tg_id = 551001
 
@@ -1759,9 +1864,9 @@ async def test_subscription_link(store_file):
         # 1. Обычный случай: сервис подписок на порту панели, ссылка проверена
         await bot.start_checkout(tg_id, tg_id, BASIC)
         order = [o for o in bot.payment_store.orders.values()][-1]
-        status, body = await post_fk_notification(order["id"], bot.TARIFFS[BASIC]["price"])
+        status, body = await post_platega_callback(order["id"], bot.TARIFFS[BASIC]["price"])
         client = panel_client(f"tg-paid-{tg_id}")
-        check("оплата прошла, клиент создан", body == "YES" and client is not None, body)
+        check("оплата прошла, клиент создан", body.strip() == "ok" and client is not None, body)
 
         sub_id = str(client.get("subId") or "")
         check("у клиента есть Sub ID (нужен для подписки)", bool(sub_id), sub_id)
@@ -1783,7 +1888,7 @@ async def test_subscription_link(store_file):
         await bot.start_checkout(tg_id + 1, tg_id + 1, BASIC)
         order2 = [o for o in bot.payment_store.orders.values()][-1]
         # intid у каждого уведомления свой: по нему бот отсекает повторные доставки
-        await post_fk_notification(order2["id"], bot.TARIFFS[BASIC]["price"], intid="987655")
+        await post_platega_callback(order2["id"], bot.TARIFFS[BASIC]["price"], transaction_id="987655")
         check("второй заказ тоже выдан",
               panel_client(f"tg-paid-{tg_id + 1}") is not None)
         check("повторная выдача обошлась без новых запросов настроек",
@@ -1797,7 +1902,7 @@ async def test_subscription_link(store_file):
         #    клиент получает ключ, админ предупреждение
         reset_all()
         reset(sub={"enable": False, "port": None, "path": "/sub/", "domain": "", "uri": ""})
-        off = new_bot({"mode": "freekassa"}, store_file + ".off")
+        off = new_bot({"mode": "platega"}, store_file + ".off")
         await off.start_checkout(tg_id, tg_id, BASIC)
         order3 = [o for o in off.payment_store.orders.values()][-1]
         info3 = await off.fulfill_order(order3, charge_id="test-sub-off")
@@ -1831,7 +1936,7 @@ async def test_subscription_link(store_file):
             reset(sub=sub_settings)
             # Адрес берём из настоящих настроек панели (через фейковый API 3x-ui):
             # панель может быть за прокси, поэтому проверку доступности тут не ждём.
-            variant = new_bot({**{"mode": "freekassa"}, **env}, f"{store_file}.case{index}")
+            variant = new_bot({**{"mode": "platega"}, **env}, f"{store_file}.case{index}")
             async with variant.XUIClient() as client:
                 panel_settings = await variant.fetch_panel_settings(client)
             base, note = await variant.get_subscription_base(refresh=True)
@@ -1841,7 +1946,7 @@ async def test_subscription_link(store_file):
             check(f"пояснение к адресу ({label}) непустое", bool(note), note)
 
         # 5. Приоритет адресов: переменная важнее настроек панели
-        variant = new_bot({"mode": "freekassa", "sub_url_base": "https://my-sub.example.com",
+        variant = new_bot({"mode": "platega", "sub_url_base": "https://my-sub.example.com",
                            "sub_port": None, "sub_path": None}, f"{store_file}.prio")
         order_candidates = variant.subscription_candidates({
             "subURI": "https://sub.panel.example.com/sub/", "subDomain": "vpn.example.com",
@@ -1863,7 +1968,7 @@ async def test_subscription_link(store_file):
 async def test_promo_tariff(store_file):
     print("\n▶ 14д. Промо-тариф: 15 дней, 10 ГБ, бесплатно и один раз на аккаунт")
     reset_all()
-    bot = new_bot({"mode": "freekassa"}, store_file)
+    bot = new_bot({"mode": "platega"}, store_file)
     email = f"tg-paid-{TG_TG_ID}"
 
     check("промо включён по умолчанию", bot.promo_enabled() is True)
@@ -1920,7 +2025,7 @@ async def test_promo_tariff(store_file):
 
     # Кнопка в тарифах доводит клиента до готового ключа (как это делает пользователь)
     reset_all()
-    click = new_bot({"mode": "freekassa"}, store_file + ".click")
+    click = new_bot({"mode": "platega"}, store_file + ".click")
     user_id = 999001
     cb = _FakeCallback(click, "buy_promo", uid=user_id)
     await click.cb_buy(cb)
@@ -1937,7 +2042,7 @@ async def test_promo_tariff(store_file):
 
     # PROMO_ENABLED=0 — пункта нет и выдача отклоняется
     reset_all()
-    off = new_bot({"mode": "freekassa", "promo_enabled": "0"}, store_file)
+    off = new_bot({"mode": "platega", "promo_enabled": "0"}, store_file)
     check("PROMO_ENABLED=0 выключает промо", off.promo_enabled() is False)
     check("выключенный промо не виден", off.promo_visible(TG_TG_ID) is False)
     try:
@@ -1950,7 +2055,7 @@ async def test_promo_tariff(store_file):
     # PROMO_ONCE=0 — промо не считается использованным (для проверок на своём аккаунте):
     # после /revoke выданный ранее промо можно активировать заново.
     reset_all()
-    many = new_bot({"mode": "freekassa", "promo_once": "0"}, store_file + ".once")
+    many = new_bot({"mode": "platega", "promo_once": "0"}, store_file + ".once")
     await many.grant_promo(TG_TG_ID, TG_TG_ID)
     check("PROMO_ONCE=0 не помечает промо использованным",
           many.promo_used(TG_TG_ID) is False and many.promo_visible(TG_TG_ID) is True)
@@ -1964,13 +2069,13 @@ async def test_promo_tariff(store_file):
     # Тем, у кого уже есть платная подписка, промо не выдаётся —
     # иначе промо переписало бы лимиты оплаченного тарифа на 10 ГБ.
     reset_all()
-    paid = new_bot({"mode": "freekassa"}, store_file + ".paid")
+    paid = new_bot({"mode": "platega"}, store_file + ".paid")
     runner = await paid.run_webhook_server()
     try:
         await paid.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         order = [o for o in paid.payment_store.orders.values()][-1]
-        status, body = await post_fk_notification(order["id"], paid.TARIFFS[BASIC]["price"])
-        check("платная подписка активирована", body == "YES" and panel_client(email) is not None, body)
+        status, body = await post_platega_callback(order["id"], paid.TARIFFS[BASIC]["price"])
+        check("платная подписка активирована", body.strip() == "ok" and panel_client(email) is not None, body)
         total_before = panel_client(email)["totalGB"]
         paid_refused = False
         try:
@@ -2003,7 +2108,7 @@ async def test_promo_tariff(store_file):
 async def test_cancel_order(store_file):
     print("\n▶ 14г. Отмена заказа: статус, проверка оплаты и позднее поступление денег")
     reset_all()
-    bot = new_bot({"mode": "freekassa"}, store_file)
+    bot = new_bot({"mode": "platega"}, store_file)
     runner = await bot.run_webhook_server()
     email = f"tg-paid-{TG_TG_ID}"
 
@@ -2043,8 +2148,8 @@ async def test_cancel_order(store_file):
               any("отменён" in a.lower() for a in cb3.answers))
 
         # Клиент всё-таки оплатил по старой ссылке — деньги не должны пропасть
-        status, body = await post_fk_notification(order_id, order["amount_rub"])
-        check("уведомление по отменённому заказу принято (YES)", body == "YES", body)
+        status, body = await post_platega_callback(order_id, order["amount_rub"])
+        check("уведомление по отменённому заказу принято (200 «ok»)", body.strip() == "ok", body)
         paid = await bot.payment_store.get(order_id)
         check("заказ снова стал оплаченным", paid["status"] == "paid")
         check("ключ выдан, несмотря на отмену", panel_client(email) is not None)
@@ -2135,7 +2240,7 @@ async def _get_healthz():
 async def main():
     runners = []
     for port, app in ((PANEL_PORT, make_app()), (TG_PORT, make_tg_app()),
-                      (YK_PORT, make_yk_app())):
+                      (YK_PORT, make_yk_app()), (PLAT_PORT, make_platega_app())):
         runner = web.AppRunner(app)
         await runner.setup()
         await web.TCPSite(runner, "127.0.0.1", port).start()
@@ -2156,19 +2261,19 @@ async def main():
         await test_yookassa_flow(store_for("yookassa"))
         await test_receipt_optional(store_for("yookassa_vat"))
         await test_yookassa_oauth_webhook(store_for("yookassa_oauth"))
-        await test_freekassa_signatures()
-        await test_freekassa_flow(store_for("freekassa"))
-        await test_duplicate_guard(store_for("freekassa_dup"))
-        await test_freekassa_ip_check_and_errors(store_for("freekassa_ip"))
-        await test_freekassa_test_mode_and_diagnostics(store_for("freekassa_test"))
-        await test_freekassa_stats_and_labels(store_for("freekassa_stats"))
+        await test_platega_api_and_amounts()
+        await test_platega_flow(store_for("platega"))
+        await test_duplicate_guard(store_for("platega_dup"))
+        await test_platega_credentials_and_errors(store_for("platega_creds"))
+        await test_platega_diagnostics(store_for("platega_diag"))
+        await test_platega_stats_and_labels(store_for("platega_stats"))
         await test_yookassa_button_and_revoke(store_for("yookassa_btn"))
         await test_persistence_and_off(store_for("persist"))
         await test_egress_ip(store_for("egress"))
         await test_diagnostics(store_for("diag"))
         await test_panel_debug(store_for("debug"))
         await test_simulated_payment(store_for("simulate"))
-        await test_freekassa_self_check(store_for("selfcheck"))
+        await test_platega_self_check(store_for("selfcheck"))
         await test_myid_payments_diag(store_for("myid"))
         await test_production_handlers(store_for("prodhandlers"))
         await test_cancel_order(store_for("cancelorder"))

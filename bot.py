@@ -305,8 +305,9 @@ SUB_PATH = (os.getenv("SUB_PATH") or "").strip()
 # ОПЛАТА ПОДПИСОК
 # =========================
 # Режимы (PAYMENTS_MODE):
-#   • freekassa — FreeKassa: бот присылает ссылку на платёжную страницу (карта, СБП,
-#                 кошельки), результат приходит уведомлением на /freekassa/webhook.
+#   • platega   — Platega: бот создаёт транзакцию через API и присылает ссылку на
+#                 оплату (карта, СБП, кошельки, крипта), результат приходит
+#                 callback-уведомлением на /platega/webhook.
 #   • stars     — Telegram Stars (XTR). Штатный способ оплаты цифровых товаров
 #                 внутри Telegram: не нужны ни юрлицо, ни платёжный шлюз.
 #   • provider  — Telegram Payments через платёжный токен BotFather (ЮKassa и др.),
@@ -315,8 +316,8 @@ SUB_PATH = (os.getenv("SUB_PATH") or "").strip()
 #                 ссылку на оплату (карта, СБП), результат приходит вебхуком.
 #   • off       — приём оплаты выключен (кнопки тарифов показывают заглушку).
 # Если PAYMENTS_MODE не задан: provider → при наличии PAYMENT_PROVIDER_TOKEN,
-# иначе yookassa → при наличии ключей ЮKassa, иначе freekassa → при наличии магазина FK,
-# иначе stars.
+# иначе yookassa → при наличии ключей ЮKassa, иначе platega → при наличии
+# Merchant ID и ключа Platega, иначе stars.
 
 PAYMENTS_MODE = (os.getenv("PAYMENTS_MODE") or "").strip().lower()
 
@@ -331,70 +332,62 @@ PROVIDER_TEST_MODE = ":TEST:" in PAYMENT_PROVIDER_TOKEN.upper()
 TELEGRAM_SEND_RECEIPT = (os.getenv("TELEGRAM_SEND_RECEIPT") or "").strip().lower() in ("1", "true", "yes", "on")
 TELEGRAM_RECEIPT_VAT_CODE = _int_env("TELEGRAM_RECEIPT_VAT_CODE", 1)
 
-# --- FreeKassa (карта, СБП, кошельки — оплата по ссылке) ---
-# ID магазина и два секретных слова из кабинета FK (Настройки магазина):
-#   «Секретное слово»   — подпись ссылки на оплату;
-#   «Секретное слово 2» — подпись уведомления о платеже (URL оповещения).
-FREEKASSA_MERCHANT_ID = (os.getenv("FREEKASSA_MERCHANT_ID") or "").strip()
-FREEKASSA_SECRET1 = (os.getenv("FREEKASSA_SECRET1") or "").strip()
-FREEKASSA_SECRET2 = (os.getenv("FREEKASSA_SECRET2") or "").strip()
+# --- Platega (карта, СБП, кошельки — оплата по ссылке) ---
+# Merchant ID (UUID) и API-ключ из личного кабинета Platega: Настройки → Интеграция → API.
+# Те же два значения Platega присылает заголовками X-MerchantId и X-Secret при вызове
+# нашего вебхука — по ним бот проверяет, что уведомление настоящее.
+PLATEGA_MERCHANT_ID = (os.getenv("PLATEGA_MERCHANT_ID") or "").strip()
+PLATEGA_SECRET = (os.getenv("PLATEGA_SECRET") or "").strip()
 
-# Адрес платёжной страницы: ровно тот, что открывается у вашего магазина.
-#   • https://pay.freekassa.ru/ — российская франшиза (рубли);
-#   • https://pay.fk.money/     — международная версия.
-FREEKASSA_PAY_URL = (
-    os.getenv("FREEKASSA_PAY_URL") or ""
-).strip().rstrip("/") or "https://pay.freekassa.ru"
-# Домен хранится без хвостового слэша: ссылка собирается как FREEKASSA_PAY_URL + "/?…",
-# иначе в адресе получалось «pay.freekassa.ru//?…» (некоторые кассы такой адрес отвергают).
+# Адрес API. Меняется, только если менеджер Platega выдал другой хост.
+PLATEGA_API_URL = (os.getenv("PLATEGA_API_URL") or "https://app.platega.io").strip().rstrip("/")
 
-# Валюта счёта: RUB (по умолчанию), USD, EUR, UAH, KZT.
-FREEKASSA_CURRENCY = (os.getenv("FREEKASSA_CURRENCY") or "RUB").strip().upper()
+# Валюта счёта: RUB (по умолчанию).
+PLATEGA_CURRENCY = (os.getenv("PLATEGA_CURRENCY") or "RUB").strip().upper()
 
-# Формула подписи ссылки на оплату:
-#   currency (по умолчанию) — md5(магазин:сумма:секрет:валюта:заказ) — новая форма FK;
-#   plain                   — md5(магазин:сумма:секрет:заказ) — старая форма free-kassa.org.
-FREEKASSA_SIGN_VARIANT = (os.getenv("FREEKASSA_SIGN_VARIANT") or "currency").strip().lower() or "currency"
+# Способ оплаты. Пусто (по умолчанию) — плательщик сам выбирает способ на странице
+# Platega: так касса сама показывает то, что доступно магазину. Можно зафиксировать
+# один метод: 2 — СБП (QR), 3 — ЕРИП, 11 — карточный эквайринг,
+# 12 — международная оплата, 13 — криптовалюта, 14 — SberPay.
+PLATEGA_METHOD_RAW = (os.getenv("PLATEGA_METHOD") or "").strip()
+PLATEGA_METHOD = int(PLATEGA_METHOD_RAW) if PLATEGA_METHOD_RAW.isdigit() else None
+PLATEGA_METHODS = {
+    2: "СБП (QR-код)",
+    3: "ЕРИП",
+    11: "карточный эквайринг",
+    12: "международная оплата",
+    13: "криптовалюта",
+    14: "SberPay",
+}
 
-# Тестовый режим магазина FK (галочка «Тестовый режим» в кабинете): деньги не
-# списываются, но уведомление о платеже приходит как обычно. Бот тогда честно
-# помечает оплату как тестовую и сам включает проверочные команды.
-FREEKASSA_TEST = (os.getenv("FREEKASSA_TEST") or "").strip().lower() in ("1", "true", "yes", "on")
+# Куда Platega вернёт плательщика после успешной оплаты и после неудачи.
+# Пусто — используется ссылка на бота (клиент возвращается прямо в Telegram).
+PLATEGA_RETURN_URL = (os.getenv("PLATEGA_RETURN_URL") or "").strip()
+PLATEGA_FAILED_URL = (os.getenv("PLATEGA_FAILED_URL") or "").strip()
 
-# Проверка IP отправителя уведомления. По умолчанию ВЫКЛЮЧЕНА: на Railway бот
-# видит IP балансировщика, а не FreeKassa (настоящий адрес приходит в заголовке
-# X-Forwarded-For). Главная защита — подпись SIGN вторым секретным словом.
-# На своём сервере/VPS без прокси включи FREEKASSA_CHECK_IP=1.
-FREEKASSA_CHECK_IP = (os.getenv("FREEKASSA_CHECK_IP") or "0").strip().lower() in ("1", "true", "yes", "on")
-
-# Белые списки IP FreeKassa (свой список: FREEKASSA_ALLOWED_IPS=1.2.3.4,5.6.7.8).
-FREEKASSA_ALLOWED_IPS_DEFAULT = (
-    "168.119.157.136", "168.119.60.227", "178.154.197.79", "51.250.54.238",
-    "136.243.38.147", "136.243.38.149", "136.243.38.150", "136.243.38.151",
-    "136.243.38.189", "136.243.38.108",
-)
-FREEKASSA_ALLOWED_IPS = tuple(
-    ip.strip() for ip in (os.getenv("FREEKASSA_ALLOWED_IPS") or "").split(",") if ip.strip()
-) or FREEKASSA_ALLOWED_IPS_DEFAULT
+# Путь вебхука: этот адрес вписывается в кабинет Platega (Настройки → Callback URLs)
+# как https://<домен сервиса><PLATEGA_WEBHOOK_PATH>.
+PLATEGA_WEBHOOK_PATH = (os.getenv("PLATEGA_WEBHOOK_PATH") or "/platega/webhook").strip() or "/platega/webhook"
+if not PLATEGA_WEBHOOK_PATH.startswith("/"):
+    PLATEGA_WEBHOOK_PATH = "/" + PLATEGA_WEBHOOK_PATH
 
 # Проверка выдачи ключа БЕЗ реальной оплаты (только для админа): /test_pay.
 # Бот прогоняет тот же путь, что и после настоящей оплаты — создаёт заказ, клиента
 # в 3x-ui и отправляет сообщение с ключом, — но денег не списывает. Такой заказ
-# помечается тестовым и не попадает в выручку. В тестовом режиме FreeKassa
-# (FREEKASSA_TEST=1) проверка включается автоматически, в боевом режиме —
-# переменной PAYMENTS_ALLOW_TEST_PAY=1 (после проверки её лучше убрать).
+# помечается тестовым и не попадает в выручку. Включается переменной
+# PAYMENTS_ALLOW_TEST_PAY=1 (после проверки её лучше убрать).
 PAYMENTS_ALLOW_TEST_PAY = (os.getenv("PAYMENTS_ALLOW_TEST_PAY") or "").strip().lower() in ("1", "true", "yes", "on")
 
-# Видны ли тестовые команды (/test_pay, /freekassa_check) и их кнопки.
-# По умолчанию — только когда включена проверка без оплаты (PAYMENTS_ALLOW_TEST_PAY=1)
-# или магазин FK работает в тестовом режиме (FREEKASSA_TEST=1). В обычном режиме
+# Видны ли тестовые команды (/test_pay, /platega_check) и их кнопки.
+# По умолчанию — только когда включена проверка без оплаты (PAYMENTS_ALLOW_TEST_PAY=1).
+# В обычном режиме
 # этих команд в боте нет совсем: ни в меню Telegram, ни в /payments.
 # TEST_TOOLS=0 — спрятать даже в тестовой сети (бот выглядит полностью боевым);
 # TEST_TOOLS=1 — включить принудительно.
 TEST_TOOLS_RAW = (os.getenv("TEST_TOOLS") or "").strip().lower()
 
 # Видны ли служебные команды администратора: /inbounds, /reset_vpn, /panel_debug,
-# /totp, /groups, /payments, /revoke, /test_pay, /freekassa_check.
+# /totp, /groups, /payments, /revoke, /test_pay, /platega_check.
 #   ADMIN_TOOLS=0 (по умолчанию) — в боте их нет совсем: ни в меню Telegram, ни по вводу.
 #     Пользователи видят только рабочие команды, бот выглядит как обычный сервис.
 #   ADMIN_TOOLS=1 — все админ-команды возвращаются (нужно для обслуживания).
@@ -514,12 +507,12 @@ if not PAYMENTS_MODE:
         PAYMENTS_MODE = "provider"
     elif YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
         PAYMENTS_MODE = "yookassa"
-    elif FREEKASSA_MERCHANT_ID and FREEKASSA_SECRET1:
-        PAYMENTS_MODE = "freekassa"
+    elif PLATEGA_MERCHANT_ID and PLATEGA_SECRET:
+        PAYMENTS_MODE = "platega"
     else:
         PAYMENTS_MODE = "stars"
 
-if PAYMENTS_MODE not in ("stars", "provider", "yookassa", "freekassa", "off"):
+if PAYMENTS_MODE not in ("stars", "provider", "yookassa", "platega", "off"):
     logger.warning("Неизвестный PAYMENTS_MODE=%r — платежи выключены.", PAYMENTS_MODE)
     PAYMENTS_MODE = "off"
 
@@ -532,20 +525,21 @@ if PAYMENTS_MODE == "yookassa" and not (YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY
     logger.warning(
         "PAYMENTS_MODE=yookassa, но не заданы YOOKASSA_SHOP_ID / YOOKASSA_SECRET_KEY — платежи не создадутся."
     )
-if FREEKASSA_TEST:
-    # Тестовый магазин FK: проверочные команды включаются сами, как раньше в тестнете.
-    PAYMENTS_ALLOW_TEST_PAY = True
-
 if PAYMENTS_ALLOW_TEST_PAY:
     logger.info(
         "Проверка выдачи ключа без оплаты включена: команда /test_pay (только для администратора)."
     )
 
-if PAYMENTS_MODE == "freekassa" and not (FREEKASSA_MERCHANT_ID and FREEKASSA_SECRET1 and FREEKASSA_SECRET2):
+if PAYMENTS_MODE == "platega" and not (PLATEGA_MERCHANT_ID and PLATEGA_SECRET):
     logger.warning(
-        "PAYMENTS_MODE=freekassa, но не заданы FREEKASSA_MERCHANT_ID / FREEKASSA_SECRET1 / "
-        "FREEKASSA_SECRET2 — ссылки на оплату и уведомления работать не будут. "
-        "Все три значения есть в кабинете FreeKassa -> Настройки магазина."
+        "PAYMENTS_MODE=platega, но не заданы PLATEGA_MERCHANT_ID / PLATEGA_SECRET — "
+        "платежи создаваться не будут. Оба значения есть в кабинете Platega: "
+        "Настройки -> Интеграция -> API."
+    )
+if PAYMENTS_MODE == "platega" and not PUBLIC_BASE_URL:
+    logger.warning(
+        "Не задан PUBLIC_BASE_URL (публичный адрес сервиса) — Platega не сможет прислать "
+        "callback об оплате, заказ будет подтверждаться только кнопкой «Проверить оплату»."
     )
 
 if PAYMENTS_MODE == "yookassa" and not PUBLIC_BASE_URL:
@@ -2076,7 +2070,7 @@ class PaymentStore:
             "paid_count": len(paid),
             "promo_count": len(promo),
             "rub": sum(int(o.get("amount_rub") or 0) for o in paid
-                       if o.get("mode") in ("yookassa", "provider", "freekassa")),
+                       if o.get("mode") in ("yookassa", "provider", "platega")),
             "stars": sum(int(o.get("amount_stars") or 0) for o in paid if o.get("currency") == "XTR"),
             "by_tariff": by_tariff,
         }
@@ -2450,7 +2444,7 @@ def comment_with_new_expiry(comment: str | None, expiry_ms: int) -> str:
     """
     Обновляет дату в комментарии клиента, сохраняя номер платежа.
 
-    Комментарий выглядит как «basic до 17.10.2026 | fk-123456»; по хвосту после «|»
+    Комментарий выглядит как «basic до 17.10.2026 | platega-123456»; по хвосту после «|»
     бот понимает, что подписка уже выдана (защита от повторной выдачи), поэтому
     при продлении меняем только дату.
     """
@@ -2840,11 +2834,11 @@ def trial_button_visible(user_id: int | None) -> bool:
 
 def test_tools_enabled() -> bool:
     """
-    Показывать ли тестовые команды (/test_pay, /freekassa_check) и их кнопки.
+    Показывать ли тестовые команды (/test_pay, /platega_check) и их кнопки.
 
     В боевом режиме их нет: команды не регистрируются вообще, кнопки не выводятся,
-    в меню Telegram они не попадают. Включаются сами в тестовом режиме FreeKassa
-    или переменной PAYMENTS_ALLOW_TEST_PAY=1; TEST_TOOLS управляет принудительно.
+    в меню Telegram они не попадают. Включаются переменной PAYMENTS_ALLOW_TEST_PAY=1;
+    TEST_TOOLS управляет принудительно.
     """
     if not ADMIN_TOOLS:
         return False          # админ-инструменты скрыты — прячем и проверки оплаты
@@ -2858,7 +2852,7 @@ def payments_mode_title() -> str:
         "stars": "Telegram Stars ⭐️",
         "provider": "оплата картой в Telegram (BotFather provider token)",
         "yookassa": "ЮKassa (карта / СБП по ссылке)",
-        "freekassa": f"FreeKassa (карта, СБП и кошельки, {FREEKASSA_CURRENCY})",
+        "platega": f"Platega (карта, СБП и кошельки, {PLATEGA_CURRENCY})",
         "off": "выключена",
     }.get(PAYMENTS_MODE, PAYMENTS_MODE)
 
@@ -2868,7 +2862,7 @@ def payments_diag_text() -> str:
     Короткая диагностика оплаты для /myid: что настроено и почему молчат проверки.
 
     /myid доступна всегда, даже при ADMIN_TOOLS=0, поэтому именно здесь видно,
-    из-за какой переменной /test_pay и /freekassa_check не отвечают.
+    из-за какой переменной /test_pay и /platega_check не отвечают.
     """
     lines = [f"💳 <b>Оплата:</b> {escape(payments_mode_title())} (<code>{PAYMENTS_MODE}</code>)"]
 
@@ -2896,19 +2890,23 @@ def payments_diag_text() -> str:
     else:
         lines.append("• Промо-доступ: выключен (<code>PROMO_ENABLED=0</code> или тариф удалён)")
 
-    if PAYMENTS_MODE == "freekassa":
-        shop = FREEKASSA_MERCHANT_ID or "не задан ❌"
-        secrets = "заданы ✅" if (FREEKASSA_SECRET1 and FREEKASSA_SECRET2) else "НЕ заданы ❌"
-        lines.append(f"• Магазин FK: <code>{escape(shop)}</code>, секретные слова: {secrets}")
-        if FREEKASSA_TEST:
-            lines.append("• Тестовый режим FK: включён 🧪 (реальные деньги не списываются)")
+    if PAYMENTS_MODE == "platega":
+        lines.append(f"• Merchant ID: <code>{escape(PLATEGA_MERCHANT_ID or 'не задан ❌')}</code>")
+        lines.append(f"• API-ключ (X-Secret): {'задан ✅' if PLATEGA_SECRET else 'НЕ задан ❌'}")
+        lines.append(f"• API: <code>{escape(PLATEGA_API_URL)}</code>, валюта {escape(PLATEGA_CURRENCY)}")
+        lines.append(
+            "• Способ оплаты: "
+            + (escape(PLATEGA_METHODS.get(PLATEGA_METHOD, str(PLATEGA_METHOD)))
+               if PLATEGA_METHOD else "выбирает плательщик на странице Platega")
+        )
         if PUBLIC_BASE_URL:
-            lines.append(f"• URL оповещения: <code>{escape(PUBLIC_BASE_URL + '/freekassa/webhook')}</code>")
+            lines.append(f"• Callback URL: <code>{escape(PUBLIC_BASE_URL + PLATEGA_WEBHOOK_PATH)}</code>")
         else:
             lines.append(
-                "• URL оповещения: ⚠️ нет публичного адреса — Railway → Settings → "
+                "• Callback URL: ⚠️ нет публичного адреса — Railway → Settings → "
                 "Networking → <b>Generate Domain</b> (или задай <code>PUBLIC_BASE_URL</code>)"
             )
+        lines.append("• Защита callback: заголовки X-MerchantId + X-Secret")
     elif PAYMENTS_MODE == "stars":
         lines.append(f"• Цена в звёздах: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (меняется <code>STARS_RUB_RATE</code>)")
     elif PAYMENTS_MODE == "yookassa":
@@ -2918,11 +2916,11 @@ def payments_diag_text() -> str:
         lines.append(f"• Токен BotFather: {'задан ✅' if PAYMENT_PROVIDER_TOKEN else 'НЕ задан ❌'}")
 
     # Диагностика настроек — только чтение, поэтому доступна и в боевом режиме.
-    if admin_tools_enabled() and PAYMENTS_MODE == "freekassa":
-        lines.append("• <code>/freekassa_check</code> — проверка настроек магазина: <b>доступна</b> ✅")
-    elif PAYMENTS_MODE == "freekassa":
+    if admin_tools_enabled() and PAYMENTS_MODE == "platega":
+        lines.append("• <code>/platega_check</code> — проверка настроек магазина: <b>доступна</b> ✅")
+    elif PAYMENTS_MODE == "platega":
         lines.append(
-            "• <code>/freekassa_check</code> — проверка настроек магазина: скрыта, "
+            "• <code>/platega_check</code> — проверка настроек магазина: скрыта, "
             "нужна <code>ADMIN_TOOLS=1</code>"
         )
     # Выдача ключа без оплаты — это уже тестовый инструмент.
@@ -2936,8 +2934,7 @@ def payments_diag_text() -> str:
     else:
         lines.append(
             "• <code>/test_pay</code> — выдача ключа без оплаты: скрыта. "
-            "Включить: <code>PAYMENTS_ALLOW_TEST_PAY=1</code> (в тестовом режиме FK — "
-            "<code>FREEKASSA_TEST=1</code>)"
+            "Включить: <code>PAYMENTS_ALLOW_TEST_PAY=1</code>"
         )
     if not ADMIN_TOOLS:
         lines.append(
@@ -3199,10 +3196,8 @@ def provider_mode_title() -> str:
 
 async def recheck_order_payment(order: dict) -> tuple[str, str]:
     """
-    Переспрашивает платёж у провайдера (ЮKassa) — если вебхук не дошёл.
-
-    У FreeKassa такого запроса нет: оплату подтверждает только уведомление на
-    «URL оповещения», поэтому для её заказов функция сообщает «ждём уведомление».
+    Переспрашивает платёж у платёжной системы, если вебхук не дошёл:
+    Platega — GET /transaction/{id}, ЮKassa — GET /payments/{id}.
 
     Возвращает (состояние, подробности):
       • 'paid'     — оплата подтверждена;
@@ -3210,8 +3205,26 @@ async def recheck_order_payment(order: dict) -> tuple[str, str]:
       • 'canceled' — платёж отменён/истёк;
       • 'error'    — не удалось проверить (текст ошибки для пользователя).
     """
-    if order.get("mode") == "freekassa":
-        return "pending", "ждём уведомление FreeKassa"
+    if order.get("mode") == "platega":
+        transaction_id = str(order.get("payment_id") or "").strip()
+        if not transaction_id:
+            return "error", "Платёж ещё не создан, нажми «Оплатить»."
+        try:
+            data = await platega_transaction(transaction_id)
+        except PaymentError as exc:
+            return "error", str(exc)
+        except Exception as exc:
+            logger.warning("Не удалось проверить платёж Platega %s: %s", transaction_id, exc)
+            return "error", "❌ Не удалось связаться с Platega. Попробуй ещё раз через минуту."
+        status = str(data.get("status") or "").strip().upper()
+        if status == "CONFIRMED":
+            amount = (data.get("paymentDetails") or {}).get("amount")
+            if not platega_amount_matches(order, amount):
+                return "error", "⚠️ Сумма оплаты не совпала с заказом — напиши в поддержку."
+            return "paid", status
+        if status in ("CANCELED", "CHARGEBACKED"):
+            return "canceled", status
+        return "pending", status or "PENDING"
 
     # ЮKassa
     payment_id = order.get("payment_id")
@@ -3261,67 +3274,36 @@ def telegram_receipt_provider_data(order: dict) -> str | None:
 
 
 
-# --- FreeKassa ---
-# Приём оплаты по ссылке: бот формирует платёжную ссылку с подписью первым
-# секретным словом, а FreeKassa присылает уведомление о платеже на URL
-# оповещения (/freekassa/webhook) с подписью вторым секретным словом.
+# --- Platega ---
+# Оплата по ссылке: бот создаёт транзакцию через API (POST /v2/transaction/process) и
+# присылает клиенту ссылку на платёжную страницу Platega. Об оплате Platega сообщает
+# callback-уведомлением на наш вебхук: в заголовках X-MerchantId и X-Secret (те же
+# значения, что в переменных бота), в теле — id транзакции, сумма, валюта, статус
+# (CONFIRMED / CANCELED / CHARGEBACKED) и наш payload (номер заказа).
+# Дополнительно статус можно переспросить у API: GET /transaction/{id}.
 
-def freekassa_configured() -> bool:
-    """Заданы ли магазин и оба секретных слова FreeKassa."""
-    return bool(FREEKASSA_MERCHANT_ID and FREEKASSA_SECRET1 and FREEKASSA_SECRET2)
-
-
-def freekassa_amount(order: dict) -> str:
-    """Сумма заказа для платёжной формы: без лишних нулей («1500», «1500.5»)."""
-    price = float(order.get("amount_rub") or 0)
-    if price == int(price):
-        return str(int(price))
-    return f"{price:.2f}".rstrip("0").rstrip(".")
+def platega_configured() -> bool:
+    """Заданы ли Merchant ID и API-ключ Platega."""
+    return bool(PLATEGA_MERCHANT_ID and PLATEGA_SECRET)
 
 
-def freekassa_sign_form(order: dict) -> str:
-    """
-    Подпись ссылки на оплату — первым секретным словом.
-
-    Новая форма FK: md5(магазин:сумма:секрет:валюта:заказ);
-    старая (free-kassa.org) — без валюты: md5(магазин:сумма:секрет:заказ).
-    """
-    parts = [FREEKASSA_MERCHANT_ID, freekassa_amount(order)]
-    if FREEKASSA_SIGN_VARIANT == "plain":
-        parts.append(FREEKASSA_SECRET1)
-    else:
-        parts += [FREEKASSA_SECRET1, FREEKASSA_CURRENCY]
-    parts.append(str(order["id"]))
-    return hashlib.md5(":".join(parts).encode()).hexdigest()
-
-
-def freekassa_sign_notify(params: dict) -> str:
-    """Подпись уведомления — вторым секретным словом: md5(магазин:сумма:секрет2:заказ)."""
-    raw = ":".join([
-        str(params.get("MERCHANT_ID") or ""),
-        str(params.get("AMOUNT") or ""),
-        FREEKASSA_SECRET2,
-        str(params.get("MERCHANT_ORDER_ID") or ""),
-    ])
-    return hashlib.md5(raw.encode()).hexdigest()
-
-
-def freekassa_payment_url(order: dict) -> str:
-    """Ссылка на платёжную страницу FreeKassa для заказа."""
-    params = {
-        "m": FREEKASSA_MERCHANT_ID,
-        "oa": freekassa_amount(order),
-        "o": order["id"],
-        "s": freekassa_sign_form(order),
-        "currency": FREEKASSA_CURRENCY,
-        "lang": "ru",
-        # us_* вернётся в уведомлении — по нему видно, кто платил (для поддержки).
-        "us_tg": str(order.get("tg_id") or ""),
+def platega_headers() -> dict:
+    """Заголовки авторизации Platega: X-MerchantId + X-Secret."""
+    return {
+        "X-MerchantId": PLATEGA_MERCHANT_ID,
+        "X-Secret": PLATEGA_SECRET,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
     }
-    return f"{FREEKASSA_PAY_URL}/?{urlencode(params)}"
 
 
-def freekassa_amount_matches(order: dict, amount: str) -> bool:
+def platega_amount(order: dict) -> float | int:
+    """Сумма заказа для API: целое число, если сумма целая (500, а не 500.0)."""
+    price = float(order.get("amount_rub") or 0)
+    return int(price) if price == int(price) else round(price, 2)
+
+
+def platega_amount_matches(order: dict, amount) -> bool:
     """Совпадает ли оплаченная сумма с заказом (сравниваем в копейках)."""
     try:
         paid_kop = round(float(str(amount).replace(",", ".")) * 100)
@@ -3330,89 +3312,244 @@ def freekassa_amount_matches(order: dict, amount: str) -> bool:
     return abs(paid_kop - order_amount(order)) <= 1
 
 
-def freekassa_client_ip(request: web.Request) -> str:
-    """IP отправителя уведомления: учитываем заголовки прокси (Railway, nginx)."""
-    for header in ("X-Real-IP", "X-Forwarded-For"):
-        value = (request.headers.get(header) or "").strip()
-        if value:
-            return value.split(",")[0].strip()
-    return str(request.remote or "")
-
-
-def freekassa_ip_allowed(ip: str) -> bool:
-    """Пришло ли уведомление с серверов FreeKassa (по белому списку IP)."""
-    return str(ip or "").strip() in FREEKASSA_ALLOWED_IPS
-
-
-async def process_freekassa_notification(params: dict) -> tuple[str, str]:
+def platega_credentials_valid(merchant_id: str | None, secret: str | None) -> bool:
     """
-    Обрабатывает уведомление FreeKassa о платеже.
+    Совпадают ли присланные Platega заголовки с нашими.
 
-    Возвращает (ответ, пояснение): ответ отдаём FreeKassa как есть — «YES» означает
-    «принято» (при включённой функции подтверждения FK будет повторять уведомление,
-    пока не получит YES), любой другой текст — ошибку. Пояснение идёт в логи и в
-    проверочные команды. Этим же путём идёт /test_pay, поэтому проверка полностью
-    повторяет боевую обработку.
-
-    Порядок проверок: подпись → наш ли это магазин → заказ → сумма → тип платежа.
+    У Platega нет отдельной подписи уведомления: и запросы, и callback защищены
+    одной парой X-MerchantId / X-Secret, поэтому сравниваем их (в постоянном
+    времени, чтобы по ответам нельзя было подбирать ключ посимвольно).
     """
-    sign = str(params.get("SIGN") or "")
-    order_id = str(params.get("MERCHANT_ORDER_ID") or "")
+    if not platega_configured():
+        return False
+    # Сравниваем байты: compare_digest не принимает строки с не-ASCII (а в мусорном
+    # запросе может прийти что угодно), зато так сравнение остаётся постоянным по времени.
+    return (
+        hmac.compare_digest(str(merchant_id or "").encode(), PLATEGA_MERCHANT_ID.encode())
+        and hmac.compare_digest(str(secret or "").encode(), PLATEGA_SECRET.encode())
+    )
 
-    if not FREEKASSA_SECRET2:
-        return "no", "FREEKASSA_SECRET2 не задан — проверять подпись нечем"
-    if not sign or sign.lower() != freekassa_sign_notify(params):
-        logger.warning("FreeKassa: подпись уведомления не совпала (заказ %r)", order_id)
-        return "no", "подпись уведомления не совпала"
 
-    merchant = str(params.get("MERCHANT_ID") or "")
-    if merchant != FREEKASSA_MERCHANT_ID:
-        logger.warning("FreeKassa: уведомление для другого магазина (%r)", merchant)
-        return "no", f"чужой магазин: {merchant}"
+async def platega_back_url() -> str:
+    """Куда вернуть клиента после оплаты: чат с ботом."""
+    username = await get_bot_username()
+    return f"https://t.me/{username}" if username else (PUBLIC_BASE_URL or "https://t.me")
+
+
+async def platega_create_payment(order: dict) -> dict:
+    """
+    Создаёт транзакцию в Platega и возвращает данные для оплаты.
+
+    Ответ API: transactionId, status, url (в v2) или redirect (в v1), expiresIn.
+    При ошибке поднимает PaymentError с понятным текстом для пользователя.
+    """
+    if not platega_configured():
+        raise PaymentError(
+            "⚠️ Оплата через Platega не настроена: не хватает Merchant ID или API-ключа.\n\n"
+            "Администратору: добавь в Railway → Variables <b>PLATEGA_MERCHANT_ID</b> и "
+            "<b>PLATEGA_SECRET</b> (кабинет Platega → Настройки → Интеграция → API). "
+            "Проверить: команда /platega_check."
+        )
+
+    back_url = await platega_back_url()
+    body = {
+        "paymentDetails": {"amount": platega_amount(order), "currency": PLATEGA_CURRENCY},
+        "description": f"Оплата подписки {order.get('tariff_name') or order.get('tariff') or ''}".strip()[:120],
+        "return": PLATEGA_RETURN_URL or back_url,
+        "failedUrl": PLATEGA_FAILED_URL or back_url,
+        # payload возвращается в callback — по нему находим заказ в журнале бота,
+        # даже если журнал переехал; orderId виден в кабинете Platega.
+        "payload": str(order["id"]),
+        "orderId": str(order["id"]),
+        "metadata": {
+            "userId": str(order.get("tg_id") or ""),
+            "userName": str(order.get("tg_username") or order.get("tg_id") or "telegram"),
+        },
+    }
+    if PLATEGA_METHOD:
+        body["paymentMethod"] = PLATEGA_METHOD
+
+    url = f"{PLATEGA_API_URL}/v2/transaction/process"
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=body, headers=platega_headers()) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    logger.error("Platega вернула %s на создание платежа: %s", resp.status, _snip(text, 300))
+                    reason = _snip(text, 200)
+                    if resp.status in (401, 403):
+                        reason = "Platega отклонила Merchant ID или API-ключ — проверь переменные"
+                    raise PaymentError(
+                        "❌ Platega не создала платёж (HTTP {status}).\n"
+                        "Причина: <code>{reason}</code>\n\n"
+                        "Попробуй ещё раз через минуту; если повторяется — /platega_check или поддержка."
+                        .format(status=resp.status, reason=escape(reason))
+                    )
+                data = json.loads(text or "{}")
+    except PaymentError:
+        raise
+    except asyncio.TimeoutError:
+        raise PaymentError(
+            "❌ Platega не ответила вовремя. Попробуй ещё раз через минуту — "
+            "если повторяется, напиши в поддержку."
+        )
+    except Exception as exc:
+        logger.error("Не удалось создать платёж в Platega: %s", exc)
+        raise PaymentError(
+            "❌ Не удалось создать платёж в Platega: <code>{reason}</code>\n\n"
+            "Попробуй ещё раз через минуту или напиши в поддержку.".format(
+                reason=escape(_snip(str(exc), 160))
+            )
+        )
+
+    if not platega_payment_url(data):
+        logger.error("Platega не вернула ссылку на оплату: %s", _snip(json.dumps(data, ensure_ascii=False), 300))
+        raise PaymentError(
+            "❌ Platega не вернула ссылку на оплату. Попробуй ещё раз через минуту "
+            "или напиши в поддержку."
+        )
+    return data
+
+
+def platega_payment_url(data: dict) -> str:
+    """Ссылка на оплату из ответа API: у v2 это url, у v1 — redirect."""
+    return str(data.get("url") or data.get("redirect") or "").strip()
+
+
+async def platega_transaction(transaction_id: str) -> dict:
+    """Статус и детали транзакции: GET /transaction/{id} (PENDING/CONFIRMED/CANCELED/CHARGEBACKED)."""
+    if not platega_configured():
+        raise PaymentError("Platega не настроена: не хватает PLATEGA_MERCHANT_ID / PLATEGA_SECRET.")
+    url = f"{PLATEGA_API_URL}/transaction/{quote(str(transaction_id), safe='')}"
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, headers=platega_headers()) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                logger.warning("Platega вернула %s на статус транзакции %s: %s",
+                               resp.status, transaction_id, _snip(text, 200))
+                raise PaymentError("Не удалось получить статус платежа в Platega.")
+            return json.loads(text or "{}")
+
+
+async def platega_balance() -> str:
+    """Быстрая проверка ключей: запрос балансов магазина (GET /balance/all)."""
+    url = f"{PLATEGA_API_URL}/balance/all"
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, headers=platega_headers()) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise PaymentError(f"HTTP {resp.status}: {_snip(text, 120)}")
+            return _snip(text, 200)
+
+
+async def process_platega_callback(
+    payload_body: dict, merchant_id: str | None, secret: str | None
+) -> tuple[int, str]:
+    """
+    Обрабатывает callback Platega об изменении статуса транзакции.
+
+    Возвращает (код ответа, пояснение): 200 — уведомление принято и обработано
+    (Platega больше не повторяет), 4xx — отказ (она повторит попытку до 3 раз, что
+    полезно, если панель 3x-ui оказалась недоступна в момент оплаты).
+
+    Статусы: CONFIRMED — деньги пришли, выдаём ключ; CANCELED — платёж отменён или
+    истёк; CHARGEBACKED — деньги вернули клиенту (ключ не отзываем автоматически,
+    но админ получает предупреждение, чтобы решить вопрос через /revoke).
+    """
+    if not platega_credentials_valid(merchant_id, secret):
+        logger.warning("Platega: callback с чужими заголовками X-MerchantId/X-Secret отклонён.")
+        return 401, "заголовки X-MerchantId / X-Secret не совпали"
+
+    transaction_id = str(payload_body.get("id") or "").strip()
+    status = str(payload_body.get("status") or "").strip().upper()
+    order_id = str(payload_body.get("payload") or "").strip()
 
     order = await payment_store.get(order_id) if order_id else None
-    if order is None:
-        logger.error("FreeKassa: уведомление по неизвестному заказу %r", order_id)
-        return "no", f"заказ {order_id!r} не найден в журнале бота"
-
-    if not freekassa_amount_matches(order, params.get("AMOUNT")):
-        logger.error(
-            "FreeKassa: сумма %s не совпадает с заказом %s (%s ₽)",
-            params.get("AMOUNT"), order["id"], order["amount_rub"],
+    if order is None and transaction_id:
+        # payload мог не дойти — ищем заказ по id транзакции в журнале.
+        order = next(
+            (o for o in payment_store.orders.values()
+             if str(o.get("payment_id") or "") == transaction_id),
+            None,
         )
-        return "no", "сумма платежа не совпадает с заказом"
+    if order is None:
+        logger.error("Platega: callback по неизвестному заказу %r (транзакция %s)",
+                     order_id, transaction_id)
+        return 404, f"заказ {order_id!r} не найден в журнале бота"
 
-    intid = str(params.get("intid") or "")
+    if status == "CANCELED":
+        if order.get("status") != "paid":
+            await payment_store.update(order["id"], status="canceled",
+                                       payment_id=transaction_id or order.get("payment_id"))
+        logger.info("Platega: платёж по заказу %s отменён (транзакция %s)", order["id"], transaction_id)
+        return 200, "платёж отменён"
+
+    if status == "CHARGEBACKED":
+        await payment_store.update(order["id"], chargeback=True, chargeback_at=int(time.time()))
+        logger.warning("Platega: возврат средств по заказу %s (транзакция %s)", order["id"], transaction_id)
+        await notify_admins(
+            "↩️ <b>Platega: возврат средств по оплаченному заказу.</b>\n\n"
+            f"• Заказ: <code>{escape(order['id'])}</code>\n"
+            f"• Тариф: {escape(order.get('tariff_name') or '—')}, {order.get('amount_rub')} ₽\n"
+            f"• Пользователь: TG <code>{order['tg_id']}</code>\n"
+            f"• Транзакция: <code>{escape(transaction_id)}</code>\n\n"
+            "Деньги вернулись клиенту. Подписку можно снять командой /revoke — "
+            "решение о доступе за тобой."
+        )
+        return 200, "возврат средств отмечен"
+
+    if status != "CONFIRMED":
+        # PENDING и прочие промежуточные статусы: ничего не выдаём, ждём подтверждения.
+        logger.info("Platega: промежуточный статус %s по заказу %s", status or "—", order["id"])
+        return 200, f"статус {status or '—'} — ждём оплату"
+
+    if not platega_amount_matches(order, payload_body.get("amount")):
+        logger.error(
+            "Platega: сумма %s не совпадает с заказом %s (%s ₽)",
+            payload_body.get("amount"), order["id"], order["amount_rub"],
+        )
+        return 400, "сумма платежа не совпадает с заказом"
+
+    currency = str(payload_body.get("currency") or PLATEGA_CURRENCY).strip().upper()
+    if currency and currency != PLATEGA_CURRENCY:
+        logger.error("Platega: валюта %s не совпадает с ожидаемой %s (заказ %s)",
+                     currency, PLATEGA_CURRENCY, order["id"])
+        return 400, "валюта платежа не совпадает с заказом"
+
     was_canceled = order.get("status") == "canceled"
     if was_canceled:
         # Клиент отменил заказ, но всё-таки оплатил по старой ссылке: деньги списаны,
         # поэтому ключ выдаём, а не отказываем. Предупредим и клиента, и админа в логах.
         logger.warning(
-            "FreeKassa: оплата по отменённому заказу %s — принимаю деньги и выдаю ключ "
-            "(при необходимости верните оплату в кабинете FK и снимите подписку /revoke).",
+            "Platega: оплата по отменённому заказу %s — принимаю деньги и выдаю ключ "
+            "(при необходимости верните оплату в кабинете Platega и снимите подписку /revoke).",
             order["id"],
         )
     if order.get("status") == "paid":
-        # FK может повторить уведомление — ключ уже выдан, просто подтверждаем.
-        logger.info("FreeKassa: повторное уведомление по заказу %s — уже оплачен", order["id"])
-        return "YES", "заказ уже оплачен, повторное уведомление подтверждено"
+        # Platega может повторить callback — ключ уже выдан, просто подтверждаем приём.
+        logger.info("Platega: повторный callback по заказу %s — уже оплачен", order["id"])
+        await payment_store.update(order["id"], payment_id=transaction_id or order.get("payment_id"))
+        return 200, "заказ уже оплачен, повторный callback подтверждён"
 
     await payment_store.update(
         order["id"],
-        intid=intid,
-        payment_id=intid or order["id"],
-        payer_email=str(params.get("P_EMAIL") or ""),
-        payer_phone=str(params.get("P_PHONE") or ""),
-        cur_id=str(params.get("CUR_ID") or ""),
-        payer_account=str(params.get("payer_account") or ""),
-        commission=str(params.get("commission") or ""),
+        payment_id=transaction_id or order["id"],
+        payment_method=str(payload_body.get("paymentMethod") or ""),
     )
 
     try:
-        await fulfill_order(order, charge_id=f"fk-{intid or order['id']}", provider_charge_id=intid)
+        await fulfill_order(
+            order,
+            charge_id=f"platega-{transaction_id or order['id']}",
+            provider_charge_id=transaction_id,
+        )
     except Exception as exc:
-        logger.error("FreeKassa: выдача по заказу %s не удалась: %s — ждём повтор уведомления", order["id"], exc)
-        return "no", f"выдача ключа не удалась: {exc}"
+        logger.error("Platega: выдача по заказу %s не удалась: %s — ждём повтор callback",
+                     order["id"], exc)
+        return 500, f"выдача ключа не удалась: {exc}"
 
     if was_canceled:
         await payment_store.update(order["id"], canceled_then_paid=True)
@@ -3428,7 +3565,7 @@ async def process_freekassa_notification(params: dict) -> tuple[str, str]:
         except Exception as exc:
             logger.warning("Не удалось предупредить об оплате отменённого заказа %s: %s", order["id"], exc)
 
-    return "YES", "оплата принята, ключ выдан"
+    return 200, "оплата принята, ключ выдан"
 
 
 def make_yookassa_client() -> YooKassaClient:
@@ -3480,7 +3617,7 @@ def comment_has_payment_ref(comment: str | None, payment_ref: str) -> bool:
     """
     Проверяет, что подписка в панели уже выдана именно по этому платежу.
 
-    Комментарий клиента выглядит как «basic до 17.10.2026 | fk-123456», поэтому
+    Комментарий клиента выглядит как «basic до 17.10.2026 | platega-123456», поэтому
     сравниваем только хвост после «|»: иначе короткий ref вроде «2» совпал бы
     с цифрами в дате и бот зря решил бы, что ключ уже выдан.
     """
@@ -3496,10 +3633,10 @@ def comment_has_payment_ref(comment: str | None, payment_ref: str) -> bool:
 
 def order_charge_id(order: dict) -> str:
     """Идентификатор платежа заказа — тот же, что приходит в вебхуке и при проверке."""
-    if order.get("mode") == "freekassa":
-        # intid — номер операции FreeKassa, он же приходит в уведомлении.
-        intid = str(order.get("intid") or "").strip()
-        return f"fk-{intid}" if intid else ""
+    if order.get("mode") == "platega":
+        # id транзакции Platega — он же приходит в callback и в проверке статуса.
+        transaction_id = str(order.get("payment_id") or "").strip()
+        return f"platega-{transaction_id}" if transaction_id else ""
     return str(order.get("payment_id") or "")
 
 
@@ -4045,7 +4182,7 @@ def new_test_order(tg_id: int, tariff_key: str, location_key: str | None = None)
     Заказ для проверки выдачи ключа без оплаты.
 
     Всё как у обычного заказа (тариф, срок, лимиты), но помечен тестовым: в выручку
-    не попадает, уведомления об оплате его не трогают (они ищут только mode=freekassa).
+    не попадает, уведомления об оплате его не трогают (они ищут только mode=platega).
     """
     order = new_order(tg_id, tariff_key,
                       location_key=location_key or (LOCATION_ORDER[0] if LOCATION_ORDER else None))
@@ -4219,84 +4356,74 @@ def egress_ip_line(ip: str) -> str:
     )
 
 
-async def freekassa_self_check() -> str:
+async def platega_self_check() -> str:
     """
-    Проверяет настройки FreeKassa без денег: ключи, подписи, адреса и вебхук.
+    Проверяет настройки Platega без денег: ключи, API, вебхук и адрес сервиса.
 
-    Ничего не создаёт и не оплачивает: считает подписи ссылки на оплату и
-    уведомления для пробного заказа, прогоняет подпись через собственную проверку
-    бота и, если известен публичный адрес, стучится в свой /healthz. Так видно,
-    что формулы совпадают и сервер отвечает ещё до первой реальной оплаты.
+    Ничего не создаёт и не оплачивает: запрашивает балансы магазина (GET /balance/all) —
+    это подтверждает, что Merchant ID и API-ключ приняты, — и, если известен публичный
+    адрес, стучится в свой /healthz. Так видно, что связка настроена, ещё до первой
+    реальной оплаты.
     """
-    mode = "тестовый режим 🧪 (деньги не списываются)" if FREEKASSA_TEST else "боевой режим"
-    lines = [f"🔍 <b>Проверка FreeKassa — {mode}</b>", ""]
+    lines = ["🔍 <b>Проверка Platega</b>", ""]
 
-    lines.append(f"• Магазин (MERCHANT_ID): <code>{escape(FREEKASSA_MERCHANT_ID or '—')}</code>")
-    lines.append(f"• Секретное слово (ссылка на оплату): {'задан ✅' if FREEKASSA_SECRET1 else 'НЕ задан ❌'}")
-    lines.append(f"• Секретное слово 2 (уведомления): {'задан ✅' if FREEKASSA_SECRET2 else 'НЕ задан ❌'}")
-    lines.append(f"• Платёжная страница: <code>{escape(FREEKASSA_PAY_URL)}</code>")
-    lines.append(f"• Валюта: <b>{escape(FREEKASSA_CURRENCY)}</b>, формула подписи: <code>{escape(FREEKASSA_SIGN_VARIANT)}</code>")
+    lines.append(f"• Merchant ID: <code>{escape(PLATEGA_MERCHANT_ID or '—')}</code>")
+    lines.append(f"• API-ключ (X-Secret): {'задан ✅' if PLATEGA_SECRET else 'НЕ задан ❌'}")
+    lines.append(f"• API: <code>{escape(PLATEGA_API_URL)}</code>")
+    lines.append(f"• Валюта: <b>{escape(PLATEGA_CURRENCY)}</b>")
     lines.append(
-        "• Проверка IP уведомления: "
-        + (
-            "включена, белый список: " + ", ".join(f"<code>{escape(ip)}</code>" for ip in FREEKASSA_ALLOWED_IPS)
-            if FREEKASSA_CHECK_IP
-            else "выключена (на Railway так и нужно: защищает подпись SIGN)"
-        )
+        "• Способ оплаты: "
+        + (f"<b>{escape(PLATEGA_METHODS.get(PLATEGA_METHOD, str(PLATEGA_METHOD)))}</b> "
+           f"(<code>PLATEGA_METHOD={PLATEGA_METHOD}</code>)"
+           if PLATEGA_METHOD
+           else "плательщик выбирает на странице Platega")
     )
     egress_ip = await fetch_egress_ip()
     lines.append(
         "• Исходящий IP бота: "
         + (f"<code>{escape(egress_ip)}</code>" if egress_ip else "⚠️ определить не удалось")
-        + " — если платёжный сервис просит белый список адресов, укажи этот; "
+        + " — если Platega просит белый список адресов, укажи этот; "
         "на Railway он меняется при каждом деплое"
     )
 
-    if not freekassa_configured():
+    if not platega_configured():
         lines += [
             "",
             "❌ <b>Магазин настроен не полностью.</b>",
             "",
-            "Возьми в кабинете FreeKassa → Настройки магазина три значения: <b>ID магазина</b>, "
-            "<b>Секретное слово</b> и <b>Секретное слово 2</b>, затем добавь их в Railway → Variables:",
-            "<code>FREEKASSA_MERCHANT_ID</code>, <code>FREEKASSA_SECRET1</code>, <code>FREEKASSA_SECRET2</code>",
-            "и поставь <code>PAYMENTS_MODE=freekassa</code>.",
+            "Возьми в кабинете Platega → <b>Настройки → Интеграция → API</b> два значения: "
+            "<b>Merchant ID</b> (UUID) и <b>API-ключ</b>, затем добавь их в Railway → Variables:",
+            "<code>PLATEGA_MERCHANT_ID</code> и <code>PLATEGA_SECRET</code>, "
+            "и поставь <code>PAYMENTS_MODE=platega</code>.",
         ]
         return "\n".join(lines)
 
-    # 1. Подписи: считаем для пробного заказа и проверяем их тем же кодом, что и оплату.
-    probe = {
-        "id": f"probe-{int(time.time())}",
-        "tg_id": 0,
-        "amount_rub": freekassa_check_price(),
-        "currency": FREEKASSA_CURRENCY,
-    }
-    form_sign = freekassa_sign_form(probe)
-    notify_probe = {
-        "MERCHANT_ID": FREEKASSA_MERCHANT_ID,
-        "AMOUNT": freekassa_amount(probe),
-        "MERCHANT_ORDER_ID": probe["id"],
-    }
-    notify_ok = freekassa_sign_notify({**notify_probe, "SIGN": freekassa_sign_notify(notify_probe)})
-    lines.append("")
-    lines.append(f"• Подпись ссылки на оплату: <code>{form_sign[:16]}…</code> ✅")
-    lines.append(
-        "• Подпись уведомления: "
-        + ("совпала с проверкой бота ✅" if notify_ok == freekassa_sign_notify(notify_probe) else "❌ ошибка")
-    )
-    lines.append(f"• Пример ссылки: <code>{escape(_snip(freekassa_payment_url(probe), 200))}</code>")
+    # 1. Ключи: запрос балансов магазина. Денег не двигает, но проверяет авторизацию.
+    try:
+        balance = await platega_balance()
+        lines.append("")
+        lines.append(f"• Связь с API: ✅ ключи приняты, ответ <code>{escape(balance)}</code>")
+    except Exception as exc:
+        lines.append("")
+        lines.append(
+            "• Связь с API: ❌ "
+            f"<code>{escape(_snip(str(exc), 160))}</code>\n"
+            "  Проверь <code>PLATEGA_MERCHANT_ID</code> и <code>PLATEGA_SECRET</code> "
+            "(кабинет Platega → Настройки → Интеграция → API) и доступность "
+            f"<code>{escape(PLATEGA_API_URL)}</code> с сервера бота."
+        )
 
-    # 2. Вебхук: тот же адрес, что вписывается в кабинет FK, должен отвечать.
-    notify_url = f"{PUBLIC_BASE_URL}/freekassa/webhook" if PUBLIC_BASE_URL else ""
+    # 2. Вебхук: этот адрес должен быть вписан в кабинете Platega (Callback URLs) и отвечать.
+    notify_url = f"{PUBLIC_BASE_URL}{PLATEGA_WEBHOOK_PATH}" if PUBLIC_BASE_URL else ""
     if not notify_url:
         lines += [
             "",
-            "⚠️ <b>PUBLIC_BASE_URL не задан</b> — уведомления FreeKassa некуда присылать.",
+            "⚠️ <b>PUBLIC_BASE_URL не задан</b> — Platega некуда присылать callback об оплате.",
             "Railway → сервис бота → Settings → Networking → <b>Generate Domain</b>, "
             "адрес подхватится сам (можно задать вручную переменной <code>PUBLIC_BASE_URL</code>).",
         ]
     else:
-        lines.append(f"• URL оповещения: <code>{escape(notify_url)}</code>")
+        lines.append(f"• Callback URL (вписать в кабинет Platega): <code>{escape(notify_url)}</code>")
         try:
             timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -4311,53 +4438,22 @@ async def freekassa_self_check() -> str:
         except Exception as exc:
             lines.append(f"• Самопроверка сервера: ⚠️ {escape(_snip(str(exc), 120))}")
 
-    # 3. Доступна ли платёжная страница (домен может блокироваться у провайдеров,
-    #    тогда ссылка не откроется ни у админа, ни у клиентов — это не ошибка настроек).
-    try:
-        timeout = aiohttp.ClientTimeout(total=6)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(FREEKASSA_PAY_URL + "/") as resp:
-                lines.append(
-                    f"• Доступность страницы оплаты: отвечает ✅ (HTTP {resp.status})"
-                )
-    except Exception as exc:
-        reason = _snip(str(exc), 90) or type(exc).__name__
-        if isinstance(exc, asyncio.TimeoutError):
-            reason = "превышено время ожидания (6 секунд) — домен не ответил"
-        lines.append(
-            "• Доступность страницы оплаты: ⚠️ "
-            f"<code>{escape(reason)}</code>\n"
-            "  С сервера бота домен не отвечает — у клиентов ссылка тоже не откроется. "
-            "Варианты: зеркало <code>FREEKASSA_PAY_URL=https://pay.kassa.shop/</code> "
-            "(та же касса и подписи) или <code>https://pay.fk.money/</code> "
-            "для международного кабинета. Актуальный домен подтвердит поддержка FK."
-        )
-
-    # 4. Что вписать в кабинет FK и что попросить у поддержки.
-    bot_username = await get_bot_username()
-    back_url = f"https://t.me/{bot_username}" if bot_username else "https://t.me/<имя_бота>"
+    # 3. Что вписать в кабинет Platega.
+    back_url = await platega_back_url()
     lines += [
         "",
-        "<b>Поля в кабинете FreeKassa:</b>",
-        f"• URL оповещения (метод GET): <code>{escape(notify_url or 'нужен PUBLIC_BASE_URL')}</code>",
-        f"• URL успешной оплаты: <code>{escape(back_url)}</code>",
-        f"• URL возврата в случае неудачи: <code>{escape(back_url)}</code>",
+        "<b>Поля в кабинете Platega:</b>",
+        f"• Callback URL (Настройки → Callback URLs): <code>{escape(notify_url or 'нужен PUBLIC_BASE_URL')}</code>",
+        f"• Return URL (успех): <code>{escape(PLATEGA_RETURN_URL or back_url)}</code>",
+        f"• Failed URL (неудача): <code>{escape(PLATEGA_FAILED_URL or back_url)}</code>",
         "",
-        "<b>Осталось сделать в кабинете FK:</b>",
-        "1. Включить галочку <b>«Подтверждение платежа»</b> в этом же блоке настроек "
-        "(если галочки нет — попросить поддержку FK включить функцию): бот отвечает "
-        "<code>YES</code>, и FK повторяет уведомление, пока не получит ответ. "
-        "Кнопка <b>«Проверить статус»</b> рядом с URL покажет, что обработчик отвечает "
-        "(ожидаемый ответ — 200).",
-        "2. Если магазин под бота — попросить поддержку разрешить URL оповещения на своём домене.",
-        (
-            "3. Тестовый режим включён: галочка в кабинете FK и <code>FREEKASSA_TEST=1</code>. "
-            "Проведи тестовую оплату — ключ должен прийти сам."
-            if FREEKASSA_TEST
-            else "3. Боевой режим: в кабинете FK галочка <b>«Тестовый режим»</b> должна быть "
-                 "<b>выключена</b>, а переменная <code>FREEKASSA_TEST</code> — убрана из Railway. "
-                 "Если тест останется только с одной стороны, оплата не спишется, а бот будет ждать тест."
-        ),
+        "<b>Требования Platega к адресу callback:</b>",
+        "1. Только <b>HTTPS</b> с доверенным сертификатом (самоподписанные и приватные "
+        "адреса не принимаются) — домен Railway подходит, домен нужен публичный.",
+        "2. Бот отвечает на callback <code>200</code> — если ответа нет в течение 60 секунд, "
+        "Platega отменит запрос и повторит его до 3 раз с интервалом 5 минут.",
+        "3. Заголовки <code>X-MerchantId</code> и <code>X-Secret</code> в callback должны "
+        "совпадать с переменными бота — иначе бот ответит <code>401</code> и ключ не выдаст.",
         "",
         (
             "Дальше: /test_pay — выдача ключа тем же путём, что и после настоящей оплаты."
@@ -4370,12 +4466,6 @@ async def freekassa_self_check() -> str:
     return "\n".join(lines)
 
 
-def freekassa_check_price() -> int:
-    """Сумма для пробной ссылки: самый дешёвый платный тариф."""
-    prices = [t["price"] for t in TARIFFS.values() if t["price"] > 0]
-    return min(prices) if prices else 100
-
-
 async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
                          location_key: str | None = None) -> None:
     """
@@ -4383,7 +4473,7 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
 
     location_key — выбранный сервер для тарифов с одним туннелем (Стокгольм/Варшава);
     тарифы на несколько туннелей получают все локации сразу.
-    stars/provider — нативный счёт Telegram; yookassa и freekassa — ссылка
+    stars/provider — нативный счёт Telegram; platega и yookassa — ссылка
     на страницу оплаты.
     """
     if terms_gate_needed(tg_id):
@@ -4407,7 +4497,7 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
     if not payments_enabled():
         raise PaymentError(
             "💳 <b>Приём оплаты пока не настроен.</b>\n\n"
-            "Администратору: задай <b>PAYMENTS_MODE</b> (freekassa / stars / provider / yookassa) "
+            "Администратору: задай <b>PAYMENTS_MODE</b> (platega / stars / provider / yookassa) "
             "в Railway → Variables. Пошаговая инструкция — в README и команде /payments."
         )
 
@@ -4463,23 +4553,20 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
         )
         return
 
-    # FreeKassa: отдаём ссылку на платёжную страницу (карта, СБП, кошельки)
-    if PAYMENTS_MODE == "freekassa":
-        if not freekassa_configured():
-            raise PaymentError(
-                "⚠️ Оплата через FreeKassa не настроена: не хватает магазина или секретных слов.\n\n"
-                "Администратору: добавь в Railway → Variables <b>FREEKASSA_MERCHANT_ID</b>, "
-                "<b>FREEKASSA_SECRET1</b> и <b>FREEKASSA_SECRET2</b> (кабинет FreeKassa → "
-                "Настройки магазина). Проверить: команда /freekassa_check."
-            )
+    # Platega: создаём транзакцию и отдаём ссылку на оплату (карта, СБП, кошельки)
+    if PAYMENTS_MODE == "platega":
         order = await payment_store.create(new_order(tg_id, tariff_key, location_key))
-        pay_url = freekassa_payment_url(order)
-        await payment_store.update(order["id"], payment_url=pay_url)
+        try:
+            data = await platega_create_payment(order)
+        except Exception:
+            # Платёж не создан — заказ в журнале не нужен, помечаем неудачным.
+            await payment_store.update(order["id"], status="failed")
+            raise
+        transaction_id = str(data.get("transactionId") or data.get("id") or "")
+        pay_url = platega_payment_url(data)
+        await payment_store.update(order["id"], payment_id=transaction_id, payment_url=pay_url)
 
-        test_note = (
-            "\n🧪 <i>Тестовый режим FreeKassa — реальные деньги не списываются.</i>"
-            if FREEKASSA_TEST else ""
-        )
+        expires = str(data.get("expiresIn") or "")
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text=f"💳 Оплатить {tariff['price']} ₽", url=pay_url)],
@@ -4494,13 +4581,16 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
             f"• Сумма: <b>{tariff['price']} ₽</b>\n"
             f"{tariff_terms_line(tariff)}\n"
             f"• Сервер: <b>{location_display(tariff, location_key)}</b>\n\n"
-            "Нажми «Оплатить» — откроется страница FreeKassa: карта, СБП и электронные "
-            "кошельки. Ключ придёт автоматически после подтверждения оплаты.\n"
-            f"<i>Номер заказа: <code>{order['id']}</code></i>{test_note}",
+            "Нажми «Оплатить» — откроется платёжная страница Platega: карта, СБП, "
+            "электронные кошельки и криптовалюта. Ключ придёт автоматически после "
+            "подтверждения оплаты.\n"
+            + (f"<i>Ссылка действует {escape(expires)}</i>\n" if expires else "")
+            + f"<i>Номер заказа: <code>{order['id']}</code></i>",
             reply_markup=keyboard,
             parse_mode="HTML",
         )
-        logger.info("Ссылка FreeKassa создана: заказ %s на %s ₽", order["id"], tariff["price"])
+        logger.info("Ссылка Platega создана: заказ %s на %s ₽ (транзакция %s)",
+                    order["id"], tariff["price"], transaction_id or "—")
         return
 
     # ЮKassa: создаём платёж и отдаём ссылку на оплату
@@ -4542,7 +4632,7 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
 
 
 def make_webhook_app() -> web.Application:
-    """HTTP-сервер для уведомлений об оплате (ЮKassa, FreeKassa)."""
+    """HTTP-сервер для уведомлений об оплате (ЮKassa, Platega)."""
 
     async def healthz(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "mode": PAYMENTS_MODE})
@@ -4604,45 +4694,49 @@ def make_webhook_app() -> web.Application:
 
         return web.json_response({"ok": True})
 
-    async def freekassa_webhook(request: web.Request) -> web.Response:
+    async def platega_webhook(request: web.Request) -> web.Response:
         """
-        Уведомление FreeKassa о платеже.
+        Callback Platega об изменении статуса транзакции (настраивается в кабинете).
 
-        Принимаем GET и POST (метод задаётся в кабинете FK), проверяем подпись и
-        сумму, выдаём ключ и отвечаем ровно «YES» — при включённой функции
-        «Подтверждение заявки» FreeKassa будет повторять уведомление до этого ответа.
+        Platega присылает POST с заголовками X-MerchantId и X-Secret (проверяем их
+        постоянным сравнением) и телом JSON: id, amount, currency, status, payload.
+        Ответ 200 — «принято, больше не повторяй»; 4xx/5xx — Platega повторит запрос
+        (до 3 раз с интервалом 5 минут), поэтому при сбое выдачи ключа отвечаем 5xx.
         """
-        if request.method == "POST":
-            try:
-                form = await request.post()
-            except Exception:
-                return web.Response(text="no: bad form", status=400, content_type="text/plain")
-            params = {str(key): str(value) for key, value in form.items()}
-        else:
-            params = dict(request.rel_url.query)
+        if request.method != "POST":
+            # Платёжные системы иногда «прощупывают» адрес GET-запросом: отвечаем, что живы.
+            return web.Response(text="platega webhook: use POST", status=405, content_type="text/plain")
 
-        ip = freekassa_client_ip(request)
-        if FREEKASSA_CHECK_IP and not freekassa_ip_allowed(ip):
-            logger.warning("Вебхук FreeKassa: уведомление с незнакомого IP %s отклонено.", ip)
-            return web.Response(text="no: forbidden ip", status=403, content_type="text/plain")
+        try:
+            raw = await request.text()
+            payload_body = json.loads(raw or "{}")
+        except Exception:
+            logger.warning("Вебхук Platega: тело не разобралось как JSON: %s", _snip(raw, 200))
+            return web.Response(text="bad json", status=400, content_type="text/plain")
+        if not isinstance(payload_body, dict):
+            return web.Response(text="bad json", status=400, content_type="text/plain")
 
+        merchant_id = request.headers.get("X-MerchantId")
+        secret = request.headers.get("X-Secret")
         logger.info(
-            "Вебхук FreeKassa: заказ=%s сумма=%s intid=%s ip=%s",
-            params.get("MERCHANT_ORDER_ID"), params.get("AMOUNT"), params.get("intid"), ip,
+            "Вебхук Platega: транзакция=%s статус=%s заказ=%s сумма=%s",
+            payload_body.get("id"), payload_body.get("status"),
+            payload_body.get("payload"), payload_body.get("amount"),
         )
-        answer, note = await process_freekassa_notification(params)
-        if answer == "YES":
-            logger.info("Вебхук FreeKassa: %s (заказ %s)", note, params.get("MERCHANT_ORDER_ID"))
+        code, note = await process_platega_callback(payload_body, merchant_id, secret)
+        if 200 <= code < 300:
+            logger.info("Вебхук Platega: %s", note)
         else:
-            logger.warning("Вебхук FreeKassa: отказ — %s", note)
-        return web.Response(text=answer, content_type="text/plain")
+            logger.warning("Вебхук Platega: отказ (%s) — %s", code, note)
+        # 200 с пустым телом — «принято»; иначе Platega повторит запрос.
+        return web.Response(status=code, content_type="text/plain", text="ok" if code == 200 else note)
 
     app = web.Application()
     app.router.add_get("/healthz", healthz)
     app.router.add_post("/yookassa/webhook", yookassa_webhook)
     app.router.add_post("/payments/yookassa", yookassa_webhook)   # алиас для удобства
-    app.router.add_route("*", "/freekassa/webhook", freekassa_webhook)    # GET и POST
-    app.router.add_route("*", "/payments/freekassa", freekassa_webhook)   # алиас
+    app.router.add_post(PLATEGA_WEBHOOK_PATH, platega_webhook)
+    app.router.add_post("/payments/platega", platega_webhook)   # алиас для удобства
     app.router.add_get("/", healthz)
     return app
 
@@ -4650,10 +4744,10 @@ def make_webhook_app() -> web.Application:
 async def run_webhook_server() -> web.AppRunner | None:
     """
     Поднимает HTTP-сервер бота: /healthz всегда, /yookassa/webhook и
-    /freekassa/webhook — для приёма уведомлений об оплате.
+    /platega/webhook — для приёма уведомлений об оплате.
 
     Сервер слушает PORT и нужен Railway, чтобы контейнер считался живым,
-    а в режимах yookassa и freekassa — ещё и для подтверждения оплаты.
+    а в режимах yookassa и platega — ещё и для подтверждения оплаты.
     """
     runner = web.AppRunner(make_webhook_app())
     await runner.setup()
@@ -4661,16 +4755,16 @@ async def run_webhook_server() -> web.AppRunner | None:
     await site.start()
     logger.info("Веб-сервер бота запущен на 0.0.0.0:%s (health: /healthz)", WEB_PORT)
 
-    if PAYMENTS_MODE == "freekassa":
+    if PAYMENTS_MODE == "platega":
         if PUBLIC_BASE_URL:
             logger.info(
-                "Вебхук FreeKassa: %s — впиши этот адрес в кабинет FreeKassa → Настройки "
-                "магазина → «URL оповещения» (метод GET).",
-                f"{PUBLIC_BASE_URL}/freekassa/webhook",
+                "Вебхук Platega: %s — впиши этот адрес в кабинет Platega → "
+                "Настройки → Callback URLs.",
+                f"{PUBLIC_BASE_URL}{PLATEGA_WEBHOOK_PATH}",
             )
         else:
             logger.warning(
-                "PUBLIC_BASE_URL не задан — уведомления FreeKassa некуда присылать. "
+                "PUBLIC_BASE_URL не задан — callback Platega некуда присылать. "
                 "Railway → Settings → Networking → Generate Domain."
             )
 
@@ -5430,7 +5524,7 @@ async def cmd_myid(message: Message):
         if admin_tools_enabled():
             visible = "/payments, /panel_debug, /groups, /totp, /inbounds, /reset_vpn, /revoke"
             if test_tools_enabled():
-                visible += ", /test_pay, /freekassa_check"
+                visible += ", /test_pay, /platega_check"
             status_text = f"✅ Ты администратор{extra} — служебные команды включены: {visible}."
         else:
             status_text = (
@@ -5447,7 +5541,7 @@ async def cmd_myid(message: Message):
                 "Вернуть кнопки в меню и тарифы — <code>TRIAL_BUTTON=1</code>."
             )
         # Владельцу видно состояние оплаты: именно тут понятно, почему /test_pay
-        # и /freekassa_check молчат или что не хватает для приёма денег.
+        # и /platega_check молчат или что не хватает для приёма денег.
         status_text += "\n\n" + payments_diag_text()
         # И какой контакт поддержки видят клиенты: переменная перекрывает стандартный.
         support_source = (
@@ -5913,29 +6007,25 @@ async def cmd_panel_debug(message: Message):
                     "   Настройка: кабинет ЮKassa → Интеграция → HTTP-уведомления → "
                     "URL выше, событие <b>payment.succeeded</b>"
                 )
-        elif PAYMENTS_MODE == "freekassa":
+        elif PAYMENTS_MODE == "platega":
+            lines.append(f"   Merchant ID: <code>{escape(PLATEGA_MERCHANT_ID or '—')}</code>")
+            lines.append("   API-ключ: " + ("задан ✅" if PLATEGA_SECRET else "НЕ задан ❌"))
             lines.append(
-                f"   Магазин: <code>{escape(FREEKASSA_MERCHANT_ID or '—')}</code>"
-                + (" (тестовый режим 🧪)" if FREEKASSA_TEST else "")
+                f"   API: <code>{escape(PLATEGA_API_URL)}</code>, валюта {escape(PLATEGA_CURRENCY)}, "
+                "способ оплаты: "
+                + (escape(PLATEGA_METHODS.get(PLATEGA_METHOD, str(PLATEGA_METHOD)))
+                   if PLATEGA_METHOD else "выбирает плательщик")
             )
-            lines.append("   Секретные слова: " + ("заданы ✅" if freekassa_configured() else "НЕ заданы ❌"))
-            lines.append(
-                f"   Платёжная страница: <code>{escape(FREEKASSA_PAY_URL)}</code>, "
-                f"валюта {escape(FREEKASSA_CURRENCY)}, формула подписи <code>{escape(FREEKASSA_SIGN_VARIANT)}</code>"
-            )
-            webhook_url = (PUBLIC_BASE_URL + "/freekassa/webhook") if PUBLIC_BASE_URL else ""
+            webhook_url = (PUBLIC_BASE_URL + PLATEGA_WEBHOOK_PATH) if PUBLIC_BASE_URL else ""
             if webhook_url:
-                lines.append(f"   URL оповещения: <code>{escape(webhook_url)}</code> (метод GET)")
+                lines.append(f"   Callback URL: <code>{escape(webhook_url)}</code> (метод POST)")
             else:
-                lines.append("   URL оповещения: ⚠️ PUBLIC_BASE_URL не задан (Railway подставляет его сам)")
-            lines.append(
-                "   Проверка IP: "
-                + ("включена" if FREEKASSA_CHECK_IP else "выключена (защита — подпись SIGN)")
-            )
+                lines.append("   Callback URL: ⚠️ PUBLIC_BASE_URL не задан (Railway подставляет его сам)")
+            lines.append("   Защита callback: заголовки X-MerchantId + X-Secret")
             if test_tools_enabled():
-                lines.append("   Проверка без оплаты: /test_pay ✅, связка с FreeKassa: /freekassa_check")
+                lines.append("   Проверка без оплаты: /test_pay ✅, связка с Platega: /platega_check")
             elif admin_tools_enabled():
-                lines.append("   Диагностика магазина без денег: /freekassa_check")
+                lines.append("   Диагностика магазина без денег: /platega_check")
 
         elif PAYMENTS_MODE == "stars":
             lines.append(f"   Курс: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (STARS_RUB_RATE)")
@@ -6110,9 +6200,9 @@ async def cb_tariffs(cb: CallbackQuery):
     elif PAYMENTS_MODE == "stars":
         text += ("⭐️ <i>Оплата в звёздах Telegram: они уже есть в твоём аккаунте или покупаются в пару нажатий. "
                  "Ключ придёт сразу после оплаты.</i>")
-    elif PAYMENTS_MODE == "freekassa":
+    elif PAYMENTS_MODE == "platega":
         text += ("💳 <i>Оплата картой, через СБП или электронный кошелёк на защищённой "
-                 "странице FreeKassa. Ключ придёт автоматически после оплаты.</i>")
+                 "странице Platega. Ключ придёт автоматически после оплаты.</i>")
     elif PAYMENTS_MODE == "yookassa":
         text += ("💳 <i>Оплата картой или через СБП на защищённой странице ЮKassa. "
                  "Ключ придёт автоматически после оплаты.</i>")
@@ -6358,9 +6448,9 @@ async def cb_cancel_order(cb: CallbackQuery):
 
     Заказ получает статус canceled и пропадает из ожидающих: клиенту больше не нужно
     ничего оплачивать, а ссылка в сообщении убирается, чтобы не заплатил случайно.
-    Важно: платёжную страницу FreeKassa это не «закрывает». Если клиент всё-таки
+    Важно: платёжную страницу Platega это не «закрывает». Если клиент всё-таки
     оплатит по старой ссылке, деньги списываются — в этом случае бот выдаст ключ
-    (см. process_freekassa_notification), чтобы оплата не пропала.
+    (см. process_platega_callback), чтобы оплата не пропала.
     """
     order_id = cb.data.removeprefix("cancelorder_")
     order = await payment_store.get(order_id)
@@ -6405,10 +6495,10 @@ async def cb_cancel_order(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("checkpay_"))
 async def cb_check_payment(cb: CallbackQuery):
     """
-    Ручная проверка оплаты (ЮKassa) — если вебхук не дошёл.
+    Ручная проверка оплаты (ЮKassa, Platega) — если вебхук не дошёл.
 
-    У FreeKassa статус запросить негде: оплату подтверждает только уведомление
-    на URL оповещения, поэтому такому заказу бот объясняет, что и где смотреть.
+    У Platega статус можно переспросить у API (GET /transaction/{id}), поэтому
+    такая проверка полностью повторяет обработку callback.
     """
     order_id = cb.data.removeprefix("checkpay_")
     order = await payment_store.get(order_id)
@@ -6458,15 +6548,15 @@ async def cb_check_payment(cb: CallbackQuery):
         await cb.message.answer(details, parse_mode="HTML")
         return
 
-    if order.get("mode") == "freekassa":
+    if order.get("mode") == "platega":
         await cb.message.answer(
-            "⏳ <b>FreeKassa ещё не прислала подтверждение об оплате.</b>\n\n"
-            "Оплата подтверждается уведомлением на сервер бота — обычно это 5–15 секунд "
-            "после платежа. Если деньги уже списались:\n"
-            "1. подожди минуту и нажми «Проверить оплату» ещё раз;\n"
+            "⏳ <b>Platega ещё не подтвердила оплату.</b>\n\n"
+            "Подтверждение приходит на сервер бота — обычно это 5–15 секунд после платежа. "
+            "Если деньги уже списались:\n"
+            "1. подожди минуту и нажми «Проверить оплату» ещё раз — бот сам спросит статус "
+            "у Platega;\n"
             "2. напиши в поддержку — проверим платёж по номеру заказа "
-            f"<code>{order_id}</code> (в кабинете FreeKassa есть кнопка «Уведомить»: "
-            "она отправит уведомление повторно).",
+            f"<code>{order_id}</code>.",
             parse_mode="HTML",
         )
         return
@@ -6504,16 +6594,17 @@ async def cmd_payments(message: Message):
                          + (" (автонастройка ✅)" if YOOKASSA_OAUTH_TOKEN else " (добавляется в кабинете ЮKassa)"))
         else:
             lines.append("• Вебхук: ⚠️ PUBLIC_BASE_URL не задан")
-    if PAYMENTS_MODE == "freekassa":
-        lines.append(f"• Магазин: <code>{escape(FREEKASSA_MERCHANT_ID or 'не задан')}</code>"
-                     + (" (тестовый режим 🧪)" if FREEKASSA_TEST else ""))
-        lines.append(f"• Секретные слова: {'заданы ✅' if freekassa_configured() else 'НЕ заданы ❌'}")
-        lines.append(f"• Платёжная страница: <code>{escape(FREEKASSA_PAY_URL)}</code>, "
-                     f"валюта {escape(FREEKASSA_CURRENCY)}")
-        lines.append(f"• URL оповещения: <code>{escape(PUBLIC_BASE_URL + '/freekassa/webhook')}</code>"
-                     if PUBLIC_BASE_URL else "• URL оповещения: ⚠️ PUBLIC_BASE_URL не задан")
-        lines.append("• Проверка IP: "
-                     + ("включена" if FREEKASSA_CHECK_IP else "выключена (защита — подпись SIGN)"))
+    if PAYMENTS_MODE == "platega":
+        lines.append(f"• Merchant ID: <code>{escape(PLATEGA_MERCHANT_ID or 'не задан')}</code>")
+        lines.append(f"• API-ключ (X-Secret): {'задан ✅' if PLATEGA_SECRET else 'НЕ задан ❌'}")
+        lines.append(f"• API: <code>{escape(PLATEGA_API_URL)}</code>, "
+                     f"валюта {escape(PLATEGA_CURRENCY)}")
+        lines.append("• Способ оплаты: "
+                     + (escape(PLATEGA_METHODS.get(PLATEGA_METHOD, str(PLATEGA_METHOD)))
+                        if PLATEGA_METHOD else "выбирает плательщик на странице Platega"))
+        lines.append(f"• Callback URL: <code>{escape(PUBLIC_BASE_URL + PLATEGA_WEBHOOK_PATH)}</code>"
+                     if PUBLIC_BASE_URL else "• Callback URL: ⚠️ PUBLIC_BASE_URL не задан")
+        lines.append("• Защита callback: заголовки X-MerchantId + X-Secret")
 
     if PAYMENTS_MODE == "stars":
         lines.append(f"• Курс пересчёта: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (меняется через STARS_RUB_RATE)")
@@ -6528,8 +6619,8 @@ async def cmd_payments(message: Message):
 
     if test_tools_enabled():
         lines.append("• Проверка без оплаты: /test_pay ✅ (ключ выдаётся тем же путём, что после оплаты)")
-    elif PAYMENTS_MODE == "freekassa" and admin_tools_enabled():
-        lines.append("• Диагностика магазина без денег: /freekassa_check")
+    elif PAYMENTS_MODE == "platega" and admin_tools_enabled():
+        lines.append("• Диагностика магазина без денег: /platega_check")
 
     lines += [
         "",
@@ -6559,7 +6650,7 @@ async def cmd_payments(message: Message):
 
     if not payments_enabled():
         lines.append(
-            "\n⚠️ <b>Оплата выключена.</b> Задай PAYMENTS_MODE=stars или freekassa "
+            "\n⚠️ <b>Оплата выключена.</b> Задай PAYMENTS_MODE=stars или platega "
             "(проще всего), provider либо yookassa — инструкция в README."
         )
 
@@ -6568,9 +6659,9 @@ async def cmd_payments(message: Message):
     if test_tools_enabled():
         keyboard.append([InlineKeyboardButton(text="🧪 Проверить выдачу ключа без оплаты",
                                               callback_data="testpay_menu")])
-        if PAYMENTS_MODE == "freekassa":
-            keyboard.append([InlineKeyboardButton(text="🔍 Проверить FreeKassa (без денег)",
-                                                  callback_data="freekassa_check")])
+        if PAYMENTS_MODE == "platega":
+            keyboard.append([InlineKeyboardButton(text="🔍 Проверить Platega (без денег)",
+                                                  callback_data="platega_check")])
 
     await message.answer(
         "\n".join(lines)[:4000],
@@ -6623,8 +6714,7 @@ async def cmd_test_pay(message: Message):
     if not test_pay_enabled():
         await message.answer(
             "🧪 Проверка без оплаты выключена.\n\n"
-            "Включи переменную <b>PAYMENTS_ALLOW_TEST_PAY=1</b> в Railway → Variables "
-            "(в тестовом режиме FreeKassa, FREEKASSA_TEST=1, она включается сама). "
+            "Включи переменную <b>PAYMENTS_ALLOW_TEST_PAY=1</b> в Railway → Variables. "
             "После проверки переменную можно убрать.",
             parse_mode="HTML",
         )
@@ -6761,24 +6851,24 @@ async def cb_testpay_del(cb: CallbackQuery):
         )
 
 
-async def cmd_freekassa_check(message: Message):
-    """Проверяет настройки FreeKassa без денег: ключи, подписи, адрес вебхука."""
+async def cmd_platega_check(message: Message):
+    """Проверяет настройки Platega без денег: ключи, API, адрес callback."""
     if not is_admin(message.from_user.id):
         await message.answer(admin_denied_text(message.from_user.id), parse_mode="HTML")
         return
-    if PAYMENTS_MODE != "freekassa":
+    if PAYMENTS_MODE != "platega":
         await message.answer(
-            "ℹ️ Команда нужна для приёма оплаты через FreeKassa. Сейчас режим оплаты: "
+            "ℹ️ Команда нужна для приёма оплаты через Platega. Сейчас режим оплаты: "
             f"<b>{escape(payments_mode_title())}</b>.",
             parse_mode="HTML",
         )
         return
 
-    wait_msg = await message.answer("🔍 Проверяю настройки FreeKassa (без оплаты)...")
+    wait_msg = await message.answer("🔍 Проверяю настройки Platega (без оплаты)...")
     try:
-        text = await freekassa_self_check()
+        text = await platega_self_check()
     except Exception as exc:
-        logger.error("Проверка FreeKassa не удалась: %s", exc)
+        logger.error("Проверка Platega не удалась: %s", exc)
         await send_error_message(message, exc)
         return
     finally:
@@ -6789,15 +6879,15 @@ async def cmd_freekassa_check(message: Message):
     await message.answer(text, parse_mode="HTML")
 
 
-async def cb_freekassa_check(cb: CallbackQuery):
+async def cb_platega_check(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Только для администратора — /myid покажет твой ID.", show_alert=True)
         return
-    await cb.answer("Проверяю настройки FreeKassa...")
+    await cb.answer("Проверяю настройки Platega...")
     try:
-        text = await freekassa_self_check()
+        text = await platega_self_check()
     except Exception as exc:
-        logger.error("Проверка FreeKassa не удалась: %s", exc)
+        logger.error("Проверка Platega не удалась: %s", exc)
         text = f"❌ Не получилось: <code>{escape(_snip(str(exc), 300))}</code>"
     await cb.message.answer(text, parse_mode="HTML")
 
@@ -7412,16 +7502,16 @@ else:
         "Включить при необходимости: ADMIN_TOOLS=1 в Railway → Variables."
     )
 
-# Диагностика связки с FreeKassa: ничего не создаёт и не оплачивает, только читает
-# настройки и считает подписи. Доступна администратору и в боевом режиме — именно там
-# она и нужна, поэтому флагов тестового режима не требует.
-if admin_tools_enabled() and PAYMENTS_MODE == "freekassa":
-    dp.message.register(cmd_freekassa_check, Command("freekassa_check"))
-    dp.callback_query.register(cb_freekassa_check, F.data == "freekassa_check")
-    logger.info("Проверка настроек FreeKassa доступна администратору: /freekassa_check.")
+# Диагностика связки с Platega: ничего не создаёт и не оплачивает, только читает
+# настройки и запрашивает балансы магазина. Доступна администратору и в боевом
+# режиме — именно там она и нужна, поэтому флагов тестового режима не требует.
+if admin_tools_enabled() and PAYMENTS_MODE == "platega":
+    dp.message.register(cmd_platega_check, Command("platega_check"))
+    dp.callback_query.register(cb_platega_check, F.data == "platega_check")
+    logger.info("Проверка настроек Platega доступна администратору: /platega_check.")
 elif admin_tools_enabled():
     logger.info(
-        "Проверка /freekassa_check не нужна: режим оплаты %s, а не freekassa.", PAYMENTS_MODE
+        "Проверка /platega_check не нужна: режим оплаты %s, а не platega.", PAYMENTS_MODE
     )
 
 # Проверка выдачи ключа без оплаты — отдельный флаг TEST_TOOLS и только когда
@@ -7437,7 +7527,7 @@ else:
     # что именно мешает: видно в Railway → Deployments → Logs.
     logger.info(
         "Проверка выдачи ключа без оплаты скрыта: /test_pay не зарегистрирована. "
-        "Включить: ADMIN_TOOLS=1 и (FREEKASSA_TEST=1 или PAYMENTS_ALLOW_TEST_PAY=1 или TEST_TOOLS=1). "
+        "Включить: ADMIN_TOOLS=1 и (PAYMENTS_ALLOW_TEST_PAY=1 или TEST_TOOLS=1). "
         "Сейчас: ADMIN_TOOLS=%s, TEST_TOOLS=%r, режим оплаты %s.",
         int(ADMIN_TOOLS), TEST_TOOLS_RAW or "авто", PAYMENTS_MODE,
     )
@@ -7480,7 +7570,7 @@ def bot_commands() -> list[BotCommand]:
     if test_tools_enabled():
         commands += [
             BotCommand(command="test_pay", description="🧪 Проверить выдачу ключа без оплаты"),
-            BotCommand(command="freekassa_check", description="🔍 Проверить FreeKassa без денег"),
+            BotCommand(command="platega_check", description="🔍 Проверить Platega без денег"),
         ]
     return commands
 
@@ -7506,20 +7596,15 @@ async def main():
 
     payment_store.load()
     logger.info("Приём оплаты: %s.", payments_mode_title())
-    if PAYMENTS_MODE == "freekassa":
-        if FREEKASSA_TEST:
-            logger.warning(
-                "FreeKassa в ТЕСТОВОМ режиме (FREEKASSA_TEST=1): реальные платежи не пройдут. "
-                "Для боя выключи «Тестовый режим» в кабинете FK и убери переменную FREEKASSA_TEST."
-            )
-        elif freekassa_configured():
+    if PAYMENTS_MODE == "platega":
+        if platega_configured():
             logger.info(
-                "FreeKassa в боевом режиме: платежи настоящие. Проверка настроек — /freekassa_check."
+                "Platega в боевом режиме: платежи настоящие. Проверка настроек — /platega_check."
             )
         else:
             logger.warning(
-                "FreeKassa настроена не полностью: нужны FREEKASSA_MERCHANT_ID, FREEKASSA_SECRET1, "
-                "FREEKASSA_SECRET2. Чего не хватает — видно в /myid."
+                "Platega настроена не полностью: нужны PLATEGA_MERCHANT_ID и PLATEGA_SECRET. "
+                "Чего не хватает — видно в /myid."
             )
 
     runner = None

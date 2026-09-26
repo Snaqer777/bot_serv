@@ -3,10 +3,10 @@
 
 Проверяем две вещи:
 
-1. В боевом режиме в боте нет ничего тестового: команды /test_pay и /freekassa_check не
+1. В боевом режиме в боте нет ничего тестового: команды /test_pay и /platega_check не
    регистрируются, их кнопок нет в /payments, подсказок про PAYMENTS_ALLOW_TEST_PAY
    пользователю не показывается. Тестовый режим включается только явно
-   (PAYMENTS_ALLOW_TEST_PAY=1, тестовый режим FreeKassa или TEST_TOOLS=1).
+   (PAYMENTS_ALLOW_TEST_PAY=1 или TEST_TOOLS=1).
 
 2. Пользовательское соглашение: доступно командой /terms и кнопкой в меню, умещается
    в одно сообщение Telegram, содержит обязательные разделы и синхронно с TERMS.md.
@@ -24,14 +24,14 @@ from panel import load_bot
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ADMIN_ID = 42
-# Выдача ключа без оплаты — тестовый инструмент (TEST_TOOLS / FREEKASSA_TEST /
+# Выдача ключа без оплаты — тестовый инструмент (TEST_TOOLS /
 # PAYMENTS_ALLOW_TEST_PAY).
 TEST_PAY_HANDLERS = {
     "cmd_test_pay", "cb_testpay_menu", "cb_testpay_run", "cb_testpay_del",
 }
-# Диагностика настроек FreeKassa — только чтение: доступна администратору и в бою.
-FREEKASSA_CHECK_HANDLERS = {"cmd_freekassa_check", "cb_freekassa_check"}
-TEST_HANDLERS = TEST_PAY_HANDLERS | FREEKASSA_CHECK_HANDLERS
+# Диагностика настроек Platega — только чтение: доступна администратору и в бою.
+PLATEGA_CHECK_HANDLERS = {"cmd_platega_check", "cb_platega_check"}
+TEST_HANDLERS = TEST_PAY_HANDLERS | PLATEGA_CHECK_HANDLERS
 ADMIN_HANDLERS = {
     "cmd_inbounds", "cmd_reset_vpn", "cmd_groups", "cmd_panel_debug",
     "cmd_totp", "cmd_payments", "cmd_revoke",
@@ -159,10 +159,9 @@ def load(env=None):
         "PAYMENT_STORE_FILE": os.path.join(tempfile.mkdtemp(), "orders.json"),
         "BOT_USERNAME": env.get("bot_username", "myvpnbot"),
         "PAYMENTS_ALLOW_TEST_PAY": env.get("allow_test_pay"),
-        "FREEKASSA_TEST": env.get("fk_test"),
-        "FREEKASSA_MERCHANT_ID": env.get("merchant"),
-        "FREEKASSA_SECRET1": env.get("secret1"),
-        "FREEKASSA_SECRET2": env.get("secret2"),
+        "PLATEGA_MERCHANT_ID": env.get("merchant"),
+        "PLATEGA_SECRET": env.get("secret"),
+        "PLATEGA_API_URL": env.get("api_url") or "http://127.0.0.1:9",
         "TEST_TOOLS": env.get("test_tools"),
         "ADMIN_TOOLS": env.get("admin_tools"),
         "TRIAL_PUBLIC": env.get("trial_public"),
@@ -196,8 +195,8 @@ async def test_production_look():
     check("ни один тестовый обработчик не зарегистрирован",
           not (TEST_HANDLERS & (msg_handlers | cb_handlers)),
           str(sorted(TEST_HANDLERS & (msg_handlers | cb_handlers))))
-    check("диагностика FreeKassa не отвечает, пока не включены служебные команды",
-          not (FREEKASSA_CHECK_HANDLERS & (msg_handlers | cb_handlers)))
+    check("диагностика Platega не отвечает, пока не включены служебные команды",
+          not (PLATEGA_CHECK_HANDLERS & (msg_handlers | cb_handlers)))
 
     commands = []
 
@@ -207,8 +206,8 @@ async def test_production_look():
     bot.bot.set_my_commands = fake_set_my_commands
     await bot.on_startup()
     names = [c.command for c in commands]
-    check("в меню Telegram нет /test_pay и /freekassa_check",
-          "test_pay" not in names and "freekassa_check" not in names, str(names))
+    check("в меню Telegram нет /test_pay и /platega_check",
+          "test_pay" not in names and "platega_check" not in names, str(names))
     check("в меню Telegram есть /terms, /help и /invite",
           {"terms", "help", "invite"} <= set(names), str(names))
     check("служебных команд админа в меню нет",
@@ -230,7 +229,7 @@ async def test_production_look():
     await bot.cmd_payments(msg)
     text = msg.last
     check("в /payments нет кнопок проверок",
-          not any(str(cb or "").startswith(("testpay_", "freekassa_check")) for cb in callbacks_of(msg.kwargs[-1].get("reply_markup"))),
+          not any(str(cb or "").startswith(("testpay_", "platega_check")) for cb in callbacks_of(msg.kwargs[-1].get("reply_markup"))),
           str(callbacks_of(msg.kwargs[-1].get("reply_markup"))))
     check("в /payments нет подсказок про PAYMENTS_ALLOW_TEST_PAY",
           "PAYMENTS_ALLOW_TEST_PAY" not in text and "/test_pay" not in text)
@@ -270,12 +269,12 @@ async def test_production_look():
     await bot.cmd_start(start)
     check("/start отправляет к соглашению", "/terms" in start.last)
     check("/start не упоминает тестовые команды",
-          "/test_pay" not in start.last and "/freekassa_check" not in start.last)
+          "/test_pay" not in start.last and "/platega_check" not in start.last)
 
 
 async def test_test_mode_returns_tools():
     print("\n▶ 2. Тестовый режим: команды проверки возвращаются")
-    bot = load({"mode": "freekassa", "merchant": "14248", "secret1": "s1", "secret2": "s2",
+    bot = load({"mode": "platega", "merchant": "14248", "secret": "s1",
                 "allow_test_pay": "1", "admin_tools": "1"})
     check("проверка включена явно", bot.test_tools_enabled() is True)
     handlers = handler_names(bot.dp.message) | handler_names(bot.dp.callback_query)
@@ -286,7 +285,7 @@ async def test_test_mode_returns_tools():
     await bot.cmd_payments(msg)
     cbs = callbacks_of(msg.kwargs[-1].get("reply_markup"))
     check("в /payments вернулись кнопки проверок",
-          "testpay_menu" in cbs and "freekassa_check" in cbs, str(cbs))
+          "testpay_menu" in cbs and "platega_check" in cbs, str(cbs))
 
     commands = []
 
@@ -297,30 +296,24 @@ async def test_test_mode_returns_tools():
     await bot.on_startup()
     names = [c.command for c in commands]
     check("команды проверки снова в меню Telegram",
-          "test_pay" in names and "freekassa_check" in names, str(names))
+          "test_pay" in names and "platega_check" in names, str(names))
 
-    # Тестовый режим FreeKassa включает проверку сама, но TEST_TOOLS=0 её прячет
-    fk_test = load({"mode": "freekassa", "merchant": "14248", "secret1": "s1", "secret2": "s2",
-                    "fk_test": "1", "admin_tools": "1"})
-    check("в тестовом режиме FreeKassa проверка включается автоматически",
-          fk_test.test_tools_enabled() is True)
-
-    hidden = load({"mode": "freekassa", "merchant": "14248", "secret1": "s1", "secret2": "s2",
-                   "fk_test": "1", "admin_tools": "1", "test_tools": "0"})
-    check("TEST_TOOLS=0 прячет проверку даже в тестовом режиме", hidden.test_tools_enabled() is False)
+    hidden = load({"mode": "platega", "merchant": "14248", "secret": "s1",
+                   "allow_test_pay": "1", "admin_tools": "1", "test_tools": "0"})
+    check("TEST_TOOLS=0 прячет проверку, даже если она разрешена", hidden.test_tools_enabled() is False)
     hidden_handlers = handler_names(hidden.dp.message) | handler_names(hidden.dp.callback_query)
     check("в этом случае выдача без оплаты недоступна",
           not (TEST_PAY_HANDLERS & hidden_handlers),
           str(sorted(TEST_PAY_HANDLERS & hidden_handlers)))
-    check("диагностика /freekassa_check остаётся доступной",
-          FREEKASSA_CHECK_HANDLERS <= hidden_handlers)
+    check("диагностика /platega_check остаётся доступной",
+          PLATEGA_CHECK_HANDLERS <= hidden_handlers)
 
-    forced = load({"mode": "freekassa", "merchant": "14248", "secret1": "s1", "secret2": "s2",
+    forced = load({"mode": "platega", "merchant": "14248", "secret": "s1",
                    "test_tools": "1", "admin_tools": "1"})
     check("TEST_TOOLS=1 включает проверку в боевом режиме", forced.test_tools_enabled() is True)
 
     # Без служебных команд проверки оплаты не показываются даже при allow_test_pay
-    no_admin = load({"mode": "freekassa", "merchant": "14248", "secret1": "s1", "secret2": "s2",
+    no_admin = load({"mode": "platega", "merchant": "14248", "secret": "s1",
                      "allow_test_pay": "1", "admin_tools": "0"})
     check("ADMIN_TOOLS=0 прячет проверки оплаты", no_admin.test_tools_enabled() is False)
     check("обработчиков проверок нет", not (TEST_HANDLERS & (handler_names(no_admin.dp.message)
@@ -328,16 +321,16 @@ async def test_test_mode_returns_tools():
 
 
 async def test_wartime_diagnostics():
-    print("\n▶ 2б. Боевой режим: диагностика FreeKassa доступна, выдача без оплаты — нет")
-    bot = load({"mode": "freekassa", "merchant": "14248", "secret1": "s1", "secret2": "s2",
+    print("\n▶ 2б. Боевой режим: диагностика Platega доступна, выдача без оплаты — нет")
+    bot = load({"mode": "platega", "merchant": "14248", "secret": "s1",
                 "admin_tools": "1"})
     handlers = handler_names(bot.dp.message) | handler_names(bot.dp.callback_query)
-    check("в бою /freekassa_check зарегистрирована", FREEKASSA_CHECK_HANDLERS <= handlers,
-          str(sorted(FREEKASSA_CHECK_HANDLERS - handlers)))
+    check("в бою /platega_check зарегистрирована", PLATEGA_CHECK_HANDLERS <= handlers,
+          str(sorted(PLATEGA_CHECK_HANDLERS - handlers)))
     check("в бою /test_pay не зарегистрирована", not (TEST_PAY_HANDLERS & handlers),
           str(sorted(TEST_PAY_HANDLERS & handlers)))
     check("в бою test_tools_enabled() выключен", bot.test_tools_enabled() is False)
-    check("режим оплаты — боевой", bot.FREEKASSA_TEST is False)
+    check("режим оплаты — ключи Platega заданы", bot.platega_configured() is True)
 
     commands = []
 
@@ -347,20 +340,20 @@ async def test_wartime_diagnostics():
     bot.bot.set_my_commands = fake_set_my_commands
     await bot.on_startup()
     names = [c.command for c in commands]
-    check("в бою в меню Telegram нет ни /test_pay, ни /freekassa_check",
-          "test_pay" not in names and "freekassa_check" not in names, str(names))
+    check("в бою в меню Telegram нет ни /test_pay, ни /platega_check",
+          "test_pay" not in names and "platega_check" not in names, str(names))
 
     msg = FakeMsg()
     await bot.cmd_payments(msg)
     text = msg.last
     check("в /payments нет ни /test_pay, ни PAYMENTS_ALLOW_TEST_PAY",
           "/test_pay" not in text and "PAYMENTS_ALLOW_TEST_PAY" not in text)
-    check("в /payments есть подсказка про диагностику", "/freekassa_check" in text)
+    check("в /payments есть подсказка про диагностику", "/platega_check" in text)
 
     myid = FakeMsg(uid=ADMIN_ID, text="/myid")
     await bot.cmd_myid(myid)
     check("/myid в бою: диагностика отмечена доступной",
-          "/freekassa_check" in myid.last and "доступна" in myid.last)
+          "/platega_check" in myid.last and "доступна" in myid.last)
     check("/myid в бою: выдача без оплаты отмечена скрытой",
           "/test_pay" in myid.last and "скрыта" in myid.last)
     check("/myid в бою: подсказан способ включить выдачу",
@@ -680,9 +673,9 @@ async def test_terms_file_matches_bot():
           "платёжный провайдер" in bot_text and "chargeback" in bot_text)
     check("в документе оплата идёт через платёжного провайдера",
           "платёжным провайдером" in doc and "chargeback" in doc)
-    check("в соглашении не осталось старых платёжных систем (CryptoBot, FreeKassa)",
+    check("в соглашении не осталось названий платёжных систем",
           all(system not in bot_text and system not in doc
-              for system in ("CryptoBot", "FreeKassa", "ЮKassa")))
+              for system in ("CryptoBot", "FreeKassa", "ЮKassa", "Platega")))
 
     # Политика конфиденциальности — отдельный документ репозитория
     privacy_path = os.path.join(REPO_DIR, "PRIVACY.md")

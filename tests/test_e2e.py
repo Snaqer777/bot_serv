@@ -6,7 +6,7 @@ test_production), здесь один длинный путь: первый за
 инструкция → тарифы → оплата → ключ → профиль → рефералка → админ-функции →
 тестовый ключ. Каждый шаг идёт через
 настоящий слой aiogram: сообщения уходят на фейковый Bot API, ключи создаются в
-фейковой панели 3x-ui, оплата проходит через эмуляцию FreeKassa.
+фейковой панели 3x-ui, оплата проходит через фейковый API Platega и её callback.
 
 Запуск: python tests/test_e2e.py
 """
@@ -24,7 +24,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.types import CallbackQuery, Message
 
-import test_payments as fp   # фейковые Bot API / FreeKassa / помощники
+import test_payments as fp   # фейковые Bot API / Platega / помощники
 
 ADMIN = 4242          # владелец бота
 FRIEND = 7777         # друг, пришедший по реферальной ссылке
@@ -86,15 +86,13 @@ def got_terms(chat_id):
 # ---------------- инфраструктура ----------------
 
 def e2e_bot(store_file, ref_file, admins=None, secret=TOTP_SECRET, **overrides):
-    """Бот на фейковых Telegram + 3x-ui + FreeKassa со всеми функциями включёнными."""
+    """Бот на фейковых Telegram + 3x-ui + Platega со всеми функциями включёнными."""
     full_env = {
-        "PAYMENTS_MODE": "freekassa",
-        "FREEKASSA_MERCHANT_ID": fp.FK_MERCHANT_ID,
-        "FREEKASSA_SECRET1": fp.FK_SECRET1,
-        "FREEKASSA_SECRET2": fp.FK_SECRET2,
-        "FREEKASSA_PAY_URL": "https://pay.freekassa.ru/",
-        "FREEKASSA_CURRENCY": "RUB",
-        "FREEKASSA_TEST": "1",        # тестовый режим FK: деньги не списываются
+        "PAYMENTS_MODE": "platega",
+        "PLATEGA_MERCHANT_ID": fp.PLAT_MERCHANT_ID,
+        "PLATEGA_SECRET": fp.PLAT_SECRET,
+        "PLATEGA_API_URL": f"http://127.0.0.1:{fp.PLAT_PORT}",
+        "PLATEGA_CURRENCY": "RUB",
         "PUBLIC_BASE_URL": f"http://127.0.0.1:{fp.WEBHOOK_PORT}",
         "PORT": str(fp.WEBHOOK_PORT),
         "PAYMENT_STORE_FILE": store_file,
@@ -179,9 +177,9 @@ def days_left(client):
     return round((int(client["expiryTime"]) - int(time.time() * 1000)) / 86_400_000, 1)
 
 
-async def pay_via_freekassa(bot, uid, tariff, *, post=False, location=None):
+async def pay_via_platega(bot, uid, tariff, *, confirmed=True, location=None):
     """
-    Полный путь оплаты: ссылка на оплату → уведомление FreeKassa → выдача ключа.
+    Полный путь оплаты: ссылка на оплату → callback Platega → выдача ключа.
 
     location — выбранный сервер для тарифов с одним туннелем (как в кнопке
     «💳 Оплатить» после трёх шагов выбора).
@@ -195,10 +193,11 @@ async def pay_via_freekassa(bot, uid, tariff, *, post=False, location=None):
         cb = click(bot, f"buy_{tariff}", uid=uid)
         await bot.cb_buy(cb)
     order = [o for o in bot.payment_store.orders.values() if o["tg_id"] == uid][-1]
-    status, body = await fp.post_fk_notification(order["id"], order["amount_rub"],
-                                                method="post" if post else "get",
-                                                intid=f"77{len(bot.payment_store.orders):04d}")
-    assert status == 200 and body.strip() == "YES", (status, body)
+    status, body = await fp.post_platega_callback(
+        order["id"], order["amount_rub"],
+        status="CONFIRMED" if confirmed else "PENDING",
+        transaction_id=str(order.get("payment_id") or f"77{len(bot.payment_store.orders):04d}"))
+    assert status == 200, (status, body)
     return order["id"]
 
 
@@ -320,8 +319,8 @@ async def step_payment(bot):
     check("в кнопках тарифов нет buy_trial",
           "buy_trial" not in buttons(last_edit(ADMIN)), str(buttons(last_edit(ADMIN))))
     check("есть напоминание про условия сервиса", "/terms" in tariffs_text)
-    check("сказано, что оплата через FreeKassa и ключ придёт сразу",
-          "FreeKassa" in tariffs_text and "после оплаты" in tariffs_text)
+    check("сказано, что оплата на защищённой странице и ключ придёт сразу",
+          "Platega" in tariffs_text and "после оплаты" in tariffs_text)
 
     # Шаг 2: уровни выбранного типа подписки
     fp.TG["calls"].clear()
@@ -348,7 +347,7 @@ async def step_payment(bot):
           "Цена" in confirm_text and "Туннелей" in confirm_text
           and f"buyat_time_3" in buttons(last_edit(ADMIN)))
 
-    order_id = await pay_via_freekassa(bot, ADMIN, "time_3")
+    order_id = await pay_via_platega(bot, ADMIN, "time_3")
     client = panel_client(ADMIN)
     check("после оплаты клиент создан в панели", client is not None)
     check("срок подписки 30 дней", 29 <= (days_left(client) or 0) <= 30,
@@ -448,9 +447,9 @@ async def step_referral(bot):
           any("Тебя пригласили" in t for t in texts_to(FRIEND)))
 
     expiry_before = int(panel_client(ADMIN)["expiryTime"])
-    await pay_via_freekassa(bot, FRIEND, "time_4", post=True)   # уведомление методом POST
+    await pay_via_platega(bot, FRIEND, "time_4")
     friend_client = panel_client(FRIEND)
-    check("друг получил ключ через уведомление FreeKassa", friend_client is not None)
+    check("друг получил ключ через callback Platega", friend_client is not None)
     check("другу добавили +3 дня к тарифу (33)",
           32 <= (days_left(friend_client) or 0) <= 33, f"{days_left(friend_client)} дн.")
     check("друг получил уведомление про бонус",
@@ -477,7 +476,7 @@ async def step_admin_tools(bot):
     check("/payments показывает режим и выручку",
           "Оплата подписок" in payments_text and "Выручка" in payments_text)
     check("/payments показывает кнопки проверок",
-          {"testpay_menu", "freekassa_check"} <= set(buttons(last_sent(ADMIN))))
+          {"testpay_menu", "platega_check"} <= set(buttons(last_sent(ADMIN))))
 
     fp.TG["calls"].clear()
     await bot.cmd_panel_debug(make_message(bot, ADMIN, "/panel_debug"))
@@ -539,12 +538,12 @@ async def step_admin_tools(bot):
           (await bot.payment_store.get(order_id))["status"] == "canceled")
 
     fp.TG["calls"].clear()
-    await bot.cmd_freekassa_check(make_message(bot, ADMIN, "/freekassa_check"))
+    await bot.cmd_platega_check(make_message(bot, ADMIN, "/platega_check"))
     self_check = last_text(ADMIN)
-    check("/freekassa_check проверяет настройки без денег",
-          "Проверка FreeKassa" in self_check and "Подпись" in self_check)
-    check("в отчёте есть адрес оповещений для кабинета FK",
-          "/freekassa/webhook" in self_check)
+    check("/platega_check проверяет настройки без денег",
+          "Проверка Platega" in self_check and "ключи приняты" in self_check)
+    check("в отчёте есть Callback URL для кабинета Platega",
+          fp.PLAT_WEBHOOK_PATH in self_check)
 
     fp.TG["calls"].clear()
     await bot.cmd_revoke(make_message(bot, ADMIN, f"/revoke {FRIEND}"))
@@ -588,7 +587,7 @@ async def step_production_bot(store_file, ref_file):
     check("служебные команды не зарегистрированы",
           not ({"cmd_payments", "cmd_panel_debug", "cmd_totp", "cmd_groups",
                 "cmd_inbounds", "cmd_reset_vpn", "cmd_revoke", "cmd_test_pay",
-                "cmd_freekassa_check"} & handlers),
+                "cmd_platega_check"} & handlers),
           str(sorted(handlers)))
     check("/myid остаётся всегда", "cmd_myid" in handlers)
 
@@ -620,7 +619,8 @@ async def main():
     runners = []
     fp.reset_all()
     reset()
-    for port, app in ((fp.PANEL_PORT, make_app()), (fp.TG_PORT, fp.make_tg_app())):
+    for port, app in ((fp.PANEL_PORT, make_app()), (fp.TG_PORT, fp.make_tg_app()),
+                      (fp.PLAT_PORT, fp.make_platega_app())):
         runner = web.AppRunner(app)
         await runner.setup()
         await web.TCPSite(runner, "127.0.0.1", port).start()
