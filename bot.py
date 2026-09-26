@@ -16,7 +16,7 @@ import uuid
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from decimal import ROUND_UP, Decimal, InvalidOperation
+from decimal import ROUND_DOWN, ROUND_UP, Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from html import escape
 from urllib.parse import quote, urlencode, urlsplit
@@ -74,6 +74,18 @@ def _parse_id_list(raw: str) -> list[int]:
                 chunk,
             )
     return ids
+
+
+def _float_env(name: str, default: float = 0.0) -> float:
+    """Безопасно считывает число (можно с дробной частью) из переменной окружения."""
+    val = (os.getenv(name) or "").replace(",", ".").strip()
+    if not val:
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        logger.warning("Переменная %s ('%s') не является числом, беру %s", name, val, default)
+        return default
 
 
 def _int_env(name: str, default: int = 0) -> int:
@@ -366,6 +378,14 @@ PLATEGA_METHODS = {
 # только если касса присылает сумму за вычетом комиссии (нетто) и клиент платит ровно
 # цену: тогда, например, 5 примет оплату от 95 % суммы заказа. Больше 90 не применяется.
 PLATEGA_AMOUNT_TOLERANCE_PERCENT = _int_env("PLATEGA_AMOUNT_TOLERANCE_PERCENT", 0)
+
+# Комиссия кассы, которую берём на себя (в процентах). По умолчанию 0: счёт выставляется
+# ровно на цену тарифа, и если касса добавляет свою комиссию плательщику, клиент платит
+# больше (тариф 70 ₽ → к списанию 75,6 ₽). Если задать процент, бот сам уменьшает счёт —
+# цена тарифа / (1 + процент/100) с округлением вниз до копейки, — чтобы на платёжной
+# странице клиент видел сумму как в тарифе, а комиссию оплачивал мерчант.
+# Больше 90 не применяется. Пример: 8 → тариф 70 ₽ превращается в счёт 64,81 ₽.
+PLATEGA_PAYER_FEE_PERCENT = _float_env("PLATEGA_PAYER_FEE_PERCENT", 0.0)
 
 # Куда Platega вернёт плательщика после успешной оплаты и после неудачи.
 # Пусто — используется ссылка на бота (клиент возвращается прямо в Telegram).
@@ -3260,13 +3280,15 @@ async def recheck_order_payment(order: dict) -> tuple[str, str]:
                     f"по номеру заказа <code>{escape(order['id'])}</code>.",
                 )
             paid_rub = platega_paid_amount(amount)
-            if paid_rub is not None and round(paid_rub * 100) != order_amount(order):
-                # Переплата = комиссия платёжного способа. Запоминаем факт, чтобы он был
-                # виден в /payments (в выручке бот считает по цене тарифа).
-                logger.info(
-                    "Platega: заказ %s оплачен на %.2f ₽ при цене тарифа %s ₽ (разница — комиссия способа оплаты)",
-                    order["id"], paid_rub, order["amount_rub"],
-                )
+            if paid_rub is not None:
+                # Фактически оплаченную сумму запоминаем, чтобы она была видна в /payments
+                # (в выручке бот считает по цене тарифа).
+                if round(paid_rub * 100) != order_amount(order):
+                    logger.info(
+                        "Platega: заказ %s оплачен на %.2f ₽ при цене тарифа %s ₽ (счёт %.2f ₽)",
+                        order["id"], paid_rub, order["amount_rub"],
+                        float(order.get("payment_amount_rub") or order["amount_rub"]),
+                    )
                 await payment_store.update(order["id"], paid_amount=paid_rub)
             return "paid", status
         if status in ("CANCELED", "CHARGEBACKED"):
@@ -3350,6 +3372,39 @@ def platega_amount(order: dict) -> float | int:
     return int(price) if price == int(price) else round(price, 2)
 
 
+def platega_checkout_amount(order: dict) -> float | int:
+    """
+    Сумма, которую бот просит в счёте Platega.
+
+    Обычно это цена тарифа. Если задан PLATEGA_PAYER_FEE_PERCENT, вычитаем комиссию
+    кассы, которую берём на себя: цена / (1 + процент/100). Округляем вниз до копейки —
+    тогда касса добавит свою надбавку сверху, и клиент на платёжной странице увидит
+    ровно цену тарифа (а не цену плюс комиссия, как без переменной).
+    """
+    price = float(order.get("amount_rub") or 0)
+    if price > 0 and PLATEGA_PAYER_FEE_PERCENT > 0:
+        percent = min(PLATEGA_PAYER_FEE_PERCENT, 90.0)
+        gross = Decimal(str(price)) / (Decimal("1") + Decimal(str(percent)) / 100)
+        price = float(gross.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+    return int(price) if price == int(price) else round(price, 2)
+
+
+def platega_minimum_kop(order: dict) -> int:
+    """
+    Минимальная сумма, которую бот считает оплатой заказа (в копейках).
+
+    Это выставленный счёт: обычно цена тарифа, а в режиме «комиссия на нас» — меньше
+    неё ровно на комиссию (касса добавит её сверху, клиент заплатит цену тарифа).
+    Небольшой люфт вниз — PLATEGA_AMOUNT_TOLERANCE_PERCENT.
+    """
+    amount = order.get("payment_amount_rub") or order.get("amount_rub")
+    kop = round(float(amount or 0) * 100)
+    if PLATEGA_AMOUNT_TOLERANCE_PERCENT > 0:
+        percent = min(PLATEGA_AMOUNT_TOLERANCE_PERCENT, 90)
+        kop = round(kop * (100 - percent) / 100)
+    return kop
+
+
 def platega_paid_amount(amount) -> float | None:
     """Оплаченная сумма в рублях (None, если в платёжке мусор вместо числа)."""
     try:
@@ -3362,20 +3417,17 @@ def platega_amount_matches(order: dict, amount) -> bool:
     """
     Хватает ли оплаченной суммы на заказ (сравниваем в копейках).
 
-    Переплата — нормальная ситуация, и отказывать из-за неё нельзя: способы оплаты
-    добавляют к счёту комиссию плательщика (тариф 70 ₽, а с карты списывается 75,6 ₽),
-    и касса сообщает именно эту сумму. Поэтому принимаем всё, что не меньше цены
-    заказа; недоплата не проходит — она не покрывает заказ. Небольшой люфт вниз можно
-    разрешить переменной PLATEGA_AMOUNT_TOLERANCE_PERCENT (по умолчанию 0).
+    Переплата — нормальная ситуация, и отказывать из-за неё нельзя: касса может
+    добавить к счёту комиссию плательщика (тариф 70 ₽, а с карты списывается 75,6 ₽)
+    и сообщает именно эту сумму. Поэтому принимаем всё, что не меньше выставленного
+    счёта (см. platega_minimum_kop): это либо цена тарифа, либо, в режиме «комиссия
+    на нас», цена минус комиссия — тогда касса добавляет её сверху и клиент платит
+    ровно цену тарифа. Недоплата не проходит.
     """
     paid_rub = platega_paid_amount(amount)
     if paid_rub is None:
         return False
-    minimum_kop = order_amount(order)
-    if PLATEGA_AMOUNT_TOLERANCE_PERCENT > 0:
-        percent = min(PLATEGA_AMOUNT_TOLERANCE_PERCENT, 90)
-        minimum_kop = round(minimum_kop * (100 - percent) / 100)
-    return round(paid_rub * 100) >= minimum_kop
+    return round(paid_rub * 100) >= platega_minimum_kop(order)
 
 
 def platega_credentials_valid(merchant_id: str | None, secret: str | None) -> bool:
@@ -3419,7 +3471,7 @@ async def platega_create_payment(order: dict) -> dict:
 
     back_url = await platega_back_url()
     body = {
-        "paymentDetails": {"amount": platega_amount(order), "currency": PLATEGA_CURRENCY},
+        "paymentDetails": {"amount": platega_checkout_amount(order), "currency": PLATEGA_CURRENCY},
         "description": f"Оплата подписки {order.get('tariff_name') or order.get('tariff') or ''}".strip()[:120],
         "return": PLATEGA_RETURN_URL or back_url,
         "failedUrl": PLATEGA_FAILED_URL or back_url,
@@ -3581,25 +3633,28 @@ async def process_platega_callback(
         return 200, "заказ уже оплачен, повторный callback подтверждён"
 
     paid_rub = platega_paid_amount(payload_body.get("amount"))
-    underpaid = paid_rub is not None and round(paid_rub * 100) < order_amount(order)
     if not platega_amount_matches(order, payload_body.get("amount")):
         logger.error(
-            "Platega: оплачено %s ₽ — меньше суммы заказа %s (%s ₽), ключ не выдаю",
-            payload_body.get("amount"), order["id"], order["amount_rub"],
+            "Platega: оплачено %s ₽ — меньше счёта по заказу %s (счёт %.2f ₽, цена тарифа %s ₽), ключ не выдаю",
+            payload_body.get("amount"), order["id"],
+            float(order.get("payment_amount_rub") or order["amount_rub"]), order["amount_rub"],
         )
         return 400, "сумма платежа меньше стоимости заказа"
-    if paid_rub is not None and round(paid_rub * 100) != order_amount(order):
-        # Разница — комиссия платёжного способа: её берёт не бот, а касса. Сохраняем
-        # фактическую сумму, чтобы она была видна в /payments и в статистике поддержки.
-        over = paid_rub - float(order["amount_rub"])
-        logger.info(
-            "Platega: заказ %s оплачен на %.2f ₽ (цена тарифа %.2f ₽, разница %+.2f ₽ — комиссия платёжного способа)",
-            order["id"], paid_rub, float(order["amount_rub"]), over,
-        )
+
+    if paid_rub is not None:
+        # Фактически оплаченную сумму сохраняем: она видна в /payments и у поддержки.
         await payment_store.update(order["id"], paid_amount=paid_rub)
-        if underpaid:
-            # Недоплата прошла только при разрешённом люфте (PLATEGA_AMOUNT_TOLERANCE_PERCENT):
-            # клиент получит доступ, но админ должен знать, что денег пришло меньше тарифа.
+    if paid_rub is not None and round(paid_rub * 100) != order_amount(order):
+        fee_on_us = bool(order.get("payment_amount_rub"))
+        logger.info(
+            "Platega: заказ %s оплачен на %.2f ₽ (цена тарифа %s ₽, счёт %.2f ₽, %s)",
+            order["id"], paid_rub, order["amount_rub"],
+            float(order.get("payment_amount_rub") or order["amount_rub"]),
+            "комиссию кассы берём на себя" if fee_on_us else "разницу добавила касса — комиссия платёжного способа",
+        )
+        if round(paid_rub * 100) < order_amount(order) and not fee_on_us:
+            # Денег пришло меньше цены тарифа: оплата прошла только благодаря люфту
+            # (PLATEGA_AMOUNT_TOLERANCE_PERCENT) — клиент доступ получит, но админ должен знать.
             await notify_admins(
                 "⚠️ <b>Platega: оплата меньше цены тарифа.</b>\n\n"
                 f"• Заказ: <code>{escape(order['id'])}</code>\n"
@@ -4469,6 +4524,27 @@ async def platega_self_check() -> str:
            if PLATEGA_METHOD
            else "плательщик выбирает на странице Platega")
     )
+    if PLATEGA_PAYER_FEE_PERCENT > 0:
+        sample_tariff = min(
+            (t for t in TARIFFS.values() if float(t.get("price") or 0) > 0),
+            key=lambda t: float(t["price"]),
+            default=None,
+        )
+        sample_note = ""
+        if sample_tariff:
+            sample_note = (
+                f" (тариф {sample_tariff['price']} ₽ → счёт "
+                f"{platega_checkout_amount({'amount_rub': sample_tariff['price']}):g} ₽)"
+            )
+        lines.append(
+            f"• Комиссия кассы <b>{PLATEGA_PAYER_FEE_PERCENT:g} %</b> берём на себя{sample_note}: "
+            "счёт выставляется меньше цены тарифа, чтобы клиент на странице платил как в тарифе"
+        )
+    else:
+        lines.append(
+            "• Комиссия кассы: платит клиент (счёт = цена тарифа). Чтобы взять её на себя, "
+            "задай <code>PLATEGA_PAYER_FEE_PERCENT</code>"
+        )
     egress_ip = await fetch_egress_ip()
     lines.append(
         "• Исходящий IP бота: "
@@ -4655,7 +4731,20 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
             raise
         transaction_id = str(data.get("transactionId") or data.get("id") or "")
         pay_url = platega_payment_url(data)
-        await payment_store.update(order["id"], payment_id=transaction_id, payment_url=pay_url)
+        checkout_amount = platega_checkout_amount(order)
+        if round(float(checkout_amount) * 100) != order_amount(order):
+            # Счёт выставлен меньше цены тарифа (комиссию кассы берём на себя): сохраняем,
+            # чтобы проверка оплаты знала минимум и чтобы это было видно в /payments.
+            logger.info(
+                "Platega: комиссию берём на себя — заказ %s, цена тарифа %s ₽, счёт %.2f ₽",
+                order["id"], order["amount_rub"], float(checkout_amount),
+            )
+        await payment_store.update(
+            order["id"],
+            payment_id=transaction_id,
+            payment_url=pay_url,
+            payment_amount_rub=checkout_amount,
+        )
 
         expires = str(data.get("expiresIn") or "")
         keyboard = InlineKeyboardMarkup(
@@ -6850,6 +6939,16 @@ async def cmd_payments(message: Message):
         lines.append(f"• Callback URL: <code>{escape(PUBLIC_BASE_URL + PLATEGA_WEBHOOK_PATH)}</code>"
                      if PUBLIC_BASE_URL else "• Callback URL: ⚠️ PUBLIC_BASE_URL не задан")
         lines.append("• Защита callback: заголовки X-MerchantId + X-Secret")
+        if PLATEGA_PAYER_FEE_PERCENT > 0:
+            lines.append(
+                f"• Комиссия кассы <b>{PLATEGA_PAYER_FEE_PERCENT:g} %</b> берём на себя: счёт "
+                "выставляется меньше цены тарифа, чтобы клиент на странице платил как в тарифе"
+            )
+        else:
+            lines.append(
+                "• Комиссия кассы: если она добавляется сверху и её нужно взять на себя, "
+                "задай <code>PLATEGA_PAYER_FEE_PERCENT</code> (например, 8)"
+            )
 
     if PAYMENTS_MODE == "stars":
         lines.append(f"• Курс пересчёта: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (меняется через STARS_RUB_RATE)")
@@ -6888,10 +6987,15 @@ async def cmd_payments(message: Message):
             icons = {"paid": "✅", "pending": "⏳", "canceled": "❌", "failed": "⚠️"}
             amount = f"{order['amount_stars']} ⭐️" if order["currency"] == "XTR" else f"{order['amount_rub']} ₽"
             paid = order.get("paid_amount")
-            paid_note = (
-                f" <i>(оплачено {paid:.2f} ₽ — комиссия платёжного способа)</i>".replace(".00", "")
-                if paid and round(float(paid) * 100) != order_amount(order) else ""
-            )
+            checkout = order.get("payment_amount_rub")
+            if paid and checkout and round(float(checkout) * 100) != order_amount(order):
+                # Комиссию кассы взяли на себя: показываем и счёт, и сколько заплатил клиент.
+                paid_note = (f" <i>(счёт {float(checkout):g} ₽ → оплачено {float(paid):g} ₽, "
+                             "комиссия кассы на нас)</i>")
+            elif paid and round(float(paid) * 100) != order_amount(order):
+                paid_note = f" <i>(оплачено {float(paid):g} ₽ — комиссия платёжного способа)</i>"
+            else:
+                paid_note = ""
             lines.append(
                 f"{icons.get(order.get('status'), '❔')} <code>{escape(order['id'])}</code> — "
                 f"{escape(order.get('tariff_name', '?'))}, {amount}, TG <code>{order['tg_id']}</code>"

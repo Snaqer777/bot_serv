@@ -346,6 +346,7 @@ def new_bot(env, store_file, admins=None):
         "PLATEGA_RETURN_URL": env.get("return_url"),
         "PLATEGA_FAILED_URL": env.get("failed_url"),
         "PLATEGA_AMOUNT_TOLERANCE_PERCENT": env.get("tolerance"),
+        "PLATEGA_PAYER_FEE_PERCENT": env.get("payer_fee"),
         "PUBLIC_BASE_URL": f"http://127.0.0.1:{WEBHOOK_PORT}",
         "PAYMENTS_ALLOW_TEST_PAY": env.get("allow_test_pay"),
         "PROMO_ENABLED": env.get("promo_enabled"),
@@ -905,6 +906,29 @@ async def test_platega_api_and_amounts():
 
     check("по умолчанию люфта вниз нет: 0 %", bot.PLATEGA_AMOUNT_TOLERANCE_PERCENT == 0)
 
+    # Комиссия кассы на нас: счёт выставляется меньше цены тарифа, чтобы клиент на
+    # платёжной странице видел ровно цену тарифа, а не тариф плюс комиссию.
+    check("без переменной в счёт идёт цена тарифа",
+          bot.platega_checkout_amount({"amount_rub": 70}) == 70)
+    fee_bot = new_bot({"mode": "platega", "payer_fee": "8"}, store_file)
+    fee_order = {"amount_rub": 70, "currency": "RUB"}
+    check("PLATEGA_PAYER_FEE_PERCENT=8: счёт = цена тарифа минус комиссия (70 → 64,81)",
+          fee_bot.platega_checkout_amount(fee_order) == 64.81,
+          str(fee_bot.platega_checkout_amount(fee_order)))
+    check("касса добавит 8 % сверху — на странице ровно цена тарифа",
+          abs(64.81 * 1.08 - 70) < 0.01, str(64.81 * 1.08))
+    check("минимальная оплата — выставленный счёт, а не цена тарифа",
+          fee_bot.platega_minimum_kop({**fee_order, "payment_amount_rub": 64.81}) == 6481)
+    check("оплата цены тарифа (70 ₽) проходит: комиссию взяли на себя",
+          fee_bot.platega_amount_matches({**fee_order, "payment_amount_rub": 64.81}, 70) is True)
+    check("оплата ровно счёта (64,81 ₽) тоже проходит — касса комиссию не добавила",
+          fee_bot.platega_amount_matches({**fee_order, "payment_amount_rub": 64.81}, 64.81) is True)
+    check("а недоплата по счёту — отказ",
+          fee_bot.platega_amount_matches({**fee_order, "payment_amount_rub": 64.81}, 60) is False)
+    check("комиссия больше 90 % не применяется целиком (150 % → берём 90 %)",
+          new_bot({"mode": "platega", "payer_fee": "150"}, store_file)
+          .platega_checkout_amount(fee_order) == 36.84)
+
     # Люфт вниз нужен только тем, у кого касса присылает сумму за вычетом комиссии
     tolerant = new_bot({"mode": "platega", "tolerance": "5"}, store_file)
     check("PLATEGA_AMOUNT_TOLERANCE_PERCENT=5 принимает недоплату до 5 %",
@@ -1308,6 +1332,76 @@ async def test_platega_diagnostics(store_file):
         check("повторный callback после ручной выдачи: 200 ok и без второго продления",
               status == 200 and body.strip() == "ok" and added == basic_days, f"{status} +{added} дн.")
         PLAT["status_override"] = None
+    finally:
+        await runner.cleanup()
+
+
+async def test_platega_fee_on_us(store_file):
+    """
+    Комиссия кассы на нас: счёт выставляется на цену тарифа минус комиссия,
+    клиент на платёжной странице платит ровно цену тарифа, ключ выдаётся.
+    """
+    print("\n▶ 7в. Platega: комиссию кассы берём на себя (счёт = тариф − комиссия)")
+    reset_all()
+    bot = new_bot({"mode": "platega", "payer_fee": "8"}, store_file)
+    runner = await bot.run_webhook_server()
+    email = f"tg-paid-{TG_TG_ID}"
+    try:
+        price = bot.TARIFFS[SCHOOL]["price"]          # 70 ₽
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, SCHOOL)
+        order = [o for o in bot.payment_store.orders.values()][-1]
+
+        sent = [c for c in PLAT["calls"]
+                if c[0] == "POST /v2/transaction/process" and c[2].get("payload") == order["id"]]
+        sent_amount = sent[-1][2]["paymentDetails"]["amount"] if sent else None
+        check("в Platega ушёл счёт «цена тарифа минус комиссия» (64,81 вместо 70)",
+              sent_amount == 64.81, str(sent_amount))
+        check("выставленный счёт сохранён в заказе",
+              abs(float(order.get("payment_amount_rub") or 0) - 64.81) < 0.001,
+              str(order.get("payment_amount_rub")))
+
+        message = [m for m in tg_calls("sendMessage")
+                   if "Оплата тарифа" in m["params"].get("text", "")][-1]["params"]
+        markup = json.dumps(message["reply_markup"], ensure_ascii=False)
+        check("клиенту по-прежнему показана цена тарифа (отображение цен не менялось)",
+              f"{price} ₽" in message.get("text", "") and f"Оплатить {price} ₽" in markup,
+              f"{message.get('text', '')[:80]}")
+        check("ключ до оплаты не выдан", panel_client(email) is None)
+
+        # Недоплата по выставленному счёту не проходит
+        status, body = await post_platega_callback(order["id"], 60,
+                                                   transaction_id=str(order["payment_id"]))
+        check("оплата меньше счёта → отказ 400 и ключ не выдан",
+              status == 400 and panel_client(email) is None, f"{status} {body[:40]}")
+
+        # Клиент платит на странице ровно цену тарифа (касса добавила свои 8 %)
+        status, body = await post_platega_callback(order["id"], price,
+                                                   transaction_id=str(order["payment_id"]))
+        check("оплата цены тарифа принимается (200)", status == 200, f"{status} {body[:40]}")
+        client = panel_client(email)
+        check("ключ выдан", client is not None)
+        saved = await bot.payment_store.get(order["id"])
+        check("в заказе: счёт 64,81 ₽ и фактически оплачено 70 ₽",
+              abs(float(saved.get("payment_amount_rub") or 0) - 64.81) < 0.001
+              and abs(float(saved.get("paid_amount") or 0) - 70) < 0.001,
+              str({k: saved.get(k) for k in ("payment_amount_rub", "paid_amount")}))
+        check("в комментарии клиента — id транзакции Platega",
+              client and f"platega-{order['payment_id']}" in str(client.get("comment")))
+        check("админам не пришло ложное предупреждение о недоплате",
+              not any("оплата меньше цены тарифа" in m["params"].get("text", "")
+                      for m in tg_calls("sendMessage")),
+              json.dumps(tg_calls("sendMessage")[-1]["params"], ensure_ascii=False)[:100])
+
+        # В /payments видно и комиссию, и то, сколько реально заплатил клиент
+        msg = make_message(bot, text="/payments")
+        await bot.cmd_payments(msg)
+        payments_text = _last_api_text()
+        check("/payments: сказано, что комиссию кассы берём на себя",
+              "берём на себя" in payments_text,
+              [ln for ln in payments_text.split(chr(10)) if "Комиссия кассы" in ln][:1])
+        check("/payments: у заказа видно счёт и фактическую оплату",
+              "счёт 64.81 ₽" in payments_text and "оплачено 70 ₽" in payments_text,
+              [ln for ln in payments_text.split(chr(10)) if "счёт" in ln][:1])
     finally:
         await runner.cleanup()
 
@@ -2406,6 +2500,7 @@ async def main():
         await test_yookassa_oauth_webhook(store_for("yookassa_oauth"))
         await test_platega_api_and_amounts()
         await test_platega_flow(store_for("platega"))
+        await test_platega_fee_on_us(store_for("platega_fee"))
         await test_duplicate_guard(store_for("platega_dup"))
         await test_platega_credentials_and_errors(store_for("platega_creds"))
         await test_platega_diagnostics(store_for("platega_diag"))
