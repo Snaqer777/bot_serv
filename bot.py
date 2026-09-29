@@ -474,17 +474,11 @@ TEST_TOOLS_RAW = (os.getenv("TEST_TOOLS") or "").strip().lower()
 # как включить служебные команды обратно.
 ADMIN_TOOLS = (os.getenv("ADMIN_TOOLS") or "0").strip().lower() in ("1", "true", "yes", "on")
 
-# Промо-тариф (бесплатно 15 дней, 10 ГБ): виден всем, но выдаётся один раз на аккаунт.
-#   PROMO_ENABLED=0 — полностью убрать пункт из тарифов (промо закончилось);
-#   PROMO_ONCE=0    — разрешить получать промо повторно (для своих тестов).
-PROMO_KEY = "promo"
-PROMO_DAYS = 15          # срок промо-доступа в днях (см. тариф PROMO_KEY ниже)
-PROMO_ENABLED = (os.getenv("PROMO_ENABLED") or "1").strip().lower() in ("1", "true", "yes", "on")
-PROMO_ONCE = (os.getenv("PROMO_ONCE") or "1").strip().lower() in ("1", "true", "yes", "on")
-
-# Доступен ли бесплатный тест на 24 часа обычным пользователям (/test_vpn).
+# Бесплатный тест (10 ГБ на 15 дней) — отдельного промо-доступа в боте больше нет:
+# бесплатно ключ выдаётся только тестом и по одному разу на аккаунт (TRIAL_PUBLIC).
+# Доступен ли бесплатный тест обычным пользователям (/test_vpn).
 #   0 (по умолчанию) — тестовый доступ только у администратора (как было);
-#   1 — тест доступен всем: кнопка есть в меню у каждого, ключ выдаётся на 24 часа.
+#   1 — тест доступен всем: кнопка есть в меню у каждого, ключ выдаётся на 15 дней.
 TRIAL_PUBLIC = (os.getenv("TRIAL_PUBLIC") or "0").strip().lower() in ("1", "true", "yes", "on")
 
 # Показывать ли кнопки и пункт бесплатного теста (главное меню, профиль, тарифы).
@@ -637,10 +631,9 @@ REALITY_SNI = (os.getenv("REALITY_SNI") or "").strip()
 REALITY_SHORT_ID = (os.getenv("REALITY_SHORT_ID") or "").strip()
 REALITY_FP = (os.getenv("REALITY_FP") or "").strip()
 
-# Параметры тестового ключа
-TEST_HOURS = 24
-TEST_TRAFFIC_BYTES = 1024 ** 3  # 1 ГиБ
-TEST_IP_LIMIT = 1
+# Параметры тестового ключа берутся из тарифа «trial» (TARIFFS["trial"] ниже):
+# сейчас это 10 ГБ на 15 дней и 1 устройство. Отдельных переменных нет,
+# чтобы тест и платные уровни не разъезжались.
 
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1862,6 +1855,14 @@ def build_vless_link(client: dict, inbound: dict, params: dict) -> str:
     return f"vless://{client['id']}@{host}:{port}?{query}#{label}"
 
 
+def trial_params() -> tuple[int, int, int]:
+    """Срок (дней), трафик (ГиБ) и лимит устройств бесплатного теста — из тарифа trial."""
+    trial = TARIFFS.get("trial") or {}
+    return (int(trial.get("days") or 0),
+            int(trial.get("traffic_gb") or 0),
+            int(trial.get("ip_limit") or 1))
+
+
 def _test_client_payload(
     telegram_id: int,
     client_uuid: str,
@@ -1877,14 +1878,15 @@ def _test_client_payload(
     # xtls-rprx-vision используется для VLESS + TCP + Reality / TLS
     flow = "xtls-rprx-vision" if (network == "tcp" and security in ("reality", "tls")) else ""
 
+    trial_days, trial_traffic_gb, trial_ip_limit = trial_params()
     payload = {
         "id": client_uuid,
         "email": f"tg-test-{telegram_id}",
         "flow": flow,
         "enable": True,
-        "limitIp": TEST_IP_LIMIT,
-        "totalGB": TEST_TRAFFIC_BYTES,
-        "expiryTime": now_ms + TEST_HOURS * 60 * 60 * 1000,
+        "limitIp": trial_ip_limit or 1,
+        "totalGB": trial_traffic_gb * (1024 ** 3),
+        "expiryTime": (now_ms + trial_days * 86400 * 1000) if trial_days > 0 else 0,
         "tgId": int(telegram_id),  # число для Go struct int64!
         "subId": secrets.token_hex(8),
         "reset": 0,
@@ -2000,7 +2002,7 @@ async def get_or_create_test_key(telegram_id: int) -> tuple[str, str, dict, bool
                 group_note = _group_note(await assign_group(), group_name)
                 return link, "exists", inbound, auto_picked, sub_link, group_note
 
-            # Если ключ истёк или выключен — продлеваем на 24 часа
+            # Если ключ истёк или выключен — продлеваем на срок теста (15 дней)
             payload = _test_client_payload(
                 telegram_id,
                 existing.get("id") or str(uuid.uuid4()),
@@ -2142,12 +2144,12 @@ class PaymentStore:
         by_tariff: dict[str, int] = {}
         for order in paid:
             by_tariff[order.get("tariff", "?")] = by_tariff.get(order.get("tariff", "?"), 0) + 1
-        promo = [o for o in self.orders.values()
-                 if o.get("status") == "paid" and o.get("promo")]
+        trials = [o for o in self.orders.values()
+                  if o.get("status") == "paid" and o.get("trial")]
         return {
             "orders_total": len(self.orders),
             "paid_count": len(paid),
-            "promo_count": len(promo),
+            "trial_count": len(trials),
             "rub": sum(int(o.get("amount_rub") or 0) for o in paid
                        if o.get("mode") in ("yookassa", "provider", "platega")),
             "stars": sum(int(o.get("amount_stars") or 0) for o in paid if o.get("currency") == "XTR"),
@@ -2507,6 +2509,14 @@ def devices_word(count: int) -> str:
     return "устройств"
 
 
+def devices_label(count: int) -> str:
+    """«1 устройство», «5 устройств», «безлимит устройств» (0 = без ограничений)."""
+    value = int(count or 0)
+    if value <= 0:
+        return "безлимит устройств"
+    return f"{value} {devices_word(value)}"
+
+
 def days_word(days: int) -> str:
     """«1 день», «3 дня», «7 дней» — чтобы сообщения читались по-человечески."""
     value = abs(int(days))
@@ -2648,7 +2658,7 @@ def referral_kb(link: str, with_share: bool = True) -> InlineKeyboardMarkup:
     rows = []
     if with_share and link:
         share_text = (
-            f"Советую этот VPN: быстро, есть бесплатный тест на 24 часа. "
+            f"Советую этот VPN: быстро, есть бесплатный тест на 15 дней. "
             f"Заходи по моей ссылке — бонус к подписке: {link}"
         )
         rows.append([InlineKeyboardButton(
@@ -2778,7 +2788,7 @@ def referral_greet_text(invited_id: int, status: str) -> str:
         "🎁 <b>Тебя пригласили!</b> Друг подарил тебе "
         f"<b>+{REFERRAL_INVITED_BONUS_DAYS} {days_word(REFERRAL_INVITED_BONUS_DAYS)}</b> — "
         "они прибавятся к первой оплате любого тарифа.\n\n"
-        + ("Начни с бесплатного теста на 24 часа: /test_vpn — "
+        + ("Начни с бесплатного теста (10 ГБ на 15 дней): /test_vpn — "
            "или смотри тарифы: /start" if trial_available_for(invited_id)
            else "Смотри тарифы и подключайся: /start")
     )
@@ -2849,50 +2859,20 @@ def admin_tools_enabled() -> bool:
     return ADMIN_TOOLS
 
 
-def promo_enabled() -> bool:
-    """Включён ли промо-тариф (PROMO_ENABLED=1 и сам тариф на месте)."""
-    return PROMO_ENABLED and PROMO_KEY in TARIFFS
-
-
-def promo_used(tg_id: int | None) -> bool:
-    """
-    Пользовался ли этот аккаунт промо (по журналу заказов).
-
-    Промо выдаётся один раз: иначе бесплатные 15 дней можно оформлять бесконечно.
-    PROMO_ONCE=0 снимает ограничение — для проверок на своём аккаунте.
-    """
-    if not PROMO_ONCE or tg_id is None:
-        return False
-    payment_store.load()
-    for order in payment_store.orders.values():
-        if (order.get("tariff") == PROMO_KEY and order.get("status") == "paid"
-                and int(order.get("tg_id") or 0) == int(tg_id)):
-            return True
-    return False
-
-
-def promo_visible(tg_id: int | None) -> bool:
-    """Показывать ли промо-пункт в тарифах: включён и ещё не использован."""
-    return promo_enabled() and not promo_used(tg_id)
-
-
 def tariff_visible(tg_id: int | None, key: str, tariff: dict) -> bool:
     """
     Показывать ли тариф в списке.
 
-    Платные — всегда; бесплатные — по своим правилам: промо видно всем (но один раз
-    на аккаунт), а тестовые 24 часа — только тем, кому тест доступен и включён
+    Платные — всегда; бесплатный тест — только тем, кому он доступен и включён
     показ кнопок (TRIAL_BUTTON=1).
     """
     if tariff["price"] > 0:
         return True
-    if key == PROMO_KEY:
-        return promo_visible(tg_id)
     return trial_button_visible(tg_id)
 
 
 def trial_available_for(user_id: int | None) -> bool:
-    """Доступен ли этому пользователю бесплатный тест на 24 часа."""
+    """Доступен ли этому пользователю бесплатный тест (10 ГБ на 15 дней)."""
     if TRIAL_PUBLIC:
         return True
     if user_id is None:
@@ -2960,14 +2940,35 @@ def payments_diag_text() -> str:
                     + ")" for spot in configured_locations())
     )
 
-    promo_tariff = TARIFFS.get(PROMO_KEY) or {}
-    if promo_enabled():
-        lines.append(
-            f"• Промо-доступ: включён 🎉 {escape(promo_tariff.get('name', ''))} — "
-            + ("один раз на аккаунт" if PROMO_ONCE else "без ограничения (PROMO_ONCE=0)")
+    lines.append(
+        "• Протоколы: "
+        + ", ".join(
+            f"{protocol_title(key)} ({protocol_variant_count(key)} "
+            f"{tunnels_word(protocol_variant_count(key))})"
+            for key in PROTOCOL_ORDER
         )
-    else:
-        lines.append("• Промо-доступ: выключен (<code>PROMO_ENABLED=0</code> или тариф удалён)")
+    )
+    lines.append(
+        "• Туннели уровня: "
+        + "; ".join(
+            f"{TARIFF_LEVELS[level]['name']} — {tunnels_range_label(level)}"
+            for level in TARIFF_LEVEL_ORDER
+        )
+    )
+    sample_loc = configured_locations()[0]["env"] if configured_locations() else "XUI_INBOUND_WARSAW"
+    lines.append(
+        "• ID подключений: переменные <code>"
+        f"{sample_loc}_&lt;ВАРИАНТ&gt;</code>, например "
+        f"<code>{sample_loc}_VLESS_XHTTP</code>, <code>{sample_loc}_SHADOWSOCKS_AES256</code>, "
+        f"<code>{sample_loc}_HYSTERIA2</code> — полный список в /panel_debug"
+    )
+
+    trial_tariff = TARIFFS.get("trial") or {}
+    lines.append(
+        f"• Бесплатный тест: {escape(trial_tariff.get('traffic', '—'))} на "
+        f"{days_label(trial_tariff.get('days', 15))} — "
+        + ("доступен всем (TRIAL_PUBLIC=1)" if TRIAL_PUBLIC else "только администратору (TRIAL_PUBLIC=0)")
+    )
 
     if PAYMENTS_MODE == "platega":
         lines.append(f"• Merchant ID: <code>{escape(PLATEGA_MERCHANT_ID or 'не задан ❌')}</code>")
@@ -3033,16 +3034,16 @@ def configured_locations() -> list[dict]:
     return [{"key": key, **LOCATIONS[key]} for key in LOCATION_ORDER if key in LOCATIONS]
 
 
-def tariff_tunnels(tariff: dict) -> int:
-    """Сколько локаций реально входит в тариф (не больше, чем настроено серверов)."""
-    declared = int(tariff.get("tunnels", 1) or 1)
+def tariff_servers(tariff: dict) -> int:
+    """Сколько серверов реально входит в тариф (не больше, чем настроено локаций)."""
+    declared = int(tariff.get("servers", 1) or 1)
     return max(1, min(declared, len(configured_locations())))
 
 
 def tariff_locations(tariff: dict) -> list[dict]:
-    """Список локаций тарифа: один сервер — выбранный клиентом, иначе первые N локаций."""
+    """Список локаций тарифа: один сервер — выбранный клиентом, иначе все серверы тарифа."""
     locations = configured_locations()
-    count = tariff_tunnels(tariff)
+    count = tariff_servers(tariff)
     return locations[:count]
 
 
@@ -3096,12 +3097,14 @@ def tariff_price_label(tariff: dict) -> str:
     return f"{tariff['price']} ₽"
 
 
-def new_order(tg_id: int, tariff_key: str, location_key: str | None = None) -> dict:
+def new_order(tg_id: int, tariff_key: str, location_key: str | None = None,
+              protocols: list[str] | None = None) -> dict:
     """
     Создаёт заказ со статусом pending.
 
     location_key — выбранный сервер для тарифов с одним туннелем (тарифы на несколько
-    туннелей получают все локации сразу, поэтому там он не нужен).
+    локаций получают все серверы сразу, поэтому там он не нужен).
+    protocols — протоколы, которые выбрал клиент (по умолчанию все протоколы уровня).
     """
     tariff = TARIFFS[tariff_key]
     now = int(time.time())
@@ -3117,7 +3120,9 @@ def new_order(tg_id: int, tariff_key: str, location_key: str | None = None) -> d
         "days": tariff["days"],
         "traffic_gb": tariff["traffic_gb"],
         "ip_limit": tariff["ip_limit"],
-        "tunnels": tariff.get("tunnels", 1),
+        "servers": tariff.get("servers", 1),
+        "tunnels_max": tariff.get("tunnels_max", 0),
+        "protocols": list(protocols or default_protocols(tariff, list(PROTOCOL_ORDER))),
         "location": location_key or None,
         "amount_rub": tariff["price"],
         "amount_stars": tariff.get("stars", 0),
@@ -3873,12 +3878,17 @@ async def activate_paid_subscription(
     payment_ref: str,
     extra_days: int = 0,
     location_key: str | None = None,
+    protocols: list[str] | None = None,
 ) -> dict:
     """
     Создаёт или продлевает платную подписку в 3x-ui по оплаченному заказу.
 
-    Тариф на один туннель выдаётся в выбранной локации (Стокгольм или Варшава),
-    тарифы на несколько туннелей — сразу во всех локациях, входящих в тариф.
+    Туннель — это пара «сервер + вариант протокола». Клиент заводится в подключении
+    каждого варианта каждого выбранного протокола на каждом сервере тарифа: выбрал
+    VLESS — получает Reality, XHTTP и gRPC; уровень 3 с тремя протоколами на двух
+    серверах — до 14 подключений. subId у всех один, поэтому клиенту уходит одна
+    ссылка-подписка со всеми конфигами.
+
     Если срок тарифа не ограничен (тип «по трафику»), expiryTime = 0: подписка
     действует, пока не израсходован трафик, а реферальные бонусы (дни) задают срок.
 
@@ -3886,7 +3896,7 @@ async def activate_paid_subscription(
     выдача не происходит (защита от дублей вебхука и перезапуска бота).
     extra_days — реферальный бонус приглашённого; к ним добавляются накопленные
     бонусы самого покупателя (он тоже мог приглашать друзей).
-    Возвращает словарь с доступом, сроком и деталями подписки.
+    Возвращает словарь с доступом, сроком и списком выданных туннелей.
     """
     tariff = TARIFFS[tariff_key]
     target_email = f"tg-paid-{telegram_id}"
@@ -3904,27 +3914,83 @@ async def activate_paid_subscription(
     else:
         comment = f"{tariff_key} без ограничения по времени | {payment_ref[:40]}"
 
-    spots = tariff_locations(tariff)
-    if int(tariff.get("tunnels", 1) or 1) <= 1:
-        chosen = location_by_key(location_key) or spots[0]
-        spots = [chosen]
+    spots = tariff_spots(tariff, location_key)
+
+    # Какие протоколы выдаём: выбор клиента; заказ мог прийти от старой версии
+    # (без выбора) — тогда рекомендуемый набор тарифа.
+    chosen = [key for key in (protocols or []) if key in PROTOCOL_ORDER]
+    if not chosen:
+        chosen = default_protocols(tariff, list(PROTOCOL_ORDER))
 
     async with XUIClient() as client:
         group_name, group_state = await client.resolve_client_group()
+        inbounds = await client.get_inbounds()
+
+        # Один subId на все подключения заказа: клиент получает одну ссылку-подписку
+        # со всеми протоколами, вариантами и серверами. Если подписка уже была —
+        # сохраняем прежний subId, чтобы ссылка у клиента не менялась при продлении.
+        sub_id = ""
+        for inbound in inbounds:
+            settings = as_dict(inbound.get("settings"))
+            for candidate in settings.get("clients") or []:
+                if (isinstance(candidate, dict) and str(candidate.get("email")) == target_email
+                        and str(candidate.get("subId") or "").strip()):
+                    sub_id = str(candidate["subId"]).strip()
+                    break
+            if sub_id:
+                break
+        if not sub_id:
+            sub_id = secrets.token_hex(8)
+
+        # Что выдаём: подключение на каждую пару «сервер + вариант протокола».
+        targets: list[tuple[dict, str, str, dict]] = []
+        for spot in spots:
+            for protocol in chosen:
+                for meta in protocol_variants(protocol):
+                    variant = str(meta.get("key"))
+                    matched = match_tunnel_inbound(inbounds, spot, protocol, variant)
+                    if matched is None or not matched.get("id"):
+                        logger.warning(
+                            "Заказ %s: туннель %s в %s недоступен — пропускаю.",
+                            order_id, variant_title(protocol, variant), spot.get("title"),
+                        )
+                        continue
+                    try:
+                        inbound = await client.get_inbound(int(matched.get("id")))
+                    except Exception as exc:
+                        logger.warning("Заказ %s: подключение #%s недоступно (%s) — пропускаю.",
+                                       order_id, matched.get("id"), exc)
+                        continue
+                    targets.append((spot, protocol, variant, inbound))
+
+        if not targets:
+            wanted = []
+            for protocol in chosen:
+                wanted.extend(variant_title(protocol, str(meta.get("key")))
+                              for meta in protocol_variants(protocol))
+            raise XUIError(
+                "❌ В панели 3x-ui нет подходящих подключений для туннелей: "
+                + ", ".join(wanted)
+                + ".\n\nПроверь раздел Inbounds: в названии подключения должны быть локация "
+                "и протокол (например «Warsaw-Hysteria2»), либо задай его ID переменной "
+                "<code>XUI_INBOUND_&lt;ЛОКАЦИЯ&gt;_&lt;ВАРИАНТ&gt;</code> "
+                "(например <code>XUI_INBOUND_WARSAW_VLESS_XHTTP</code> или "
+                "<code>XUI_INBOUND_STOCKHOLM_SHADOWSOCKS_AES256</code>)."
+            )
+
         entries: list[dict] = []
 
-        async def sub_link_for(sub_id: str | None) -> str | None:
+        async def sub_link_for(sub: str | None) -> str | None:
             """Ссылка-подписка клиента (или None, если сервис подписок недоступен)."""
-            if not sub_id:
+            if not sub:
                 return None
-            base, note = await get_subscription_base(client, sub_id=sub_id)
+            base, note = await get_subscription_base(client, sub_id=sub)
             if not base:
                 logger.warning("Подписка %s: ссылка подписки недоступна — %s", target_email, note)
                 return None
-            return build_sub_link(base, sub_id)
+            return build_sub_link(base, sub)
 
-        for spot in spots:
-            inbound, auto_picked, source = await resolve_location_inbound(client, spot)
+        for spot, protocol, variant, inbound in targets:
             inbound_id = inbound.get("id")
             params = extract_vless_params(inbound)
 
@@ -3934,18 +4000,22 @@ async def activate_paid_subscription(
 
             # Уже выдан по этому платежу? (журнал мог не сохраниться — смотрим в панель)
             if existing is not None and comment_has_payment_ref(existing.get("comment"), payment_ref):
-                logger.info("Подписка %s (%s) уже выдана по платежу %s — повторно не продлеваю.",
-                            target_email, spot["title"], payment_ref)
+                logger.info("Подписка %s (%s, %s) уже выдана по платежу %s — повторно не продлеваю.",
+                            target_email, spot["title"], variant_title(protocol, variant), payment_ref)
                 entries.append({
                     "location": spot.get("key"),
                     "location_title": spot.get("title"),
+                    "protocol": protocol,
+                    "protocol_title": protocol_title(protocol),
+                    "variant": variant,
+                    "variant_title": variant_title(protocol, variant),
                     "inbound_id": inbound_id,
                     "inbound_remark": inbound.get("remark"),
-                    "resolved_by": source,
+                    "resolved_by": "повторная выдача",
                     "status": "already",
-                    "auto_picked": auto_picked,
-                    "link": build_vless_link(existing, inbound, params),
-                    "sub_link": await sub_link_for(existing.get("subId")),
+                    "auto_picked": False,
+                    "link": build_vless_link(existing, inbound, params) if protocol == "vless" else "",
+                    "sub_link": await sub_link_for(existing.get("subId") or sub_id),
                     "expiry_ms": int(existing.get("expiryTime") or 0),
                     "existing": True,
                 })
@@ -3967,7 +4037,7 @@ async def activate_paid_subscription(
                 tariff,
                 expires_ms,
                 comment,
-                sub_id=(existing or {}).get("subId") or "",
+                sub_id=sub_id,
                 group_name=group_name or "",
             )
 
@@ -3983,12 +4053,16 @@ async def activate_paid_subscription(
             entries.append({
                 "location": spot.get("key"),
                 "location_title": spot.get("title"),
+                "protocol": protocol,
+                "protocol_title": protocol_title(protocol),
+                "variant": variant,
+                "variant_title": variant_title(protocol, variant),
                 "inbound_id": inbound_id,
                 "inbound_remark": inbound.get("remark"),
-                "resolved_by": source,
-                "status": status if existing is None else "extended",
-                "auto_picked": auto_picked,
-                "link": build_vless_link(payload, inbound, params),
+                "resolved_by": "вариант протокола и сервер",
+                "status": status,
+                "auto_picked": False,
+                "link": build_vless_link(payload, inbound, params) if protocol == "vless" else "",
                 "sub_link": sub_link,
                 "expiry_ms": expires_ms,
                 "existing": existing is not None,
@@ -4007,6 +4081,11 @@ async def activate_paid_subscription(
             )
 
     primary = entries[0]
+    delivered_protocols: list[str] = []
+    for entry in entries:
+        if entry["protocol"] not in delivered_protocols:
+            delivered_protocols.append(entry["protocol"])
+    tunnels = tunnels_from_entries(entries)
     return {
         "email": target_email,
         "already": all(entry["status"] == "already" for entry in entries),
@@ -4016,6 +4095,10 @@ async def activate_paid_subscription(
         "link": primary["link"],
         "sub_link": primary["sub_link"],
         "entries": entries,
+        "tunnels": tunnels,
+        "tunnel_count": len(tunnels),
+        "protocols": delivered_protocols,
+        "protocols_label": ", ".join(protocol_title(key) for key in delivered_protocols),
         "location": primary.get("location"),
         "location_title": primary.get("location_title"),
         "tariff": tariff,
@@ -4026,13 +4109,64 @@ async def activate_paid_subscription(
     }
 
 
+def tunnels_from_entries(entries: list[dict]) -> list[dict]:
+    """
+    Сводка «что реально выдано»: уникальные туннели по протоколу и варианту
+    с перечнем серверов. Используется в сообщениях и в «Моих подписках».
+    """
+    summary: list[dict] = []
+    index: dict[tuple[str, str], dict] = {}
+    for entry in entries or []:
+        protocol = str(entry.get("protocol") or "")
+        variant = str(entry.get("variant") or "")
+        if not protocol:
+            continue
+        key = (protocol, variant)
+        if key not in index:
+            index[key] = {
+                "protocol": protocol,
+                "protocol_title": protocol_title(protocol),
+                "variant": variant,
+                "variant_title": entry.get("variant_title") or variant_title(protocol, variant),
+                "servers": [],
+                "location_titles": [],
+            }
+            summary.append(index[key])
+        location = entry.get("location")
+        if location and location not in index[key]["servers"]:
+            index[key]["servers"].append(location)
+        title = str(entry.get("location_title") or "")
+        if title and title not in index[key]["location_titles"]:
+            index[key]["location_titles"].append(title)
+    return summary
+
+
+def tunnels_summary_text(entries: list[dict], *, limit: int | None = None) -> str:
+    """
+    Список туннелей для сообщений: «🧩 Туннели (6): • VLESS Reality · Стокгольм, Варшава …».
+
+    Одинаковые варианты на разных серверах схлопываются в одну строку — так клиент
+    видит и протоколы, и варианты шифрования, и на каких серверах они выданы.
+    """
+    tunnels = tunnels_from_entries(entries)
+    if not tunnels:
+        return ""
+    total = sum(len(tunnel["location_titles"]) or 1 for tunnel in tunnels)
+    lines = [f"🧩 <b>Что подключено ({total} {tunnels_word(total)}):</b>"]
+    for tunnel in tunnels[:limit] if limit else tunnels:
+        servers = ", ".join(tunnel["location_titles"]) or "—"
+        lines.append(f"• {tunnel['variant_title']} — <i>{escape(servers)}</i>")
+    return "\n".join(lines)
+
+
 async def get_paid_subscription(telegram_id: int) -> dict | None:
     """
     Читает текущую подписку пользователя из панели (срок, трафик, статус).
 
-    Тарифы на несколько туннелей живут в нескольких локациях: возвращаем запись
-    из каждой (список «entries»), а поля верхнего уровня — по первой локации,
-    чтобы старые вызовы продолжали работать.
+    Подписка занимает по одной записи клиента на каждую пару «локация + протокол»,
+    поэтому возвращаем их все (список «entries»), а поля верхнего уровня — по первой
+    записи, чтобы старые вызовы продолжали работать. В каждой записи есть ключ и
+    название локации и протокола — их показывают /profile и сообщения о выдаче.
     """
     target_email = f"tg-paid-{telegram_id}"
     async with XUIClient() as client:
@@ -4049,12 +4183,22 @@ async def get_paid_subscription(telegram_id: int) -> dict | None:
                         stats = stat
                         break
                 used = int(stats.get("up") or 0) + int(stats.get("down") or 0)
+                protocol = inbound_protocol_key(inbound) or "vless"
+                variant = inbound_variant_key(inbound, protocol) or ""
+                spot = next((spot for spot in configured_locations()
+                             if inbound_matches_location(inbound, spot)), None)
                 entries.append({
                     "client": candidate,
                     "inbound": inbound,
                     "inbound_id": inbound.get("id"),
                     "inbound_remark": inbound.get("remark"),
-                    "location_title": inbound.get("remark") or f"сервер #{inbound.get('id')}",
+                    "location": (spot or {}).get("key"),
+                    "location_title": (spot or {}).get("title")
+                    or inbound.get("remark") or f"сервер #{inbound.get('id')}",
+                    "protocol": protocol,
+                    "protocol_title": protocol_title(protocol),
+                    "variant": variant,
+                    "variant_title": variant_title(protocol, variant) if variant else protocol_title(protocol),
                     "used_bytes": used,
                     "total_bytes": int(candidate.get("totalGB") or 0),
                     "expiry_ms": int(candidate.get("expiryTime") or 0),
@@ -4099,9 +4243,22 @@ def subscription_status_text(sub: dict | None) -> str:
         lines.append(f"• Трафик: <b>{_human_bytes(used)}</b> (безлимит)")
 
     entries = sub.get("entries") or []
-    if len(entries) > 1:
-        titles = ", ".join(str(entry.get("location_title")) for entry in entries)
-        lines.append(f"• Серверы: <b>{escape(titles)}</b>")
+    titles: list[str] = []
+    for entry in entries:
+        title = str(entry.get("location_title") or "")
+        if title and title not in titles:
+            titles.append(title)
+    if len(titles) > 1:
+        lines.append(f"• Серверы: <b>{escape(', '.join(titles))}</b>")
+
+    tunnels = tunnels_from_entries(entries)
+    if tunnels:
+        total = sum(len(tunnel["location_titles"]) or 1 for tunnel in tunnels)
+        lines.append(f"• Туннелей: <b>{total}</b> ({len(tunnels)} {tunnels_word(len(tunnels))} "
+                     f"на {len(titles) or 1} {servers_word(len(titles) or 1)})")
+        for tunnel in tunnels:
+            servers = ", ".join(tunnel["location_titles"]) or "—"
+            lines.append(f"  – {escape(tunnel['variant_title'])} — <i>{escape(servers)}</i>")
     return "\n".join(lines)
 
 
@@ -4117,35 +4274,56 @@ def access_block(info: dict, *, heading: str = "") -> str:
     или не отвечает, показываем ключ vless:// — он работает всегда и не оставит
     клиента без доступа (админ получает отдельное предупреждение).
     """
-    entries = [entry for entry in (info.get("entries") or []) if entry.get("sub_link")]
-    if len(entries) > 1:
+    sub_links: list[str] = []
+    for entry in info.get("entries") or []:
+        link = entry.get("sub_link")
+        if link and link not in sub_links:
+            sub_links.append(link)
+    if len(sub_links) > 1:
         lines = [heading or "🔗 <b>Твои ссылки-подписки (нажми, чтобы скопировать):</b>"]
-        for entry in entries:
-            lines.append(
-                f"\n{entry.get('location_title') or 'Сервер'}:\n"
-                f"<code>{escape(entry['sub_link'])}</code>"
-            )
+        shown: set[str] = set()
+        for entry in info.get("entries") or []:
+            link = entry.get("sub_link")
+            if not link or link in shown:
+                continue
+            shown.add(link)
+            title = str(entry.get("location_title") or "Сервер")
+            variant_name = entry.get("variant_title") or entry.get("protocol_title")
+            if variant_name:
+                title = f"{title} · {variant_name}"
+            lines.append(f"\n{title}:\n<code>{escape(link)}</code>")
         lines.append(
             "\n📥 <b>Как добавить:</b> в приложении выбери «Добавить подписку» / "
-            "«Импорт из ссылки» и вставь ссылку нужного сервера — профиль появится сам "
-            "и будет обновляться. В тариф входят оба сервера: можно добавить обе ссылки."
+            "«Импорт из ссылки» и вставь ссылку — профиль появится сам и будет обновляться."
         )
         return "".join(lines) + "\n"
 
-    sub_link = info.get("sub_link")
-    if sub_link:
+    plain_sub = str(info.get("sub_link") or "").strip()
+    if plain_sub and plain_sub not in sub_links:
+        sub_links.append(plain_sub)
+    if sub_links:
         return (
             f"{heading or '🔗 <b>Твоя ссылка-подписка (нажми, чтобы скопировать):</b>'}\n"
-            f"<code>{escape(sub_link)}</code>\n\n"
+            f"<code>{escape(sub_links[0])}</code>\n\n"
+            "В подписке сразу все твои протоколы и серверы: приложение покажет их "
+            "отдельными профилями.\n\n"
             "📥 <b>Как добавить:</b> в приложении выбери «Добавить подписку» / "
             "«Импорт из ссылки» и вставь эту ссылку — профиль появится сам и будет "
             "обновляться, если на сервере что-то изменится."
         )
+
+    fallback = next((entry.get("link") for entry in (info.get("entries") or []) if entry.get("link")),
+                    info.get("link"))
+    if fallback:
+        return (
+            "🔑 <b>Твой ключ (нажми, чтобы скопировать):</b>\n"
+            f"<code>{escape(fallback)}</code>\n\n"
+            "📥 <b>Как добавить:</b> в приложении выбери «Импорт из буфера обмена» — "
+            "ключ уже скопирован, останется вставить его."
+        )
     return (
-        "🔑 <b>Твой ключ (нажми, чтобы скопировать):</b>\n"
-        f"<code>{escape(info.get('link') or '')}</code>\n\n"
-        "📥 <b>Как добавить:</b> в приложении выбери «Импорт из буфера обмена» — "
-        "ключ уже скопирован, останется вставить его."
+        "⚠️ <b>Ключ не получен.</b>\nНапиши в поддержку и укажи номер заказа — "
+        "выдадим доступ вручную."
     )
 
 
@@ -4160,16 +4338,25 @@ def order_paid_message(order: dict, info: dict) -> str:
     )
     if info.get("already"):
         title = "✅ <b>Этот платёж уже учтён — подписка активна.</b>"
-    if order.get("promo"):
-        title = "🎉 <b>Промо-доступ активирован — бесплатно!</b>"
-    elif order.get("simulated"):
+    if order.get("simulated"):
         title = "🧪 <b>Проверка выдачи: подписка создана без оплаты.</b>"
 
     if info.get("expiry_ms"):
         term_line = f"⏳ <b>Действует до:</b> {expiry}\n"
     else:
         term_line = "⏳ <b>Срок:</b> без ограничения по времени — пока не израсходован трафик\n"
-    served = ", ".join(str(entry.get("location_title")) for entry in (info.get("entries") or []))
+    servers: list[str] = []
+    for entry in info.get("entries") or []:
+        title_spot = str(entry.get("location_title") or "")
+        if title_spot and title_spot not in servers:
+            servers.append(title_spot)
+    served = " + ".join(servers)
+    protocols_served = info.get("protocols_label") or protocols_label(tariff)
+    tunnels_block = tunnels_summary_text(info.get("entries") or [])
+    tunnels_line = (
+        f"🧩 <b>Протоколы:</b> {protocols_served}\n"
+        + ((tunnels_block + "\n\n") if tunnels_block else "")
+    )
 
     return (
         f"{title}\n\n"
@@ -4179,8 +4366,9 @@ def order_paid_message(order: dict, info: dict) -> str:
            f"{days_word(info['bonus_days'])} к сроку\n" if info.get("bonus_days") else "")
         +
         f"📊 <b>Трафик:</b> {tariff['traffic']}\n"
-        f"📱 <b>Устройств:</b> {tariff['ips']}\n"
-        f"🌍 <b>Серверы:</b> {served or tariff['locations']}\n\n"
+        f"📱 <b>Устройств:</b> {devices_label(tariff['ips'])}\n"
+        + tunnels_line
+        + f"🌍 <b>Серверы:</b> {served or tariff['locations']}\n\n"
         + access_block(info) + "\n\n"
         "📲 <b>Как подключиться:</b> нажми кнопку под сообщением — покажу по шагам, "
         "что скачать и куда вставить ссылку (инструкции для iPhone, Android, Windows и macOS)."
@@ -4227,9 +4415,7 @@ async def notify_payment_success(order: dict, info: dict) -> bool:
         amount = (
             f"{order['amount_stars']} ⭐️" if order["currency"] == "XTR" else f"{order['amount_rub']} ₽"
         )
-        if order.get("promo"):
-            header = "🎁 <b>Промо-доступ выдан (бесплатно)</b>\n"
-        elif order.get("simulated"):
+        if order.get("simulated"):
             header = "🧪 <b>Тестовая выдача (оплата не производилась)</b>\n"
         else:
             header = f"💰 <b>Новая оплата:</b> {amount}\n"
@@ -4241,6 +4427,8 @@ async def notify_payment_success(order: dict, info: dict) -> bool:
         await notify_admins(
             header
             + f"• Тариф: {order['tariff_name']}\n"
+            f"• Протоколы: {escape(info.get('protocols_label') or protocols_label(info.get('tariff') or {}))}\n"
+            f"• Туннелей: {len(info.get('entries') or [])}\n"
             f"• Пользователь: <code>{order['tg_id']}</code>\n"
             f"• Заказ: <code>{order['id']}</code>\n"
             f"• Действует до: <code>{format_date(info['expiry_ms'])}</code>"
@@ -4277,20 +4465,37 @@ async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str 
             # Заказ мог быть выдан более старой версией бота: тогда пересобираем ключ
             # из панели, а ссылку-подписку считаем заново — старая могла собираться
             # на адресе панели и уже не работать.
+            entries: list[dict] = []
             try:
                 sub = await get_paid_subscription(order["tg_id"])
                 if sub:
-                    if not link:
-                        async with XUIClient() as client:
-                            params = extract_vless_params(sub["inbound"])
-                        link = build_vless_link(sub["client"], sub["inbound"], params)
-                    sub_id = sub["client"].get("subId")
-                    if sub_id:
-                        base, _note = await get_subscription_base(sub_id=str(sub_id), probe=False)
-                        if base:
-                            sub_link = build_sub_link(base, str(sub_id))
+                    async with XUIClient() as client:
+                        for entry in sub.get("entries") or []:
+                            inbound = entry["inbound"]
+                            params = extract_vless_params(inbound)
+                            entry = dict(entry)
+                            entry["link"] = build_vless_link(entry["client"], inbound, params)
+                            entry["sub_link"] = None
+                            sub_id = entry["client"].get("subId")
+                            if sub_id:
+                                base, _note = await get_subscription_base(
+                                    client, sub_id=str(sub_id), probe=False
+                                )
+                                if base:
+                                    entry["sub_link"] = build_sub_link(base, str(sub_id))
+                            entries.append(entry)
+                    if entries and not link:
+                        link = entries[0].get("link")
+                    if entries and not sub_link:
+                        sub_link = next((entry["sub_link"] for entry in entries
+                                         if entry.get("sub_link")), None)
             except Exception as exc:
                 logger.warning("Не удалось пересобрать доступ для заказа %s: %s", order["id"], exc)
+
+            delivered_protocols: list[str] = []
+            for entry in entries:
+                if entry.get("protocol") and entry["protocol"] not in delivered_protocols:
+                    delivered_protocols.append(entry["protocol"])
 
             info = {
                 "tariff": TARIFFS.get(order["tariff"], {}),
@@ -4299,6 +4504,10 @@ async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str 
                 "status": "extended",
                 "link": link,
                 "sub_link": sub_link,
+                "entries": entries,
+                "tunnels": tunnels_from_entries(entries),
+                "protocols": delivered_protocols,
+                "protocols_label": ", ".join(protocol_title(key) for key in delivered_protocols),
             }
             if not info["link"]:
                 logger.warning(
@@ -4325,6 +4534,7 @@ async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str 
             payment_ref=charge_id or order["id"],
             extra_days=REFERRAL_INVITED_BONUS_DAYS if referral_invite else 0,
             location_key=order.get("location"),
+            protocols=order.get("protocols"),
         )
     except Exception as exc:
         logger.error("Не удалось выдать подписку по заказу %s: %s", order["id"], exc)
@@ -4390,66 +4600,6 @@ def new_test_order(tg_id: int, tariff_key: str, location_key: str | None = None)
     return order
 
 
-def new_promo_order(tg_id: int) -> dict:
-    """
-    Заказ на промо-доступ: бесплатно, помечен promo и simulated.
-
-    simulated — чтобы промо не попало в выручку и не начисляло реферальные бонусы
-    (денег по нему не приходило), promo — чтобы сообщения и уведомления говорили
-    о промо, а не о «проверке выдачи».
-    """
-    order = new_order(tg_id, PROMO_KEY, location_key=LOCATION_ORDER[0] if LOCATION_ORDER else None)
-    order["mode"] = "promo"
-    order["currency"] = "PROMO"
-    order["simulated"] = True
-    order["promo"] = True
-    return order
-
-
-async def grant_promo(chat_id: int, tg_id: int) -> dict:
-    """
-    Выдаёт промо-подписку (30 дней, 10 ГБ) бесплатно — один раз на аккаунт.
-
-    Идёт тем же путём, что платный тариф: клиент tg-paid-<id> в 3x-ui, ключ в чат,
-    срок и лимиты из тарифа. Отказы: промо выключено, уже активировано, у аккаунта
-    есть действующая подписка (иначе промо переписало бы её лимиты на 10 ГБ).
-    """
-    if not promo_enabled():
-        raise PaymentError(
-            "🎉 <b>Промо-доступ сейчас закрыт.</b>\n\n"
-            "Актуальные тарифы — в разделе «💰 Тарифы»."
-        )
-    if promo_used(tg_id):
-        raise PaymentError(
-            "🎉 <b>Промо-доступ уже активирован на этом аккаунте.</b>\n\n"
-            "Он даётся один раз. Продлить доступ можно платным тарифом — "
-            "дни промо при этом сохранятся."
-        )
-    existing = await get_paid_subscription(tg_id)
-    if existing:
-        now_ms = int(time.time() * 1000)
-        still_active = existing["expiry_ms"] > now_ms and existing["enable"]
-        if still_active:
-            raise PaymentError(
-                "🎉 <b>У тебя уже есть действующая подписка</b> — промо-доступ для новых аккаунтов.\n\n"
-                "Промо не активирую, чтобы не менять условия твоего текущего тарифа."
-            )
-        # Подписка была, но закончилась: промо тоже не выдаём — иначе у аккаунта
-        # с историей оплат сбрасывался бы лимит трафика на 10 ГБ.
-        raise PaymentError(
-            "🎉 <b>Промо-доступ даётся только новым пользователям.</b>\n\n"
-            "У этого аккаунта уже была подписка — она, кстати, приостановлена. "
-            "Продлить доступ можно в разделе «💰 Тарифы»."
-        )
-
-    order = await payment_store.create(new_promo_order(tg_id))
-    logger.info("Промо-доступ: заказ %s, пользователь %s", order["id"], tg_id)
-    result = await fulfill_order(order, charge_id=f"promo-{order['id']}")
-    if not result.get("info"):
-        logger.warning("Промо-заказ %s не потребовал новой выдачи (%s)", order["id"], list(result))
-    return result
-
-
 async def simulate_successful_payment(chat_id: int, tg_id: int, tariff_key: str,
                                       location_key: str | None = None) -> dict:
     """
@@ -4491,13 +4641,15 @@ async def simulate_successful_payment(chat_id: int, tg_id: int, tariff_key: str,
         ]
     )
     expiry = format_date(int(info.get("expiry_ms") or 0)) if info.get("expiry_ms") else "—"
+    tunnels_block = tunnels_summary_text(info.get("entries") or [])
     await bot.send_message(
         chat_id,
         "🧪 <b>Проверка выдачи ключа (оплата не производилась).</b>\n\n"
         f"• Заказ: <code>{order['id']}</code>\n"
         f"• Тариф: {TARIFFS[tariff_key]['name']}\n"
         f"• Клиент в панели: <code>tg-paid-{tg_id}</code>\n"
-        f"• Действует до: <b>{expiry}</b>\n\n"
+        + ((tunnels_block + "\n") if tunnels_block else "")
+        + f"• Действует до: <b>{expiry}</b>\n\n"
         "Бот прошёл ровно тот же путь, что и после настоящей оплаты: создал клиента в 3x-ui "
         "и отправил ключ. Денег при этом не потрачено, в выручку заказ не попал.\n"
         "Если у аккаунта <b>уже была</b> платная подписка — тест её продлил: кнопка ниже удалит ключ целиком.",
@@ -4693,12 +4845,15 @@ async def platega_self_check() -> str:
 
 
 async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
-                         location_key: str | None = None) -> None:
+                         location_key: str | None = None,
+                         protocols: list[str] | None = None) -> None:
     """
     Начинает оплату выбранного тарифа в текущем режиме PAYMENTS_MODE.
 
-    location_key — выбранный сервер для тарифов с одним туннелем (Стокгольм/Варшава);
-    тарифы на несколько туннелей получают все локации сразу.
+    location_key — выбранный сервер для тарифа с одним сервером (Стокгольм/Варшава);
+    тарифы на несколько серверов получают оба сервера сразу.
+    protocols — выбранные протоколы (по умолчанию рекомендуемый набор уровня;
+    варианты протокола выдаются все).
     stars/provider — нативный счёт Telegram; platega и yookassa — ссылка
     на страницу оплаты.
     """
@@ -4710,12 +4865,12 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
         )
 
     tariff = TARIFFS[tariff_key]
+    # Уровни 2–4 включают оба сервера сразу: сервер в заказе не нужен.
+    if tariff_servers(tariff) > 1:
+        location_key = None
+    if not protocols:
+        protocols = default_protocols(tariff, list(PROTOCOL_ORDER))
     if tariff["price"] <= 0:
-        if tariff_key == PROMO_KEY:
-            raise PaymentError(
-                "🎉 Промо-доступ бесплатный — он активируется кнопкой в разделе «💰 Тарифы».\n\n"
-                "Оплата для него не нужна."
-            )
         if trial_available_for(tg_id):
             raise PaymentError("Этот тариф бесплатный — просто получи тестовый ключ командой /test_vpn.")
         raise PaymentError("Этот тариф бесплатный и сейчас недоступен. Выбери платный тариф — ключ придёт сразу после оплаты.")
@@ -4728,7 +4883,7 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
         )
 
     if PAYMENTS_MODE in ("stars", "provider"):
-        order = await payment_store.create(new_order(tg_id, tariff_key, location_key))
+        order = await payment_store.create(new_order(tg_id, tariff_key, location_key, protocols))
         provider_token = PAYMENT_PROVIDER_TOKEN if PAYMENTS_MODE == "provider" else None
         if PAYMENTS_MODE == "provider" and not provider_token:
             raise PaymentError(
@@ -4781,7 +4936,7 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
 
     # Platega: создаём транзакцию и отдаём ссылку на оплату (карта, СБП, кошельки)
     if PAYMENTS_MODE == "platega":
-        order = await payment_store.create(new_order(tg_id, tariff_key, location_key))
+        order = await payment_store.create(new_order(tg_id, tariff_key, location_key, protocols))
         try:
             data = await platega_create_payment(order)
         except Exception:
@@ -4818,7 +4973,7 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
             chat_id,
             f"💳 <b>Оплата тарифа {tariff['name']}</b>\n\n"
             f"• Сумма: <b>{tariff['price']} ₽</b>\n"
-            f"{tariff_terms_line(tariff)}\n"
+            f"{tariff_terms_line(tariff, order.get('protocols'))}\n"
             f"• Сервер: <b>{location_display(tariff, location_key)}</b>\n\n"
             "Нажми «Оплатить» — откроется платёжная страница Platega: карта, СБП, "
             "электронные кошельки и криптовалюта. Ключ придёт автоматически после "
@@ -4833,7 +4988,7 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
         return
 
     # ЮKassa: создаём платёж и отдаём ссылку на оплату
-    order = await payment_store.create(new_order(tg_id, tariff_key, location_key))
+    order = await payment_store.create(new_order(tg_id, tariff_key, location_key, protocols))
     client = make_yookassa_client()
     payment = await client.create_payment(order)
     payment_id = payment.get("id")
@@ -4858,7 +5013,7 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
         chat_id,
         f"💳 <b>Оплата тарифа {tariff['name']}</b>\n\n"
         f"• Сумма: <b>{tariff['price']} ₽</b>\n"
-        f"{tariff_terms_line(tariff)}\n"
+        f"{tariff_terms_line(tariff, order.get('protocols'))}\n"
         f"• Сервер: <b>{location_display(tariff, location_key)}</b>\n\n"
         "Нажми «Оплатить» — откроется страница ЮKassa (карта, СБП и другие способы). "
         "Ключ придёт автоматически после успешной оплаты.\n"
@@ -5100,16 +5255,198 @@ TARIFF_KINDS = {
 }
 TARIFF_KIND_ORDER = ("time", "traffic")
 
-# Уровни: название, лимит устройств и число туннелей (локаций).
+# Протоколы доступа: клиент выбирает протоколы по уровню тарифа, а бот заводит его
+# в подключение (inbound) панели для каждого ВАРИАНТА выбранного протокола на каждом
+# сервере — вариант VLESS (Reality / XHTTP / gRPC) и вариант Shadowsocks (шифр) тоже
+# считается отдельным туннелем.
+#   title  — как протокол называется в кнопках;
+#   hint   — короткое пояснение для экрана выбора;
+#   aliases — по каким словам ищем inbound в панели (remark), если не задан ID.
+# ---------------------------------------------------------------------------
+# ПРОТОКОЛЫ И ТУННЕЛИ
+# ---------------------------------------------------------------------------
+# Базовых протоколов пять. У VLESS и Shadowsocks-2022 по три варианта, у остальных
+# по одному — каждый вариант в панели 3x-ui это отдельное входящее подключение,
+# то есть отдельный «туннель», который клиент получает в подписке.
+PROTOCOLS = {
+    "vless": {
+        "title": "VLESS",
+        "hint": "Максимальная скрытность",
+        "variants": (
+            {"key": "reality", "title": "VLESS Reality",
+             "hint": "Максимальная скрытность", "env": "VLESS_REALITY",
+             "aliases": ("reality", "реалити")},
+            {"key": "xhttp", "title": "VLESS Reality + XHTTP",
+             "hint": "Маскировка под обычный сайт", "env": "VLESS_XHTTP",
+             "aliases": ("xhttp",)},
+            {"key": "grpc", "title": "VLESS Reality + gRPC",
+             "hint": "Стабильный транспорт", "env": "VLESS_GRPC",
+             "aliases": ("grpc",)},
+        ),
+    },
+    "shadowsocks": {
+        "title": "Shadowsocks-2022",
+        "hint": "Проверенный и совместимый",
+        "variants": (
+            {"key": "aes128", "title": "Shadowsocks-2022 · AES-128-GCM",
+             "hint": "Лёгкий и быстрый", "env": "SHADOWSOCKS_AES128",
+             "aliases": ("aes-128", "aes128", "aes_128"),
+             "methods": ("aes-128-gcm",)},
+            {"key": "aes256", "title": "Shadowsocks-2022 · AES-256-GCM",
+             "hint": "Усиленное шифрование", "env": "SHADOWSOCKS_AES256",
+             "aliases": ("aes-256", "aes256", "aes_256"),
+             "methods": ("aes-256-gcm",)},
+            {"key": "chacha20", "title": "Shadowsocks-2022 · ChaCha20-Poly1305",
+             "hint": "Быстр на слабом процессоре", "env": "SHADOWSOCKS_CHACHA20",
+             "aliases": ("chacha20", "chacha"),
+             "methods": ("chacha20-poly1305", "chacha20-ietf-poly1305")},
+        ),
+    },
+    "amneziawg": {
+        "title": "AmneziaWG",
+        "hint": "Быстрый и устойчивый",
+        "variants": (
+            {"key": "default", "title": "AmneziaWG",
+             "hint": "Обфускация и устойчивость к блокировкам", "env": "AMNEZIAWG",
+             "aliases": ("amnezia", "awg")},
+        ),
+    },
+    "wireguard": {
+        "title": "WireGuard",
+        "hint": "Простой и лёгкий",
+        "variants": (
+            {"key": "default", "title": "WireGuard",
+             "hint": "Простой и лёгкий", "env": "WIREGUARD",
+             "aliases": ("wireguard", "wg")},
+        ),
+    },
+    "hysteria2": {
+        "title": "Hysteria2",
+        "hint": "Скорость на нестабильных сетях",
+        "variants": (
+            {"key": "default", "title": "Hysteria2",
+             "hint": "Скорость на нестабильных сетях", "env": "HYSTERIA2",
+             "aliases": ("hysteria", "hy2")},
+        ),
+    },
+}
+PROTOCOL_ORDER = ("vless", "shadowsocks", "amneziawg", "wireguard", "hysteria2")
+
+# Уровни: сколько серверов входит, сколько протоколов выбирает клиент
+# (0 = все протоколы, выбор не нужен) и лимит устройств (0 = без ограничений).
+# Варианты протокола клиент получает все: выбрал VLESS — получил Reality, XHTTP и gRPC.
 TARIFF_LEVELS = {
-    1: {"name": "Новичок", "devices": 1, "tunnels": 1},
-    2: {"name": "Нетраннер", "devices": 3, "tunnels": 2},
-    3: {"name": "Кибер-самурай", "devices": 5, "tunnels": 4},
-    4: {"name": "Призрак", "devices": 6, "tunnels": 6},
+    1: {"name": "Новичок", "devices": 1, "servers": 1, "protocol_choices": 1},
+    2: {"name": "Нетраннер", "devices": 3, "servers": 2, "protocol_choices": 1},
+    3: {"name": "Кибер-самурай", "devices": 5, "servers": 2, "protocol_choices": 3},
+    4: {"name": "Призрак", "devices": 0, "servers": 2, "protocol_choices": 0},
 }
 TARIFF_LEVEL_ORDER = (1, 2, 3, 4)
 
+
+def protocol_title(key: str) -> str:
+    """Название протокола для кнопок и текстов: VLESS, Shadowsocks-2022, …"""
+    meta = PROTOCOLS.get(key) or {}
+    return meta.get("title") or key
+
+
+def protocol_hint(key: str) -> str:
+    """Одна строка-подсказка протокола для новичка."""
+    return (PROTOCOLS.get(key) or {}).get("hint", "")
+
+
+def protocol_variants(key: str) -> tuple[dict, ...]:
+    """Варианты (туннели) протокола: у VLESS и Shadowsocks-2022 их по три."""
+    return tuple((PROTOCOLS.get(key) or {}).get("variants") or ())
+
+
+def protocol_variant_count(key: str) -> int:
+    """Сколько туннелей даёт один протокол."""
+    return max(1, len(protocol_variants(key)))
+
+
+def protocol_variant(key: str, variant: str) -> dict:
+    """Описание варианта протокола по его ключу."""
+    for meta in protocol_variants(key):
+        if meta.get("key") == variant:
+            return meta
+    return {}
+
+
+def variant_title(key: str, variant: str) -> str:
+    """Название варианта: «VLESS Reality + XHTTP», «Shadowsocks-2022 · AES-256-GCM»."""
+    meta = protocol_variant(key, variant)
+    return meta.get("title") or protocol_title(key)
+
+
+def variant_hint(key: str, variant: str) -> str:
+    """Подсказка варианта протокола."""
+    meta = protocol_variant(key, variant)
+    return meta.get("hint") or protocol_hint(key)
+
+
+def protocol_tunnel_titles(key: str) -> list[str]:
+    """Все названия туннелей протокола (для подтверждения заказа и «Моих подписок»)."""
+    return [variant_title(key, meta.get("key")) for meta in protocol_variants(key)]
+
+
+def level_protocols(level: int | None) -> tuple[str, ...]:
+    """Все протоколы, доступные на уровне: на любом уровне можно выбрать любой из пяти."""
+    return PROTOCOL_ORDER
+
+
+def level_protocol_choices(level: int | None) -> int:
+    """Сколько протоколов выбирает клиент на уровне (0 = все, выбор не нужен)."""
+    meta = TARIFF_LEVELS.get(int(level or 0)) or {}
+    return int(meta.get("protocol_choices") or 0)
+
+
+def level_servers_count(level: int | None) -> int:
+    """Сколько серверов входит в уровень."""
+    meta = TARIFF_LEVELS.get(int(level or 0)) or {}
+    return max(1, int(meta.get("servers") or 1))
+
+
+def protocols_need_label(level: int | None) -> str:
+    """«нужно выбрать 1 протокол», «нужно выбрать 3 протокола», «входят все протоколы»."""
+    need = level_protocol_choices(level)
+    if need <= 0 or need >= len(PROTOCOL_ORDER):
+        return "входят все протоколы"
+    return f"нужно выбрать {need} {protocol_word(need)}"
+
+
+def tunnels_range(level: int | None) -> tuple[int, int]:
+    """
+    Сколько туннелей даёт уровень: (минимум, максимум).
+
+    Туннель — это пара «сервер + вариант протокола». Клиент сам решает, какие
+    протоколы взять: VLESS и Shadowsocks-2022 дают по три варианта, остальные по одному.
+    """
+    meta = TARIFF_LEVELS.get(int(level or 0))
+    if not meta:
+        return (0, 0)
+    servers = max(1, int(meta.get("servers") or 1))
+    counts = sorted((protocol_variant_count(key) for key in PROTOCOL_ORDER), reverse=True)
+    need = int(meta.get("protocol_choices") or 0) or len(PROTOCOL_ORDER)
+    need = max(1, min(need, len(PROTOCOL_ORDER)))
+    most = servers * sum(counts[:need])
+    least = servers * sum(sorted(counts)[:need])
+    return (least, most)
+
+
+def tunnels_range_label(level: int | None) -> str:
+    """«1–3 туннеля», «6–14 туннелей», «18 туннелей» — для экранов выбора."""
+    low, high = tunnels_range(level)
+    if low <= 0:
+        return "—"
+    if low == high:
+        return f"{high} {tunnels_word(high)}"
+    return f"{low}–{high} {tunnels_word(high)}"
+
+
 # Сетка: тип → уровень → цена, трафик (ГБ), срок (дней; 0 = без ограничения).
+# Цены не меняются: 70 / 130 / 250 / 450 ₽ «по времени», 70 / 150 / 300 / 500 ₽ «по трафику».
+# Комиссия кассы (PLATEGA_PAYER_FEE_PERCENT) берётся на нас: клиент видит цену тарифа.
 TARIFF_GRID = {
     "traffic": {
         1: {"price": 70, "traffic_gb": 10, "days": 0},
@@ -5118,10 +5455,10 @@ TARIFF_GRID = {
         4: {"price": 500, "traffic_gb": 200, "days": 0},
     },
     "time": {
-        1: {"price": 70, "traffic_gb": 15, "days": 15},
+        1: {"price": 70, "traffic_gb": 10, "days": 15},
         2: {"price": 130, "traffic_gb": 50, "days": 15},
         3: {"price": 250, "traffic_gb": 100, "days": 30},
-        4: {"price": 450, "traffic_gb": 0, "days": 30},
+        4: {"price": 450, "traffic_gb": 200, "days": 30},
     },
 }
 
@@ -5147,7 +5484,8 @@ def _build_plan(kind: str, level: int) -> dict:
     """Собирает описание одного платного тарифа из сетки."""
     meta = TARIFF_LEVELS[level]
     grid = TARIFF_GRID[kind][level]
-    tunnels = meta["tunnels"]
+    servers = meta["servers"]
+    low, high = tunnels_range(level)
     return {
         "name": f"{meta['name']} · {TARIFF_KINDS[kind]['short']}",
         "price": grid["price"],
@@ -5156,40 +5494,112 @@ def _build_plan(kind: str, level: int) -> dict:
         "traffic_gb": grid["traffic_gb"],
         "ips": meta["devices"],
         "ip_limit": meta["devices"],
-        "tunnels": tunnels,
+        "servers": servers,
+        "protocols": list(PROTOCOL_ORDER),
+        "protocol_choices": meta["protocol_choices"],
+        "tunnels_min": low,
+        "tunnels_max": high,
         "kind": kind,
         "level": level,
-        "locations": ("Все локации" if tunnels > 1
-                      else "1 локация на выбор"),
+        "locations": ("Все серверы" if servers > 1 else "1 сервер на выбор"),
     }
+
+
+def tariff_protocol_choices(tariff: dict) -> int:
+    """Сколько протоколов выбирает клиент в тарифе (0 = все)."""
+    if "protocol_choices" in tariff:
+        return int(tariff.get("protocol_choices") or 0)
+    return level_protocol_choices(tariff.get("level"))
+
+
+def protocols_label(tariff: dict) -> str:
+    """«1 протокол на выбор», «3 протокола на выбор» или «все протоколы (5)»."""
+    need = tariff_protocol_choices(tariff)
+    if need <= 0 or need >= len(PROTOCOL_ORDER):
+        return f"все протоколы ({len(PROTOCOL_ORDER)})"
+    return f"{need} {protocol_word(need)} на выбор"
+
+
+def protocols_count_label(tariff: dict) -> str:
+    """Короткая подпись для списков уровней: «1 протокол на выбор», «все протоколы»."""
+    need = tariff_protocol_choices(tariff)
+    if need <= 0 or need >= len(PROTOCOL_ORDER):
+        return "все протоколы"
+    return f"{need} {protocol_word(need)} на выбор"
+
+
+def tariff_tunnels_label(tariff: dict) -> str:
+    """«до 3 туннелей», «6–14 туннелей», «18 туннелей» — для списков и подтверждения."""
+    low = int(tariff.get("tunnels_min") or 0)
+    high = int(tariff.get("tunnels_max") or 0)
+    if low <= 0 or high <= 0:
+        low, high = tunnels_range(tariff.get("level"))
+    if low == high:
+        return f"{high} {tunnels_word(high)}"
+    return f"до {high} туннелей"
+
+
+def protocol_word(count: int) -> str:
+    """«протокол», «протокола», «протоколов»."""
+    value = abs(int(count))
+    if value % 100 in (11, 12, 13, 14):
+        return "протоколов"
+    if value % 10 == 1:
+        return "протокол"
+    if value % 10 in (2, 3, 4):
+        return "протокола"
+    return "протоколов"
+
+
+def tunnels_word(count: int) -> str:
+    """«туннель», «туннеля», «туннелей»."""
+    value = abs(int(count))
+    if value % 100 in (11, 12, 13, 14):
+        return "туннелей"
+    if value % 10 == 1:
+        return "туннель"
+    if value % 10 in (2, 3, 4):
+        return "туннеля"
+    return "туннелей"
+
+
+def servers_where_label(count: int) -> str:
+    """«на 1 сервере», «на 2 серверах», «на 5 серверах»."""
+    value = abs(int(count))
+    if value % 10 == 1 and value % 100 != 11:
+        return f"на {value} сервере"
+    return f"на {value} серверах"
+
+
+def servers_word(count: int) -> str:
+    """«сервер», «сервера», «серверов»."""
+    value = abs(int(count))
+    if value % 100 in (11, 12, 13, 14):
+        return "серверов"
+    if value % 10 == 1:
+        return "сервер"
+    if value % 10 in (2, 3, 4):
+        return "сервера"
+    return "серверов"
 
 
 TARIFFS = {
     "trial": {
-        "name": "🎁 Тестовый период (24 ч)",
-        "price": 0,
-        "days": 1,
-        "traffic": "1 ГБ",
-        "traffic_gb": 1,
-        "ips": 1,
-        "ip_limit": 1,
-        "tunnels": 1,
-        "kind": "",
-        "level": 0,
-        "locations": "Стокгольм",
-    },
-    "promo": {
-        "name": "🎉 Промо-доступ (15 дней)",
+        "name": "🎁 Бесплатный тест (10 ГБ / 15 дней)",
         "price": 0,
         "days": 15,
         "traffic": "10 ГБ",
         "traffic_gb": 10,
         "ips": 1,
         "ip_limit": 1,
-        "tunnels": 1,
+        "servers": 1,
+        "protocols": ["vless"],
+        "protocol_choices": 1,
+        "tunnels_min": 1,
+        "tunnels_max": 1,
         "kind": "",
         "level": 0,
-        "locations": "Стокгольм",
+        "locations": "1 сервер на выбор",
     },
 }
 for _kind in TARIFF_KIND_ORDER:
@@ -5224,12 +5634,30 @@ def tariff_specs_line(tariff: dict) -> str:
     return " · ".join(part for part in parts if part)
 
 
-def tariff_terms_line(tariff: dict) -> str:
-    """Строка для счёта и подтверждения оплаты: срок, трафик, устройства."""
+def tariff_terms_line(tariff: dict, protocols: list[str] | None = None) -> str:
+    """
+    Строка для счёта и подтверждения оплаты: срок, трафик, устройства, туннели.
+
+    Если известны выбранные протоколы — показываем точное число туннелей и сами
+    протоколы; иначе — диапазон уровня («до 3 туннелей»).
+    """
+    if protocols:
+        per_server = sum(protocol_variant_count(key) for key in protocols)
+        servers = tariff_servers(tariff)
+        total = per_server * servers
+        tunnels = f"{total} {tunnels_word(total)}"
+        if servers > 1:
+            tunnels += f" ({per_server} на каждом сервере)"
+        protocols_line = "\n🧩 <b>Протоколы:</b> " + ", ".join(protocol_title(key) for key in protocols)
+    else:
+        tunnels = tariff_tunnels_label(tariff)
+        protocols_line = ""
     return (
         f"⏳ <b>Срок:</b> {days_label(tariff.get('days', 0))}\n"
         f"📊 <b>Трафик:</b> {tariff.get('traffic', '')}\n"
-        f"📱 <b>Устройств:</b> {tariff.get('ips', 0)}"
+        f"📱 <b>Устройств:</b> {tariff.get('ips', 0)}\n"
+        f"📡 <b>Туннелей:</b> {tunnels}"
+        + protocols_line
     )
 
 
@@ -5496,16 +5924,20 @@ def main_menu_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
     показ кнопок (TRIAL_BUTTON=1 + TRIAL_PUBLIC=1 или администратор) — чтобы
     пользователь не упирался в отказ.
     """
-    rows = []
+    rows = [[InlineKeyboardButton(text="🛒 Купить VPN", callback_data="tariffs")]]
     if trial_button_visible(tg_id):
-        rows.append([InlineKeyboardButton(text="🔑 Получить тестовый VPN (24 часа)",
-                                          callback_data="get_test_key_btn")])
+        trial = TARIFFS.get("trial") or {}
+        rows.append([InlineKeyboardButton(
+            text=f"🎁 Бесплатный тест ({trial.get('traffic', '10 ГБ')} / "
+                 f"{days_label(trial.get('days', 15))})",
+            callback_data="get_test_key_btn",
+        )])
     rows += [
             [
-                InlineKeyboardButton(text="💰 Тарифы", callback_data="tariffs"),
-                InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile"),
+                InlineKeyboardButton(text="💳 Мои подписки", callback_data="profile"),
+                InlineKeyboardButton(text="❓ Помощь", callback_data="help_menu"),
             ],
-            [InlineKeyboardButton(text="📲 Как подключиться (пошагово)", callback_data="help_menu")],
+            [InlineKeyboardButton(text="ℹ️ О сервисе", callback_data="about")],
             [InlineKeyboardButton(text=f"🎁 Пригласить друга — +{REFERRAL_BONUS_DAYS} "
                                         f"{days_word(REFERRAL_BONUS_DAYS)}", callback_data="invite")],
             [
@@ -5517,56 +5949,73 @@ def main_menu_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+@dp.callback_query(F.data == "about")
+async def cb_about(cb: CallbackQuery):
+    """Экран «О сервисе»: что за сервис, какие протоколы и где документы."""
+    await cb.answer()
+    protocols_list = ", ".join(protocol_title(key) for key in PROTOCOL_ORDER)
+    text = (
+        "ℹ️ <b>О сервисе</b>\n\n"
+        f"<b>{SERVICE_NAME}</b> — быстрый VPN для повседневного использования: "
+        "стабильные серверы, современные протоколы и подключение в пару нажатий.\n\n"
+        f"🧩 <b>Протоколы:</b> {protocols_list}\n"
+        "🌍 <b>Серверы:</b> " + ", ".join(spot["title"] for spot in configured_locations()) + "\n\n"
+        "💳 Оплата — картой, через СБП или звёздами Telegram; доступ выдаётся автоматически.\n"
+        "📄 Документы: условия сервиса — /terms, политика конфиденциальности — /privacy.\n"
+        "💬 Вопросы и помощь — кнопка «Поддержка» ниже."
+    )
+    await cb.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Поддержка", callback_data="support")],
+        [InlineKeyboardButton(text="📄 Соглашение", callback_data="terms"),
+         InlineKeyboardButton(text="🔒 Политика", callback_data="privacy")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
+    ]), parse_mode="HTML")
+
+
+def kind_choice_label(kind: str) -> str:
+    """Кнопка типа подписки: «📊 По трафику (без ограничения по времени)»."""
+    titles = {
+        "traffic": "📊 По трафику (без ограничения по времени)",
+        "time": "⏳ По времени (с лимитом трафика)",
+    }
+    return titles.get(kind) or TARIFF_KINDS[kind]["title"]
+
+
 def tariffs_intro(tg_id: int | None = None) -> str:
-    """Первый экран тарифов: бесплатные предложения и шаг выбора типа подписки."""
-    text = "💰 <b>Тарифные планы</b>\n\n"
-    text += ("Выбери подписку в три шага: <b>тип</b> (по времени или по трафику) → "
-             "<b>уровень</b> (Новичок, Нетраннер, Кибер-самурай, Призрак) → "
-             "<b>сервер</b> для тарифов с одним туннелем.\n\n")
-    free_items = []
-    promo = TARIFFS.get(PROMO_KEY) or {}
-    if promo_visible(tg_id):
-        free_items.append(
-            f"• 🎉 <b>Промо-доступ</b> — {traffic_label(promo.get('traffic_gb', 0))} "
-            f"на {days_label(promo.get('days', PROMO_DAYS))} (один раз на аккаунт)"
-        )
+    """Первый экран покупки: бесплатный тест и шаг 1 — выбор типа подписки."""
+    text = "🛒 <b>Купить VPN</b>\n\n"
     trial = TARIFFS.get("trial") or {}
     if tariff_visible(tg_id, "trial", trial):
-        free_items.append(f"• 🎁 <b>Тестовый период</b> — 24 часа, {trial.get('traffic', '')}")
-    if free_items:
-        text += "<b>Бесплатно</b>\n" + "\n".join(free_items) + "\n\n"
-    text += "<b>Платные тарифы</b>\n"
+        text += (f"🎁 <b>Бесплатный тест</b> — {trial.get('traffic', '')} на "
+                 f"{days_label(trial.get('days', 15))}, один раз на аккаунт.\n\n")
+    text += "📦 <b>Шаг 1. Выберите тип подписки:</b>\n\n"
     for kind in TARIFF_KIND_ORDER:
         meta = TARIFF_KINDS[kind]
         prices = [TARIFF_GRID[kind][level]["price"] for level in TARIFF_LEVEL_ORDER]
-        text += (f"• <b>{meta['title']}</b> — от {min(prices)} ₽\n"
-                 f"  <i>{meta['hint']}</i>\n")
+        text += (f"{kind_choice_label(kind)}\n"
+                 f"<i>{meta['hint']}</i> · цены от {min(prices)} ₽\n\n")
+    text += ("Дальше: <b>тариф (уровень)</b> → <b>сервер</b> → <b>протоколы</b> → оплата.")
     return text
 
 
 def tariffs_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
     """
-    Кнопки тарифов: бесплатные предложения, затем шаг 1 — выбор типа подписки.
+    Кнопки покупки: бесплатный тест (если он доступен) и шаг 1 — тип подписки.
 
-    Бесплатный тестовый пункт показываем только тем, кому тест доступен и включён
-    показ кнопок (TRIAL_BUTTON=1) — иначе пользователь нажмёт «Бесплатно» и получит
-    отказ, а бот выглядит не как рабочий сервис.
+    Тестовый пункт показываем только тем, кому тест доступен и включён показ кнопок
+    (TRIAL_BUTTON=1) — иначе пользователь нажмёт «Бесплатно» и получит отказ.
     """
     buttons = []
-    if promo_visible(tg_id):
-        promo = TARIFFS.get(PROMO_KEY) or {}
-        buttons.append([InlineKeyboardButton(
-            text=f"🎉 Промо-доступ — {promo.get('traffic', '')} на "
-                 f"{days_label(promo.get('days', PROMO_DAYS))} бесплатно",
-            callback_data="buy_promo",
-        )])
     if tariff_visible(tg_id, "trial", TARIFFS.get("trial") or {}):
-        buttons.append([InlineKeyboardButton(text="🎁 Тестовый период (24 ч) — Бесплатно",
-                                             callback_data="buy_trial")])
-    buttons.append([InlineKeyboardButton(text="━━ Выбрать тариф ━━", callback_data="noop")])
+        trial = TARIFFS.get("trial") or {}
+        buttons.append([InlineKeyboardButton(
+            text=f"🎁 Бесплатный тест — {trial.get('traffic', '')} / "
+                 f"{days_label(trial.get('days', 15))} бесплатно",
+            callback_data="buy_trial",
+        )])
     for kind in TARIFF_KIND_ORDER:
         buttons.append([InlineKeyboardButton(
-            text=TARIFF_KINDS[kind]["title"],
+            text=kind_choice_label(kind),
             callback_data=f"tkind_{kind}",
         )])
     if PAYMENTS_MODE == "yookassa":
@@ -5575,33 +6024,43 @@ def tariffs_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def level_servers_label(tariff: dict) -> str:
+    """«1 сервер на выбор» или «2 сервера (оба)»."""
+    if tariff_servers(tariff) <= 1:
+        return "1 сервер на выбор"
+    spots = tariff_locations(tariff)
+    return f"{len(spots)} {servers_word(len(spots))} (оба)"
+
+
 def kind_levels_text(kind: str) -> str:
     """Второй экран: что входит в уровни выбранного типа подписки."""
     meta = TARIFF_KINDS[kind]
-    text = f"{meta['title']}: <b>выбери уровень</b>\n\n"
-    text += f"<i>{meta['hint']}</i>\n\n"
+    text = f"🎚️ <b>Шаг 2. Выберите тариф (уровень):</b>\n\n"
+    text += f"{meta['title']} — <i>{meta['hint']}</i>\n\n"
     for level in TARIFF_LEVEL_ORDER:
         tariff = TARIFFS[tariff_key(kind, level)]
         plan = TARIFF_LEVELS[level]
         text += (
-            f"<b>{plan['name']}</b> — <b>{tariff_price_label(tariff)}</b>\n"
-            f"  📊 {tariff['traffic']} | ⏳ {days_label(tariff['days'])}\n"
-            f"  📱 {plan['devices']} {devices_word(plan['devices'])} | "
-            f"🌍 {plan['tunnels']} {tunnels_word(plan['tunnels'])}\n\n"
+            f"<b>{level}. {plan['name']}</b> — <b>{tariff_price_label(tariff)}</b>\n"
+            f"  🌍 {level_servers_label(tariff)} | 🧩 {protocols_count_label(tariff)}\n"
+            f"  📊 {tariff['traffic']} / {days_label(tariff['days'])} | "
+            f"📱 {devices_label(plan['devices'])}\n"
+            f"  📡 {tariff_tunnels_label(tariff)} ({level_tunnels_hint(level)})\n\n"
         )
     return text
 
 
-def tunnels_word(count: int) -> str:
-    """«1 туннель», «2 туннеля», «6 туннелей»."""
-    value = abs(int(count))
-    if value % 100 in (11, 12, 13, 14):
-        return "туннелей"
-    if value % 10 == 1:
-        return "туннель"
-    if value % 10 in (2, 3, 4):
-        return "туннеля"
-    return "туннелей"
+def level_tunnels_hint(level: int) -> str:
+    """Пояснение, откуда берётся число туннелей: «3 варианта VLESS × 1 сервер»."""
+    need = level_protocol_choices(level)
+    servers = level_servers_count(level)
+    if need <= 0:
+        return f"все 5 протоколов, 9 вариантов на {servers} {servers_word(servers)}"
+    if need == 1:
+        return ("у VLESS и Shadowsocks по 3 варианта, у остальных по одному"
+                if servers == 1 else
+                f"1 протокол × {servers} {servers_word(servers)}")
+    return f"{need} {protocol_word(need)} × {servers} {servers_word(servers)}"
 
 
 def kind_levels_kb(kind: str) -> InlineKeyboardMarkup:
@@ -5611,7 +6070,7 @@ def kind_levels_kb(kind: str) -> InlineKeyboardMarkup:
         tariff = TARIFFS[tariff_key(kind, level)]
         plan = TARIFF_LEVELS[level]
         rows.append([InlineKeyboardButton(
-            text=f"{plan['name']} — {tariff_price_label(tariff)}",
+            text=f"{level}. {plan['name']} — {tariff_price_label(tariff)}",
             callback_data=f"tlvl_{kind}_{level}",
         )])
     rows.append([InlineKeyboardButton(text="◀️ Назад к типам", callback_data="tariffs")])
@@ -5619,20 +6078,31 @@ def kind_levels_kb(kind: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def tariff_summary_lines(tariff: dict) -> str:
+    """Короткая карточка тарифа для экранов выбора."""
+    plan = TARIFF_LEVELS.get(tariff.get("level") or 0, {})
+    return (
+        f"<b>{plan.get('name', '')}</b> · {TARIFF_KINDS.get(tariff.get('kind'), {}).get('short', '')} — "
+        f"<b>{tariff_price_label(tariff)}</b>\n"
+        f"🌍 {level_servers_label(tariff)} | 🧩 {protocols_count_label(tariff)}\n"
+        f"📊 {tariff['traffic']} / {days_label(tariff['days'])} | "
+        f"📱 {devices_label(tariff['ips'])}\n"
+        f"📡 {tariff_tunnels_label(tariff)}"
+    )
+
+
 def server_pick_text(kind: str, level: int) -> str:
-    """Третий экран: выбор сервера для тарифа на один туннель."""
+    """Третий экран: выбор сервера для тарифа с одним сервером (уровень 1)."""
     tariff = TARIFFS[tariff_key(kind, level)]
     return (
-        f"{TARIFF_LEVELS[level]['name']} · {TARIFF_KINDS[kind]['short']} — "
-        f"<b>{tariff_price_label(tariff)}</b>\n\n"
-        f"📊 {tariff['traffic']} | ⏳ {days_label(tariff['days'])} | "
-        f"📱 {tariff['ips']} {devices_word(tariff['ips'])}\n\n"
-        "<b>Выбери сервер:</b>"
+        "🌍 <b>Шаг 3. Выберите сервер:</b>\n\n"
+        "В этот тариф входит один сервер — выбери, где будет твой VPN.\n\n"
+        + tariff_summary_lines(tariff)
     )
 
 
 def server_pick_kb(kind: str, level: int) -> InlineKeyboardMarkup:
-    """Кнопки выбора сервера (только для тарифов с одним туннелем)."""
+    """Кнопки выбора сервера (только для тарифов с одним сервером)."""
     rows = [[InlineKeyboardButton(text=LOCATIONS[key]["title"],
                                   callback_data=f"tlocs_{kind}_{level}_{key}")]
             for key in LOCATION_ORDER]
@@ -5641,20 +6111,434 @@ def server_pick_kb(kind: str, level: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def tariff_confirm_text(tariff: dict, location_key: str | None) -> str:
+def servers_all_text(kind: str, level: int) -> str:
+    """Третий экран для уровней 2–4: серверы не выбираются — входят оба."""
+    tariff = TARIFFS[tariff_key(kind, level)]
+    spots = tariff_locations(tariff)
+    if len(spots) >= 2:
+        header = ("В этот тариф входят <b>оба сервера</b> — выбирать не нужно. Бот выдаст "
+                  "доступ на каждом из них, одна ссылка-подписка подтянет оба:\n")
+    else:
+        header = ("В этот тариф входит <b>один сервер</b> — выбирать не нужно: "
+                  "доступ будет выдан на нём.\n")
+    return (
+        "🌍 <b>Шаг 3. Серверы:</b>\n\n"
+        + header
+        + "\n".join(f"  • {spot['title']}" for spot in spots)
+        + "\n\n" + tariff_summary_lines(tariff)
+    )
+
+
+def servers_all_kb(kind: str, level: int) -> InlineKeyboardMarkup:
+    """Кнопки третьего экрана для уровней 2–4: дальше — протоколы."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➡️ Дальше: протоколы",
+                              callback_data=f"tsall_{tariff_key(kind, level)}")],
+        [InlineKeyboardButton(text="◀️ Назад к уровням", callback_data=f"tkind_{kind}")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
+    ])
+
+
+# --- Шаг 4: выбор протоколов ---
+# Каждый вариант протокола — отдельное входящее подключение (inbound) панели на
+# конкретном сервере. ID задаётся переменной XUI_INBOUND_<ЛОКАЦИЯ>_<ВАРИАНТ>
+# (например XUI_INBOUND_WARSAW_VLESS_XHTTP или XUI_INBOUND_STOCKHOLM_SHADOWSOCKS_AES256),
+# иначе подключение ищется по названию (remark) и настройкам: в названии должны
+# упоминаться локация и протокол (вариант — по названию или по транспорту/шифру).
+# У VLESS запасной вариант — обычное подключение локации (как было до вариантов).
+_INBOUNDS_CACHE: dict = {"at": 0.0, "items": []}
+
+# Выбор протоколов в интерфейсе: {tg_id: {"tariff": …, "location": …,
+# "available": {протокол: {вариант: [локации]}}, "selected": [протоколы]}}.
+PROTOCOL_SELECTION: dict[int, dict] = {}
+
+
+async def fetch_inbounds_cached(ttl: int = 60) -> list[dict]:
+    """Список подключений панели с коротким кэшем — для экранов выбора протоколов."""
+    now = time.time()
+    cached = _INBOUNDS_CACHE.get("items") or []
+    if cached and now - float(_INBOUNDS_CACHE.get("at") or 0) < ttl:
+        return cached
+    try:
+        async with XUIClient() as client:
+            items = await client.get_inbounds()
+    except Exception as exc:
+        logger.warning("Не удалось получить список подключений панели: %s", exc)
+        return cached
+    _INBOUNDS_CACHE.update({"at": now, "items": items})
+    return items
+
+
+def tunnel_env_name(location_key: str, protocol: str, variant: str) -> str:
+    """Имя переменной для туннеля: XUI_INBOUND_<ЛОКАЦИЯ>_<ВАРИАНТ>."""
+    meta = protocol_variant(protocol, variant)
+    token = str(meta.get("env") or f"{protocol}_{variant}").upper()
+    return f"XUI_INBOUND_{str(location_key).upper()}_{token}"
+
+
+def tunnel_env_inbound_id(location_key: str, protocol: str, variant: str) -> int:
+    """ID подключения из переменной туннеля (0, если переменная не задана)."""
+    return _int_env(tunnel_env_name(location_key, protocol, variant))
+
+
+def inbound_network(inbound: dict) -> str:
+    """Транспорт подключения из streamSettings (tcp, xhttp, grpc, …)."""
+    stream = as_dict(inbound.get("streamSettings"))
+    return str(stream.get("network") or "").strip().lower()
+
+
+def inbound_method(inbound: dict) -> str:
+    """Метод шифрования Shadowsocks из настроек подключения."""
+    return str(as_dict(inbound.get("settings")).get("method") or "").strip().lower()
+
+
+def inbound_remark_lower(inbound: dict) -> str:
+    return str(inbound.get("remark") or "").strip().lower()
+
+
+def inbound_protocol_key(inbound: dict) -> str | None:
+    """Какому базовому протоколу соответствует подключение панели."""
+    remark = inbound_remark_lower(inbound)
+    protocol = str(inbound.get("protocol") or "").strip().lower()
+
+    # AmneziaWG в панели тоже WireGuard — различаем по названию.
+    if protocol in ("amneziawg", "amnezia") or re.search(r"(amnezia|awg)", remark):
+        return "amneziawg"
+    if protocol in ("hysteria", "hysteria2") or re.search(r"(hysteria|hy2)", remark):
+        return "hysteria2"
+    if protocol in ("shadowsocks", "ss") or re.search(r"(shadowsocks|ss-?2022)", remark):
+        return "shadowsocks"
+    if protocol in ("wireguard", "wg") or re.search(r"(wireguard|\bwg\b)", remark):
+        return "wireguard"
+    if protocol in ("vless", "vmess") or re.search(r"(vless|reality|xhttp|grpc|xtls)", remark):
+        return "vless"
+    return None
+
+
+def inbound_variant_key(inbound: dict, protocol: str) -> str | None:
+    """Какому варианту протокола соответствует подключение (по транспорту, шифру, названию)."""
+    remark = inbound_remark_lower(inbound)
+    if protocol == "vless":
+        network = inbound_network(inbound)
+        if network == "xhttp":
+            return "xhttp"
+        if network == "grpc":
+            return "grpc"
+        if network in ("tcp", "raw", ""):
+            return "reality"
+        return None
+    if protocol == "shadowsocks":
+        method = inbound_method(inbound)
+        for meta in protocol_variants("shadowsocks"):
+            if method and method in [str(value).lower() for value in meta.get("methods") or ()]:
+                return str(meta.get("key"))
+        for meta in protocol_variants("shadowsocks"):
+            if any(str(alias) in remark for alias in meta.get("aliases") or ()):
+                return str(meta.get("key"))
+        # Метод в настройках не распознан — считаем подключение вариантом по умолчанию.
+        return "aes256"
+    variants = protocol_variants(protocol)
+    return str(variants[0]["key"]) if variants else None
+
+
+def inbound_matches_location(inbound: dict, spot: dict) -> bool:
+    """Упоминается ли локация в названии подключения."""
+    remark = inbound_remark_lower(inbound)
+    if not remark:
+        return False
+    names = [str(spot.get("short") or "").lower(), *(spot.get("aliases") or ())]
+    return any(name and name in remark for name in names)
+
+
+def inbound_is_plain_location(inbound: dict, spot: dict) -> bool:
+    """Обычное подключение локации: VLESS Reality без протокола в названии."""
+    if not inbound_matches_location(inbound, spot):
+        return False
+    return inbound_protocol_key(inbound) in (None, "vless")
+
+
+def match_tunnel_inbound(inbounds: list[dict], spot: dict, protocol: str,
+                         variant: str) -> dict | None:
+    """
+    Подключение панели для пары «локация + вариант протокола» (или None, если нет).
+
+    Приоритет: переменная XUI_INBOUND_<ЛОКАЦИЯ>_<ВАРИАНТ> → название подключения с
+    локацией и протоколом (вариант — по транспорту/шифру/названию) → для VLESS обычное
+    подключение локации → общее XUI_INBOUND_ID.
+    """
+    env_id = tunnel_env_inbound_id(spot.get("key", ""), protocol, variant)
+    if env_id > 0:
+        found = next((item for item in inbounds if int(item.get("id") or 0) == env_id), None)
+        return found or {"id": env_id, "remark": f"{spot.get('short')} · {variant_title(protocol, variant)}"}
+
+    for inbound in inbounds:
+        if inbound_protocol_key(inbound) != protocol:
+            continue
+        if not inbound_matches_location(inbound, spot):
+            continue
+        if inbound_variant_key(inbound, protocol) == variant:
+            return inbound
+
+    if protocol == "vless" and variant == "reality":
+        # Обычное подключение локации (до появления вариантов) — считаем VLESS Reality.
+        for inbound in inbounds:
+            if inbound_is_plain_location(inbound, spot):
+                return inbound
+        fallback = next((item for item in inbounds
+                         if int(item.get("id") or 0) == int(XUI_INBOUND_ID or 0)), None)
+        if fallback is not None:
+            return fallback
+    return None
+
+
+def tariff_spots(tariff: dict, location_key: str | None = None) -> list[dict]:
+    """Серверы тарифа: у односерверного — выбранный клиентом, у остальных — все."""
+    spots = tariff_locations(tariff)
+    if tariff_servers(tariff) <= 1:
+        chosen = location_by_key(location_key)
+        return [chosen] if chosen else spots
+    return spots
+
+
+async def tunnel_availability(tariff: dict, location_key: str | None = None) -> dict[str, dict[str, list[str]]]:
+    """
+    Какие туннели доступны: {протокол: {вариант: [серверы, где он есть]}}.
+
+    Если панель недоступна, считаем доступными все туннели выбранных серверов:
+    выбор в интерфейсе не должен ломаться из-за временной недоступности панели.
+    """
+    spots = tariff_spots(tariff, location_key)
+    inbounds = await fetch_inbounds_cached()
+    availability: dict[str, dict[str, list[str]]] = {}
+    for protocol in PROTOCOL_ORDER:
+        variants: dict[str, list[str]] = {}
+        for meta in protocol_variants(protocol):
+            variant = str(meta.get("key"))
+            places = [spot["key"] for spot in spots
+                      if match_tunnel_inbound(inbounds, spot, protocol, variant) is not None]
+            if places:
+                variants[variant] = places
+        if variants:
+            availability[protocol] = variants
+    if not availability:
+        for protocol in PROTOCOL_ORDER:
+            availability[protocol] = {
+                str(meta.get("key")): [spot["key"] for spot in spots]
+                for meta in protocol_variants(protocol)
+            }
+    return availability
+
+
+def availability_protocols(availability: dict[str, dict[str, list[str]]]) -> list[str]:
+    """Протоколы, доступные хотя бы одним вариантом (в порядке каталога)."""
+    return [key for key in PROTOCOL_ORDER if availability.get(key)]
+
+
+def protocol_selection_get(tg_id: int) -> dict | None:
+    """Текущий выбор протоколов пользователя (если он на шаге 4)."""
+    return PROTOCOL_SELECTION.get(int(tg_id))
+
+
+def default_protocols(tariff: dict, available: list[str]) -> list[str]:
+    """
+    Что отметить по умолчанию.
+
+    Если протоколов на выбор несколько — предлагаем рекомендуемый VLESS Reality
+    (одна кнопка «Продолжить», без обязательной возни). Уровень 3 — первые три
+    протокола каталога, «Призрак» — все.
+    """
+    keys = [key for key in PROTOCOL_ORDER if key in (available or [])]
+    if not keys:
+        return []
+    need = tariff_protocol_choices(tariff)
+    if need <= 0 or need >= len(PROTOCOL_ORDER):
+        return keys
+    if need == 1:
+        return ["vless"] if "vless" in keys else keys[:1]
+    return keys[:need]
+
+
+def protocol_selection_start(tg_id: int, tariff_key_value: str, location_key: str | None,
+                             availability: dict[str, dict[str, list[str]]]) -> dict:
+    """Начинает выбор протоколов: по умолчанию — рекомендуемый набор."""
+    selection = {
+        "tariff": tariff_key_value,
+        "location": location_key,
+        "available": availability,
+        "selected": default_protocols(TARIFFS[tariff_key_value], availability_protocols(availability)),
+    }
+    PROTOCOL_SELECTION[int(tg_id)] = selection
+    return selection
+
+
+def selection_servers(selection: dict, tariff: dict) -> list[str]:
+    """Серверы, на которые попадут выбранные туннели (для текстов)."""
+    return [spot["key"] for spot in tariff_spots(tariff, selection.get("location"))]
+
+
+def selection_tunnels(tariff: dict, selection: dict,
+                      protocols: list[str] | None = None) -> list[dict]:
+    """
+    Полный список туннелей заказа: [{"protocol", "variant", "title", "servers"}].
+
+    Считаем по фактической доступности: если вариант есть не на всех серверах,
+    в списке остаётся только там, где он есть (бот всё равно выдаст все доступные).
+    """
+    availability = selection.get("available") or {}
+    chosen = protocols if protocols is not None else (selection.get("selected") or [])
+    spots = selection_servers(selection, tariff)
+    tunnels: list[dict] = []
+    for protocol in PROTOCOL_ORDER:
+        if protocol not in chosen:
+            continue
+        variants = availability.get(protocol) or {}
+        if not variants:
+            variants = {str(meta.get("key")): spots for meta in protocol_variants(protocol)}
+        for meta in protocol_variants(protocol):
+            variant = str(meta.get("key"))
+            places = [key for key in variants.get(variant, []) if key in spots]
+            if not places:
+                continue
+            tunnels.append({
+                "protocol": protocol,
+                "variant": variant,
+                "title": variant_title(protocol, variant),
+                "servers": places,
+            })
+    return tunnels
+
+
+def selection_tunnel_count(tariff: dict, selection: dict,
+                           protocols: list[str] | None = None) -> int:
+    """
+    Сколько туннелей получит клиент при текущем выборе.
+
+    Туннель — это подключение в панели, поэтому считаем конфиги: вариант протокола
+    на каждом сервере тарифа (VLESS на двух серверах — это 6 туннелей).
+    """
+    return sum(len(tunnel["servers"]) for tunnel in selection_tunnels(tariff, selection, protocols))
+
+
+def tunnels_sentence(tariff: dict, selection: dict,
+                     protocols: list[str] | None = None) -> str:
+    """
+    «Вы получаете: VLESS Reality, VLESS Reality + XHTTP, VLESS Reality + gRPC
+    (3 туннеля на 1 сервере)» — строка для подтверждения заказа.
+    """
+    tunnels = selection_tunnels(tariff, selection, protocols)
+    if not tunnels:
+        return "⚠️ Туннели не найдены — проверь подключения в панели."
+    titles = ", ".join(tunnel["title"] for tunnel in tunnels)
+    servers = sorted({spot for tunnel in tunnels for spot in tunnel["servers"]})
+    count = sum(len(tunnel["servers"]) for tunnel in tunnels)
+    where = servers_where_label(len(servers))
+    detail = (f" ({len(tunnels)} {tunnels_word(len(tunnels))} на каждом сервере)"
+              if len(servers) > 1 else "")
+    return (f"<b>Вы получаете:</b> {titles} — <b>{count} {tunnels_word(count)}</b> "
+            f"{where}{detail}.")
+
+
+def protocol_pick_text(tariff: dict, selection: dict) -> str:
+    """Четвёртый экран: выбор протоколов, которые войдут в подписку."""
+    selected = selection.get("selected") or []
+    available = selection.get("available") or {}
+    keys = availability_protocols(available)
+    need = tariff_protocol_choices(tariff)
+    lines = [
+        "🧩 <b>Шаг 4. Выберите протокол(ы):</b>",
+        "",
+        tariff_summary_lines(tariff),
+        "",
+        "<i>Каждый протокол даёт доступ по всем своим вариантам: VLESS — Reality, XHTTP "
+        "и gRPC, Shadowsocks-2022 — три шифра.</i>",
+        "",
+    ]
+    if need <= 0 or need >= len(PROTOCOL_ORDER):
+        lines.append("В этот тариф входят <b>все протоколы</b> — выбирать не нужно.")
+    elif need == 1:
+        spots = tariff_spots(tariff, selection.get("location"))
+        where = ("на выбранном сервере" if len(spots) <= 1
+                 else "на обоих серверах (" + ", ".join(spot["short"] for spot in spots) + ")")
+        lines.append(f"Выбери <b>один протокол</b> — он войдёт в подписку {where}.")
+    else:
+        lines.append(f"Выбери <b>{need} {protocol_word(need)}</b> из {len(keys)} доступных.")
+    lines.append("")
+
+    spots = tariff_spots(tariff, selection.get("location"))
+    for key in keys:
+        variants = [str(meta.get("key")) for meta in protocol_variants(key)]
+        got = [variant for variant in variants if (available.get(key) or {}).get(variant)]
+        mark = "✅" if key in selected else "◻️"
+        star = " ⭐" if key == "vless" and need == 1 else ""
+        per_server = len(got)
+        total = per_server * max(1, len(spots))
+        lines.append(
+            f"{mark} <b>{protocol_title(key)}</b>{star} — <i>{protocol_hint(key)}</i>\n"
+            f"    {total} {tunnels_word(total)}: "
+            + ", ".join(variant_title(key, variant) for variant in got)
+            + (f" (× {len(spots)} сервера)" if len(spots) > 1 else "")
+        )
+    lines.append("")
+    if keys and not selection_tunnels(tariff, selection):
+        lines.append("Отметь хотя бы один протокол.")
+    else:
+        lines.append("Нажми «Продолжить», когда закончишь выбор.")
+    return "\n".join(lines)
+
+
+def protocol_pick_kb(selection: dict, tariff_key_value: str) -> InlineKeyboardMarkup:
+    """Кнопки выбора протоколов: переключатели + «Продолжить»."""
+    plan = TARIFFS.get(tariff_key_value) or {}
+    tariff = plan or {}
+    selected = selection.get("selected") or []
+    keys = availability_protocols(selection.get("available") or {})
+    need = tariff_protocol_choices(tariff)
+    all_included = need <= 0 or need >= len(PROTOCOL_ORDER)
+    rows = []
+    spots = tariff_spots(tariff, selection.get("location"))
+    for key in keys:
+        variants = [str(meta.get("key")) for meta in protocol_variants(key)]
+        got = [variant for variant in variants
+               if ((selection.get("available") or {}).get(key) or {}).get(variant)]
+        mark = "✅" if all_included or key in selected else "◻️"
+        star = "⭐ " if key == "vless" and need == 1 else ""
+        total = len(got) * max(1, len(spots))
+        rows.append([InlineKeyboardButton(
+            text=f"{mark} {star}{protocol_title(key)} · {total} {tunnels_word(total)}",
+            callback_data=f"tpro_{key}",
+        )])
+    rows.append([InlineKeyboardButton(text="➡️ Продолжить", callback_data="tcont")])
+    if tariff_servers(tariff) <= 1:
+        back = f"tsrv_{tariff_key_value}"
+    else:
+        back = f"tsall_{tariff_key_value}"
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=back)])
+    rows.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def tariff_confirm_text(tariff: dict, location_key: str | None,
+                        protocols: list[str] | None = None) -> str:
     """Подтверждение перед оплатой: что именно покупает клиент."""
     plan = TARIFF_LEVELS.get(tariff.get("level") or 0, {})
     locations = location_display(tariff, location_key)
+    selection = {
+        "location": location_key,
+        "available": {},
+        "selected": [key for key in (protocols or []) if key in PROTOCOL_ORDER],
+    }
+    chosen = ", ".join(protocol_title(key) for key in selection["selected"]) or "—"
     return (
-        f"🧾 <b>Твой тариф</b>\n\n"
+        "✅ <b>Проверь заказ</b>\n\n"
         f"• Тип: <b>{TARIFF_KINDS[tariff['kind']]['title']}</b>\n"
-        f"• Уровень: <b>{plan.get('name', '')}</b>\n"
-        f"• Цена: <b>{tariff_price_label(tariff)}</b>\n"
+        f"• Тариф: <b>{plan.get('name', '')}</b> "
+        f"({protocols_count_label(tariff)}, {devices_label(tariff['ips'])}, "
+        f"{tariff['traffic']})\n"
+        f"• Сервер: <b>{locations}</b>\n"
+        f"• Протоколы: <b>{chosen}</b>\n"
+        f"• {tunnels_sentence(tariff, selection, selection['selected'])}\n"
         f"• Срок: <b>{days_label(tariff['days'])}</b>\n"
-        f"• Трафик: <b>{tariff['traffic']}</b>\n"
-        f"• Устройств: <b>{tariff['ips']}</b>\n"
-        f"• Туннелей: <b>{tariff['tunnels']}</b>\n"
-        f"• Сервер: <b>{locations}</b>\n\n"
+        f"• Цена: <b>{tariff_price_label(tariff)}</b>\n\n"
         "Нажми «Оплатить», чтобы перейти к оплате."
     )
 
@@ -5664,6 +6548,7 @@ def tariff_confirm_kb(tariff_key_value: str, location_key: str | None = None) ->
     data = f"buyat_{tariff_key_value}" + (f"_{location_key}" if location_key else "")
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Оплатить", callback_data=data)],
+        [InlineKeyboardButton(text="◀️ Назад к протоколам", callback_data=f"tback_{tariff_key_value}")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
     ])
 
@@ -5725,18 +6610,22 @@ async def cmd_start(message: Message):
 
 def welcome_text(tg_id: int) -> str:
     """Приветствие /start: показывается после принятия соглашения и по кнопке «Меню»."""
+    trial = TARIFFS.get("trial") or {}
     trial_line = (
-        "🎁 Бесплатный тестовый доступ на 24 часа — кнопка ниже.\n"
+        f"🎁 Бесплатный тест: {trial.get('traffic', '10 ГБ')} на "
+        f"{days_label(trial.get('days', 15))} — кнопка ниже.\n"
         if trial_button_visible(tg_id) else ""
     )
     return (
         "👋 <b>Добро пожаловать в быстрый и надёжный VPN!</b>\n\n"
-        "Мы используем современный протокол <b>VLESS Reality</b>, "
-        "который неотличим от обычного интернет-трафика и работает стабильно.\n\n"
+        "Работаем на пяти современных протоколах — <b>VLESS</b> (Reality, XHTTP, gRPC), "
+        "<b>Shadowsocks-2022</b>, <b>AmneziaWG</b>, <b>WireGuard</b> и <b>Hysteria2</b>: "
+        "выбираешь нужные при покупке, а стабильное соединение держится даже на "
+        "нестабильных сетях.\n\n"
         + trial_line +
-        "💰 Платные тарифы — раздел «Тарифы» (оплата и моментальная выдача доступа).\n"
+        "🛒 Тарифы и моментальная выдача доступа — кнопка «Купить VPN».\n"
         "📲 Подключение по шагам (со ссылками на приложения) — /help.\n"
-        "👤 Статус подписки и продление — /profile.\n"
+        "💳 Статус подписки и продление — /profile.\n"
         "📄 Условия сервиса, оплаты и возврата — /terms.\n"
         "🔒 Политика конфиденциальности — /privacy."
     )
@@ -5775,8 +6664,8 @@ async def cmd_myid(message: Message):
             )
         if trial_available_for(user_id) and not trial_button_visible(user_id):
             status_text += (
-                "\n\n🔑 Кнопки тестового ключа скрыты (<code>TRIAL_BUTTON=0</code>), "
-                "но команда /test_vpn работает: 24 часа, 1 ГиБ. "
+                "\n\n🎁 Кнопки бесплатного теста скрыты (<code>TRIAL_BUTTON=0</code>), "
+                "но команда /test_vpn работает: 10 ГБ на 15 дней. "
                 "Вернуть кнопки в меню и тарифы — <code>TRIAL_BUTTON=1</code>."
             )
         # Владельцу видно состояние оплаты: именно тут понятно, почему /test_pay
@@ -5897,9 +6786,9 @@ async def cmd_test_vpn(message: Message):
         inbound_remark = inbound.get("remark") or f"Подключение #{inbound_id}"
 
         if status == "created":
-            title = "🎉 <b>Тестовый доступ активирован — 24 часа!</b>"
+            title = "🎉 <b>Бесплатный тест активирован!</b>"
         elif status == "updated":
-            title = "♻️ <b>Срок тестового доступа истёк — продлил ещё на 24 часа!</b>"
+            title = "♻️ <b>Срок теста истёк — продлил его заново!</b>"
         else:
             title = "🔐 <b>Твой действующий тестовый доступ:</b>"
 
@@ -5917,11 +6806,13 @@ async def cmd_test_vpn(message: Message):
                 "Запиши его в Railway -> Variables -> <b>ADMIN_ID</b>."
             )
 
+        trial = TARIFFS.get("trial") or {}
         msg_text = (
             f"{title}\n\n"
-            f"⏳ <b>Срок:</b> 24 часа\n"
-            f"📦 <b>Трафик:</b> 1 ГиБ\n"
-            f"📱 <b>Устройств:</b> 1\n"
+            f"⏳ <b>Срок:</b> {days_label(trial.get('days', 15))}\n"
+            f"📦 <b>Трафик:</b> {trial.get('traffic', '10 ГБ')}\n"
+            f"📱 <b>Устройств:</b> {devices_label(trial.get('ip_limit', 1))}\n"
+            f"🧩 <b>Протокол:</b> VLESS Reality\n"
             f"📡 <b>Подключение:</b> #{inbound_id} ({escape(inbound_remark)})\n\n"
             + access_block({"link": link, "sub_link": sub_link}) + "\n\n"
             "📲 <b>Дальше по шагам:</b> нажми «Как подключиться» под этим сообщением — "
@@ -6295,12 +7186,36 @@ async def cmd_panel_debug(message: Message):
             lines.append(
                 "   В панели: "
                 + ", ".join(f"#{item.get('id')} «{escape(str(item.get('remark') or '—'))}»"
-                            for item in inbounds[:8])
+                            for item in inbounds[:24])
             )
-            declared = max(TARIFF_LEVELS[level]["tunnels"] for level in TARIFF_LEVEL_ORDER)
+            lines.append("   🧩 <b>Туннели (локация × вариант протокола):</b>")
+            for key in LOCATION_ORDER:
+                spot = LOCATIONS[key]
+                for protocol in PROTOCOL_ORDER:
+                    parts = []
+                    for meta in protocol_variants(protocol):
+                        variant = str(meta.get("key"))
+                        matched = match_tunnel_inbound(inbounds, spot, protocol, variant)
+                        parts.append(
+                            f"{variant_title(protocol, variant)}: "
+                            + (f"#{matched.get('id')}"
+                               if matched else "❌")
+                        )
+                    lines.append(f"      {spot['title']} · {protocol_title(protocol)}: "
+                                 + ", ".join(parts))
+                lines.append("")
+            availability_note = []
+            for protocol in PROTOCOL_ORDER:
+                found = sum(1 for spot in LOCATION_ORDER for meta in protocol_variants(protocol)
+                            if match_tunnel_inbound(inbounds, LOCATIONS[spot], protocol,
+                                                    str(meta.get("key"))) is not None)
+                expected = len(LOCATION_ORDER) * protocol_variant_count(protocol)
+                availability_note.append(f"{protocol_title(protocol)}: {found}/{expected}")
+            lines.append("   🧩 <b>Найдено подключений:</b> " + "; ".join(availability_note))
+            declared = max(TARIFF_LEVELS[level]["servers"] for level in TARIFF_LEVEL_ORDER)
             if len(configured_locations()) < declared:
                 lines.append(
-                    f"   ⚠️ В тарифах указано до {declared} туннелей, а локаций настроено "
+                    f"   ⚠️ В тарифах указано до {declared} серверов, а локаций настроено "
                     f"{len(configured_locations())}. Чтобы включить остальные, добавь "
                     "подключения в панели и переменные XUI_INBOUND_&lt;ЛОКАЦИЯ&gt;."
                 )
@@ -6468,9 +7383,39 @@ async def cb_tariff_kind(cb: CallbackQuery):
                                 parse_mode="HTML")
 
 
+async def protocol_screen(tg_id: int, plan: dict, tariff_key_value: str,
+                          location_key: str | None) -> tuple[str, InlineKeyboardMarkup]:
+    """Готовит экран шага 4: какие протоколы доступны и что уже выбрано."""
+    availability = await tunnel_availability(plan, location_key)
+    selection = protocol_selection_get(tg_id)
+    if (selection is None or selection.get("tariff") != tariff_key_value
+            or selection.get("location") != location_key):
+        selection = protocol_selection_start(tg_id, tariff_key_value, location_key, availability)
+    else:
+        # Обновляем доступное (оно могло измениться), не теряя выбор пользователя.
+        keys = availability_protocols(availability)
+        selection["available"] = availability
+        selection["selected"] = [key for key in selection.get("selected") or [] if key in keys]
+        if not selection["selected"]:
+            selection["selected"] = default_protocols(plan, keys)
+        if len(selection["selected"]) > 1 and tariff_protocol_choices(plan) == 1:
+            selection["selected"] = selection["selected"][:1]
+    text = protocol_pick_text(plan, selection)
+    keyboard = protocol_pick_kb(selection, tariff_key_value)
+    return text, keyboard
+
+
+async def show_screen(cb: CallbackQuery, text: str, keyboard: InlineKeyboardMarkup) -> None:
+    """Показывает экран: правит сообщение, а если не вышло — присылает новое."""
+    try:
+        await cb.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    except Exception:
+        await cb.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+
+
 @dp.callback_query(F.data.startswith("tlvl_"))
 async def cb_tariff_level(cb: CallbackQuery):
-    """Шаг 3 для многотуннельных тарифов — сразу подтверждение; для одного туннеля — выбор сервера."""
+    """Шаг 3: у односерверного тарифа — выбор сервера, у остальных — сразу экран серверов."""
     await cb.answer()
     parts = cb.data.removeprefix("tlvl_").split("_")
     if len(parts) != 2 or not parts[1].isdigit():
@@ -6482,23 +7427,56 @@ async def cb_tariff_level(cb: CallbackQuery):
         await cb.answer("Такого тарифа нет.", show_alert=True)
         return
 
-    if plan["tunnels"] > 1:
-        # Доступны все локации — сервер выбирать не нужно.
-        text = tariff_confirm_text(plan, None)
-        keyboard = tariff_confirm_kb(tariff_key(kind, level), None)
+    if tariff_servers(plan) <= 1:
+        await show_screen(cb, server_pick_text(kind, level), server_pick_kb(kind, level))
     else:
-        text = server_pick_text(kind, level)
-        keyboard = server_pick_kb(kind, level)
+        await show_screen(cb, servers_all_text(kind, level), servers_all_kb(kind, level))
 
-    try:
-        await cb.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    except Exception:
-        await cb.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("tsall_"))
+async def cb_tariff_servers_all(cb: CallbackQuery):
+    """Шаг 3 у уровней 2–4: «Дальше» с экрана серверов — переходим к протоколам."""
+    await cb.answer()
+    tariff_key_value = cb.data.removeprefix("tsall_")
+    plan = TARIFFS.get(tariff_key_value)
+    if plan is None:
+        await cb.answer("Такого тарифа нет.", show_alert=True)
+        return
+    text, keyboard = await protocol_screen(cb.from_user.id, plan, tariff_key_value, None)
+    await show_screen(cb, text, keyboard)
+
+
+@dp.callback_query(F.data.startswith("tsrv_"))
+async def cb_tariff_server_screen(cb: CallbackQuery):
+    """Возврат на шаг 3 (выбор сервера) с шага 4."""
+    await cb.answer()
+    tariff_key_value = cb.data.removeprefix("tsrv_")
+    plan = TARIFFS.get(tariff_key_value)
+    if plan is None:
+        await cb.answer("Такого тарифа нет.", show_alert=True)
+        return
+    kind, level = plan["kind"], int(plan["level"])
+    await show_screen(cb, server_pick_text(kind, level), server_pick_kb(kind, level))
+
+
+@dp.callback_query(F.data.startswith("tback_"))
+async def cb_tariff_back_to_protocols(cb: CallbackQuery):
+    """Возврат с подтверждения заказа на шаг 4 (протоколы)."""
+    await cb.answer()
+    tariff_key_value = cb.data.removeprefix("tback_")
+    plan = TARIFFS.get(tariff_key_value)
+    if plan is None:
+        await cb.answer("Такого тарифа нет.", show_alert=True)
+        return
+    selection = protocol_selection_get(cb.from_user.id)
+    location_key = (selection or {}).get("location")
+    text, keyboard = await protocol_screen(cb.from_user.id, plan, tariff_key_value, location_key)
+    await show_screen(cb, text, keyboard)
 
 
 @dp.callback_query(F.data.startswith("tlocs_"))
 async def cb_tariff_location(cb: CallbackQuery):
-    """Шаг 3 (один туннель): выбор сервера — Стокгольм или Варшава."""
+    """Шаг 3 (один сервер): выбран Стокгольм или Варшава — переходим к протоколам."""
     await cb.answer()
     parts = cb.data.removeprefix("tlocs_").split("_")
     if len(parts) != 3 or not parts[1].isdigit() or parts[2] not in LOCATIONS:
@@ -6510,12 +7488,88 @@ async def cb_tariff_location(cb: CallbackQuery):
         await cb.answer("Такого тарифа нет.", show_alert=True)
         return
 
-    text = tariff_confirm_text(plan, location_key)
-    keyboard = tariff_confirm_kb(tariff_key(kind, level), location_key)
+    text, keyboard = await protocol_screen(cb.from_user.id, plan, tariff_key(kind, level), location_key)
+    await show_screen(cb, text, keyboard)
+
+
+@dp.callback_query(F.data.startswith("tpro_"))
+async def cb_tariff_protocol(cb: CallbackQuery):
+    """
+    Шаг 4: выбрать протокол.
+
+    На уровнях 1–2 («один протокол») кнопки работают как переключатель-радио:
+    выбрал один — снялся другой. На уровне 3 нужно ровно три протокола, у «Призрака»
+    выбор не нужен — там входят все.
+    """
+    protocol = cb.data.removeprefix("tpro_")
+    selection = protocol_selection_get(cb.from_user.id)
+    tariff_key_value = (selection or {}).get("tariff") or ""
+    plan = TARIFFS.get(tariff_key_value)
+    if selection is None or plan is None:
+        await cb.answer("Выбор устарел — открой «Тарифы» заново.", show_alert=True)
+        return
+    if protocol not in (selection.get("available") or {}):
+        await cb.answer("Этого протокола нет на выбранных серверах.", show_alert=True)
+        return
+
+    need = tariff_protocol_choices(plan)
+    selected = list(selection.get("selected") or [])
+    if need <= 0 or need >= len(PROTOCOL_ORDER):
+        await cb.answer("В этот тариф входят все протоколы — выбирать не нужно.")
+        return
+
+    if need == 1:
+        selected = [protocol]
+        await cb.answer(f"Выбран {protocol_title(protocol)}")
+    elif protocol in selected:
+        if len(selected) <= 1:
+            await cb.answer("Нужен хотя бы один протокол — его нельзя убрать.", show_alert=True)
+            return
+        selected.remove(protocol)
+        await cb.answer(f"{protocol_title(protocol)} убран")
+    else:
+        if len(selected) >= need:
+            await cb.answer(
+                f"Уже выбрано {need} {protocol_word(need)} — сними галочку с другого протокола.",
+                show_alert=True,
+            )
+            return
+        selected.append(protocol)
+        await cb.answer(f"{protocol_title(protocol)} добавлен")
+
+    selection["selected"] = [key for key in PROTOCOL_ORDER if key in selected]
+    text = protocol_pick_text(plan, selection)
+    keyboard = protocol_pick_kb(selection, tariff_key_value)
     try:
         await cb.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     except Exception:
-        await cb.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+        pass
+
+
+@dp.callback_query(F.data == "tcont")
+async def cb_tariff_protocol_done(cb: CallbackQuery):
+    """Шаг 4 завершён: показываем подтверждение заказа."""
+    selection = protocol_selection_get(cb.from_user.id)
+    plan = TARIFFS.get((selection or {}).get("tariff") or "")
+    if selection is None or plan is None:
+        await cb.answer("Выбор устарел — открой «Тарифы» заново.", show_alert=True)
+        return
+    chosen = list(selection.get("selected") or [])
+    need = tariff_protocol_choices(plan)
+    if need > 0 and need < len(PROTOCOL_ORDER) and len(chosen) != need:
+        await cb.answer(
+            f"Нужно выбрать {need} {protocol_word(need)} — сейчас отмечено {len(chosen)}.",
+            show_alert=True,
+        )
+        return
+    if not chosen:
+        await cb.answer("Выбери хотя бы один протокол.", show_alert=True)
+        return
+    await cb.answer()
+    location_key = selection.get("location")
+    text = tariff_confirm_text(plan, location_key, chosen)
+    keyboard = tariff_confirm_kb(selection["tariff"], location_key)
+    await show_screen(cb, text, keyboard)
 
 
 @dp.callback_query(F.data == "check_payment_help")
@@ -6529,9 +7583,11 @@ async def cb_check_payment_help(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("buyat_"))
 async def cb_buy_at(cb: CallbackQuery):
     """
-    Оплата выбранного тарифа с выбранным сервером: кнопка «💳 Оплатить» после трёх шагов.
+    Оплата выбранного тарифа: кнопка «💳 Оплатить» после шагов выбора.
 
     Данные кнопки: buyat_<тариф>[_<локация>] — например buyat_time_1_warsaw.
+    Протоколы берём из шага 4 (PROTOCOL_SELECTION); если выбор потерялся (например,
+    бот перезапустился) — выдаём рекомендуемый набор уровня.
     """
     payload = cb.data.removeprefix("buyat_")
     location_key = None
@@ -6546,14 +7602,22 @@ async def cb_buy_at(cb: CallbackQuery):
     if not tariff:
         await cb.answer("Тариф не найден.", show_alert=True)
         return
-    if tariff.get("tunnels", 1) <= 1 and not location_key:
+    if tariff_servers(tariff) <= 1 and not location_key:
         # Защита от старой кнопки: сервер у такого тарифа выбрать обязательно.
         await cb.answer("Выбери сервер заново — открой «Тарифы».", show_alert=True)
         return
 
+    selection = protocol_selection_get(cb.from_user.id) or {}
+    protocols = None
+    if selection.get("tariff") == tariff_key and selection.get("location") == location_key:
+        protocols = list(selection.get("selected") or []) or None
+    else:
+        # Старая кнопка или слетевший выбор: берём рекомендуемый набор тарифа.
+        protocols = default_protocols(tariff, list(PROTOCOL_ORDER))
+
     await cb.answer("Готовлю оплату...")
     try:
-        await start_checkout(cb.message.chat.id, cb.from_user.id, tariff_key, location_key)
+        await start_checkout(cb.message.chat.id, cb.from_user.id, tariff_key, location_key, protocols)
     except PaymentError as exc:
         await cb.message.answer(str(exc), parse_mode="HTML")
     except Exception as exc:
@@ -6578,35 +7642,19 @@ async def cb_buy(cb: CallbackQuery):
         await cmd_test_vpn(cb.message)
         return
 
-    if tariff_key == PROMO_KEY:
-        if not promo_enabled():
-            await cb.answer("Промо-доступ сейчас закрыт.", show_alert=True)
-            return
-        await cb.answer("Активирую промо-доступ...")
-        try:
-            await grant_promo(cb.message.chat.id, cb.from_user.id)
-        except PaymentError as exc:
-            await cb.message.answer(str(exc), parse_mode="HTML")
-        except Exception as exc:
-            logger.exception("Не удалось выдать промо-доступ: %s", exc)
-            await cb.message.answer(
-                "❌ Не получилось активировать промо-доступ. Попробуй ещё раз через минуту "
-                "или напиши в поддержку.",
-                parse_mode="HTML",
-            )
-        return
-
     tariff = TARIFFS.get(tariff_key)
     if not tariff:
         await cb.answer("Тариф не найден.", show_alert=True)
         return
 
-    # Кнопки «buy_*» приходят из старых сообщений и от промо/теста: сервер не выбран —
-    # для тарифа на один туннель берём локацию по умолчанию (первую в каталоге).
+    # Кнопки «buy_*» приходят из старых сообщений: сервер не выбран — для тарифа
+    # на один сервер берём локацию по умолчанию (первую в каталоге), протоколы —
+    # рекомендуемый набор тарифа.
     location_key = None
+    protocols = default_protocols(tariff, list(PROTOCOL_ORDER))
     await cb.answer("Готовлю оплату...")
     try:
-        await start_checkout(cb.message.chat.id, cb.from_user.id, tariff_key, location_key)
+        await start_checkout(cb.message.chat.id, cb.from_user.id, tariff_key, location_key, protocols)
     except PaymentError as exc:
         await cb.message.answer(str(exc), parse_mode="HTML")
     except Exception as exc:
@@ -7013,14 +8061,12 @@ async def cmd_payments(message: Message):
 
     if PAYMENTS_MODE == "stars":
         lines.append(f"• Курс пересчёта: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (меняется через STARS_RUB_RATE)")
-    tariff = TARIFFS.get(PROMO_KEY) or {}
-    if promo_enabled():
-        lines.append(
-            f"• Промо-доступ: включён 🎉 {escape(tariff.get('name', ''))} — "
-            + ("один раз на аккаунт" if PROMO_ONCE else "без ограничения (PROMO_ONCE=0)")
-        )
-    else:
-        lines.append("• Промо-доступ: выключен (<code>PROMO_ENABLED=0</code> или тариф удалён)")
+    trial_tariff = TARIFFS.get("trial") or {}
+    lines.append(
+        f"• Бесплатный тест: {escape(trial_tariff.get('traffic', '—'))} на "
+        f"{days_label(trial_tariff.get('days', 15))} — "
+        + ("доступен всем (TRIAL_PUBLIC=1)" if TRIAL_PUBLIC else "только администратору (TRIAL_PUBLIC=0)")
+    )
 
     if test_tools_enabled():
         lines.append("• Проверка без оплаты: /test_pay ✅ (ключ выдаётся тем же путём, что после оплаты)")
@@ -7032,10 +8078,10 @@ async def cmd_payments(message: Message):
         f"• Заказов всего: <b>{stats['orders_total']}</b>, оплачено: <b>{stats['paid_count']}</b>",
         f"• Выручка: <b>{stats['rub']} ₽</b> / <b>{stats['stars']} ⭐️</b>",
     ]
-    if stats.get("promo_count"):
+    if stats.get("trial_count"):
         lines.append(
-            f"• Промо-доступов выдано: <b>{stats['promo_count']}</b> "
-            "(бесплатно, в выручку не входит)"
+            f"• Бесплатных тестов выдано: <b>{stats['trial_count']}</b> "
+            "(в выручку не входят)"
         )
     if stats["by_tariff"]:
         breakdown = ", ".join(f"{TARIFFS.get(k, {}).get('name', k)}: {v}" for k, v in stats["by_tariff"].items())
@@ -7104,10 +8150,10 @@ def test_pay_kb() -> InlineKeyboardMarkup:
     for key in paid_tariff_keys():
         data = TARIFFS[key]
         label = f"{data['name']} — {days_label(data['days'])}, {data['traffic']}"
-        if data.get("tunnels", 1) > 1:
+        if tariff_servers(data) > 1:
             buttons.append([InlineKeyboardButton(text=label, callback_data=f"testpay_run_{key}")])
             continue
-        # Однотуннельный тариф: сервер выбирается, поэтому кнопка на каждую локацию.
+        # Односерверный тариф: сервер выбирается, поэтому кнопка на каждую локацию.
         for spot in configured_locations():
             buttons.append([InlineKeyboardButton(
                 text=f"{label} ({spot['short']})",
@@ -7425,11 +8471,14 @@ async def send_profile(message: Message, user_id: int):
         except Exception:
             pass
 
-    profile_rows = [[InlineKeyboardButton(text="💰 Продлить / сменить тариф", callback_data="tariffs")]]
+    profile_rows = [[InlineKeyboardButton(text="🛒 Продлить / сменить тариф", callback_data="tariffs")]]
     # Бесплатный тест предлагаем только тем, кому он доступен (TRIAL_PUBLIC=1 или админ).
     if trial_button_visible(user_id):
-        profile_rows.append([InlineKeyboardButton(text="🔑 Тестовый ключ (24 ч)",
-                                                  callback_data="get_test_key_btn")])
+        trial = TARIFFS.get("trial") or {}
+        profile_rows.append([InlineKeyboardButton(
+            text=f"🎁 Бесплатный тест ({trial.get('traffic', '10 ГБ')} / "
+                 f"{days_label(trial.get('days', 15))})",
+            callback_data="get_test_key_btn")])
     profile_rows.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=profile_rows)
@@ -7969,7 +9018,7 @@ def bot_commands() -> list[BotCommand]:
     # Пользовательские команды — всегда.
     commands = [BotCommand(command="start", description="🏠 Главное меню")]
     if TRIAL_PUBLIC and TRIAL_BUTTON:
-        commands.append(BotCommand(command="test_vpn", description="🔗 Бесплатный доступ на 24 часа"))
+        commands.append(BotCommand(command="test_vpn", description="🎁 Бесплатный тест (10 ГБ / 15 дней)"))
     commands += [
         BotCommand(command="profile", description="👤 Моя подписка и ключ"),
         BotCommand(command="help", description="📲 Как подключиться (пошагово)"),
@@ -7989,7 +9038,7 @@ def bot_commands() -> list[BotCommand]:
             BotCommand(command="reset_vpn", description="🔄 Сбросить тестовый ключ"),
         ]
         if TRIAL_BUTTON and not TRIAL_PUBLIC:
-            commands.insert(1, BotCommand(command="test_vpn", description="🔗 Тестовый доступ (24 часа)"))
+            commands.insert(1, BotCommand(command="test_vpn", description="🎁 Бесплатный тест (10 ГБ / 15 дней)"))
     # Тестовые команды проверки оплаты — отдельный флаг TEST_TOOLS.
     if test_tools_enabled():
         commands += [

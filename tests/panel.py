@@ -86,6 +86,75 @@ INBOUND2 = {
     }),
 }
 
+# Остальные туннели: 5 протоколов × варианты, на двух локациях.
+# VLESS — 3 варианта (Reality / XHTTP / gRPC), Shadowsocks-2022 — 3 шифра,
+# AmneziaWG / WireGuard / Hysteria2 — по одному. Итого 9 туннелей на локацию.
+def _tunnel_inbound(inbound_id: int, remark: str, port: int, *, protocol: str = "vless",
+                    network: str = "tcp", security: str = "reality",
+                    method: str | None = None) -> dict:
+    stream = {"network": network, "security": security}
+    if security == "reality":
+        stream["realitySettings"] = {
+            "dest": "www.microsoft.com:443",
+            "serverNames": ["www.microsoft.com"],
+            "shortIds": ["0123456789abcdef"],
+            "settings": {"publicKey": "PUBKEY", "fingerprint": "chrome", "spiderX": "/"},
+        }
+    if network == "grpc":
+        stream["grpcSettings"] = {"serviceName": "grpc-svc"}
+    if network == "xhttp":
+        stream["xhttpSettings"] = {"path": "/xhttp"}
+    settings = {"clients": []}
+    if method:
+        settings["method"] = method
+    else:
+        settings["decryption"] = "none"
+    return {
+        "id": inbound_id,
+        "remark": remark,
+        "protocol": protocol,
+        "port": port,
+        "settings": json.dumps(settings),
+        "streamSettings": json.dumps(stream),
+    }
+
+
+PROTOCOL_INBOUNDS = [
+    # Стокгольм (базовое VLESS Reality — INBOUND, id 1)
+    _tunnel_inbound(3, "Stockholm-VLESS-XHTTP", 8443, network="xhttp"),
+    _tunnel_inbound(4, "Stockholm-VLESS-gRPC", 8444, network="grpc"),
+    _tunnel_inbound(5, "Stockholm-Shadowsocks-AES-128", 8445, protocol="shadowsocks",
+                    network="tcp", security="none", method="aes-128-gcm"),
+    _tunnel_inbound(6, "Stockholm-Shadowsocks-AES-256", 8446, protocol="shadowsocks",
+                    network="tcp", security="none", method="aes-256-gcm"),
+    _tunnel_inbound(7, "Stockholm-Shadowsocks-ChaCha20", 8447, protocol="shadowsocks",
+                    network="tcp", security="none", method="chacha20-poly1305"),
+    _tunnel_inbound(8, "Stockholm-AmneziaWG", 51820, protocol="wireguard",
+                    network="udp", security="none"),
+    _tunnel_inbound(9, "Stockholm-WireGuard", 51821, protocol="wireguard",
+                    network="udp", security="none"),
+    _tunnel_inbound(10, "Stockholm-Hysteria2", 51822, protocol="hysteria",
+                    network="udp", security="tls"),
+    # Варшава (базовое VLESS Reality — INBOUND2, id 2)
+    _tunnel_inbound(11, "Warsaw-VLESS-XHTTP", 9443, network="xhttp"),
+    _tunnel_inbound(12, "Warsaw-VLESS-gRPC", 9444, network="grpc"),
+    _tunnel_inbound(13, "Warsaw-Shadowsocks-AES-128", 9445, protocol="shadowsocks",
+                    network="tcp", security="none", method="aes-128-gcm"),
+    _tunnel_inbound(14, "Warsaw-Shadowsocks-AES-256", 9446, protocol="shadowsocks",
+                    network="tcp", security="none", method="aes-256-gcm"),
+    _tunnel_inbound(15, "Warsaw-Shadowsocks-ChaCha20", 9447, protocol="shadowsocks",
+                    network="tcp", security="none", method="chacha20-poly1305"),
+    _tunnel_inbound(16, "Warsaw-AmneziaWG", 52820, protocol="wireguard",
+                    network="udp", security="none"),
+    _tunnel_inbound(17, "Warsaw-WireGuard", 52821, protocol="wireguard",
+                    network="udp", security="none"),
+    _tunnel_inbound(18, "Warsaw-Hysteria2", 52822, protocol="hysteria",
+                    network="udp", security="tls"),
+]
+
+# Все подключения панели в порядке «локация → протокол»: VLESS идёт первым.
+ALL_INBOUNDS = [INBOUND, INBOUND2, *PROTOCOL_INBOUNDS]
+
 SERVER_TIME_SHIFT = 0  # сдвиг заголовка Date (для проверки учёта рассинхрона часов)
 
 
@@ -130,7 +199,7 @@ def emails() -> list:
 def inbounds_snapshot() -> list:
     """Подключения панели вместе с клиентами (как ответ /panel/api/inbounds/list)."""
     return [(inbound, dict(PANEL["inbound_clients"].get(inbound["id"], {})))
-            for inbound in (INBOUND, INBOUND2)]
+            for inbound in ALL_INBOUNDS]
 
 
 def reset(**kwargs):
@@ -143,8 +212,8 @@ def reset(**kwargs):
         "sub": {"enable": True, "port": None, "path": "/sub/", "domain": "", "uri": ""},
     })
     PANEL.update(kwargs)
-    INBOUND["settings"] = json.dumps({"clients": [], "decryption": "none"})
-    INBOUND2["settings"] = json.dumps({"clients": [], "decryption": "none"})
+    for inbound in ALL_INBOUNDS:
+        inbound["settings"] = json.dumps({"clients": [], "decryption": "none"})
     # clients=... в reset() — клиенты основной локации (Стокгольм): так сценарии
     # про группы могут «предзаполнить» панель клиентом.
     seed = kwargs.get("clients")
@@ -211,7 +280,15 @@ async def login(request):
 def _inbound_view(inbound: dict, clients: dict) -> dict:
     """Копия подключения с клиентами и их трафиком (как отдаёт настоящая панель)."""
     view = dict(inbound)
+    base = {}
+    try:
+        parsed = json.loads(inbound.get("settings") or "{}")
+        if isinstance(parsed, dict):
+            base = {key: value for key, value in parsed.items() if key != "clients"}
+    except ValueError:
+        base = {}
     view["settings"] = json.dumps({
+        **base,
         "clients": [
             {"id": c["id"], "email": c["email"], "flow": c.get("flow", ""), "enable": c.get("enable", True),
              "expiryTime": c.get("expiryTime", 0), "subId": c.get("subId", ""), "tgId": c.get("tgId", 0),
@@ -220,7 +297,6 @@ def _inbound_view(inbound: dict, clients: dict) -> dict:
              **({"group": c["group_name"]} if c.get("group_name") else {})}
             for c in clients.values()
         ],
-        "decryption": "none",
     })
     view["clientStats"] = [
         {"email": c["email"], "enable": c.get("enable", True), "up": c.get("up", 0), "down": c.get("down", 0)}
@@ -231,13 +307,13 @@ def _inbound_view(inbound: dict, clients: dict) -> dict:
 
 async def inbounds_list(request):
     """Панель отдаёт клиентов из своего состояния; трафик — в clientStats."""
-    views = [_inbound_view(INBOUND, clients_of(1)), _inbound_view(INBOUND2, clients_of(2))]
+    views = [_inbound_view(inbound, clients_of(inbound["id"])) for inbound in ALL_INBOUNDS]
     return web.json_response({"success": True, "obj": views})
 
 
 async def inbound_get(request):
     wanted = int(request.match_info["id"])
-    for inbound in (INBOUND, INBOUND2):
+    for inbound in ALL_INBOUNDS:
         if int(inbound["id"]) == wanted:
             return web.json_response({"success": True,
                                       "obj": _inbound_view(inbound, clients_of(wanted))})

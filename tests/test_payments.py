@@ -29,9 +29,9 @@ from panel import PANEL, load_bot, make_app, reset
 # В боте теперь сетка «тип подписки × уровень»: time_<уровень> (ограничение по
 # времени) и traffic_<уровень> (только трафик). В сценариях используем понятные
 # псевдонимы: цены, лимиты и сроки берём из bot.TARIFFS, чтобы тесты читались.
-BASIC = "time_4"       # 450 ₽, 30 дней, безлимитный трафик, 6 устройств
-FAMILY = "time_3"      # 250 ₽, 30 дней, 100 ГБ, 5 устройств
-SCHOOL = "time_1"      # 70 ₽, 15 дней, 15 ГБ, 1 устройство
+BASIC = "time_4"       # 450 ₽, 30 дней, 200 ГБ, безлимит устройств (Призрак)
+FAMILY = "time_3"      # 250 ₽, 30 дней, 100 ГБ, 5 устройств (Кибер-самурай)
+SCHOOL = "time_1"      # 70 ₽, 15 дней, 10 ГБ, 1 устройство (Новичок)
 PREMIUM = "time_2"     # 130 ₽, 15 дней, 50 ГБ, 3 устройства
 TRAFFIC = "traffic_3"  # 300 ₽, без ограничения по времени, 100 ГБ, 5 устройств
 
@@ -349,8 +349,6 @@ def new_bot(env, store_file, admins=None):
         "PLATEGA_PAYER_FEE_PERCENT": env.get("payer_fee"),
         "PUBLIC_BASE_URL": f"http://127.0.0.1:{WEBHOOK_PORT}",
         "PAYMENTS_ALLOW_TEST_PAY": env.get("allow_test_pay"),
-        "PROMO_ENABLED": env.get("promo_enabled"),
-        "PROMO_ONCE": env.get("promo_once"),
         "SUPPORT_USERNAME": env.get("support_username"),
         "SUB_URL_BASE": env.get("sub_url_base"),
         "SUB_PORT": env.get("sub_port"),
@@ -496,7 +494,9 @@ async def test_stars_flow(store_file):
           f"{days_left(client) if client else '—'} дн.")
     basic_ips = bot.TARIFFS[BASIC]["ip_limit"]
     check(f"лимит устройств взят из тарифа ({basic_ips})", client and client.get("limitIp") == basic_ips)
-    check("трафик безлимитный (totalGB=0) — уровень «Призрак» по времени", client and client.get("totalGB") == 0)
+    check("трафик — 200 ГБ из тарифа «Призрак» по времени",
+          client and round(client.get("totalGB", 0) / (1024 ** 3)) == bot.TARIFFS[BASIC]["traffic_gb"],
+          str(client.get("totalGB") if client else None))
     check("tgId записан в панель", client and client.get("tgId") == TG_TG_ID)
     check("в комментарии — id тарифа и дата", client and client["comment"].startswith(f"{BASIC} до "))
     sent = [m for m in tg_calls("sendMessage") if str(m["params"].get("chat_id")) == str(TG_TG_ID)]
@@ -1741,8 +1741,10 @@ async def test_simulated_payment(store_file):
     check("срок взят из тарифа: 30 дней", client and 29 <= days_left(client) <= 30,
           f"{days_left(client) if client else '—'} дн.")
     basic_ips = bot.TARIFFS[BASIC]["ip_limit"]
-    check(f"лимиты взяты из тарифа ({basic_ips} устройств, безлимитный трафик)",
-          client and client.get("limitIp") == basic_ips and client.get("totalGB") == 0)
+    check(f"лимиты взяты из тарифа ({basic_ips} устройств, 200 ГБ)",
+          client and client.get("limitIp") == basic_ips
+          and round(client.get("totalGB", 0) / (1024 ** 3)) == bot.TARIFFS[BASIC]["traffic_gb"],
+          str((client or {}).get("totalGB")))
     check("в панели сохранился id тарифа и дата", client and client["comment"].startswith(f"{BASIC} до "))
 
     texts = [m["params"].get("text", "") for m in tg_calls("sendMessage")]
@@ -2237,146 +2239,6 @@ async def test_subscription_link(store_file):
         await runner.cleanup()
 
 
-async def test_promo_tariff(store_file):
-    print("\n▶ 14д. Промо-тариф: 15 дней, 10 ГБ, бесплатно и один раз на аккаунт")
-    reset_all()
-    bot = new_bot({"mode": "platega"}, store_file)
-    email = f"tg-paid-{TG_TG_ID}"
-
-    check("промо включён по умолчанию", bot.promo_enabled() is True)
-    check("тариф промо: 15 дней, 10 ГБ, 1 устройство",
-          bot.TARIFFS["promo"]["days"] == bot.PROMO_DAYS == 15
-          and bot.TARIFFS["promo"]["traffic_gb"] == 10
-          and bot.TARIFFS["promo"]["ip_limit"] == 1)
-    check("промо указан как бесплатный", bot.tariff_price_label(bot.TARIFFS["promo"]) == "Бесплатно")
-    check("промо видно в списке тарифов", bot.promo_visible(TG_TG_ID) is True)
-
-    kb = bot.tariffs_kb(TG_TG_ID)
-    callbacks = [button.callback_data for row in kb.inline_keyboard for button in row]
-    labels = " | ".join(button.text for row in kb.inline_keyboard for button in row)
-    check("в кнопках тарифов есть промо", "buy_promo" in callbacks, str(callbacks))
-    check("промо подписан как бесплатный пункт", "бесплатно" in labels.lower(), labels[:160])
-    screen = _FakeCallback(bot, "tariffs")
-    await bot.cb_tariffs(screen)
-    tariffs_text = screen.message.sent[-1] if screen.message.sent else ""
-    check("на экране тарифов промо с трафиком 10 ГБ",
-          "Промо" in tariffs_text and "10 ГБ" in tariffs_text and "Бесплатно" in tariffs_text,
-          tariffs_text[:120].replace("\n", " "))
-    await bot.grant_promo(TG_TG_ID, TG_TG_ID)
-    client = panel_client(email)
-    check("промо создало подписку в панели", client is not None)
-    check("срок промо — 15 дней", round(days_left(client)) == 15, str(days_left(client)))
-    check("лимит трафика — 10 ГБ",
-          round(client["totalGB"] / (1024 ** 3)) == 10, str(client["totalGB"]))
-    check("заказ помечен промо и не попал в выручку",
-          any(o.get("promo") for o in bot.payment_store.orders.values())
-          and bot.payment_store.stats()["rub"] == 0
-          and bot.payment_store.stats()["promo_count"] == 1)
-
-    diag = bot.payments_diag_text()
-    check("в /myid видно состояние промо", "Промо-доступ: включён" in diag, diag[-160:].replace("\n", " "))
-    text = _last_api_text()
-    check("ключ отправлен с пометкой промо", "Промо-доступ активирован" in text, text[:80])
-    check("в сообщении про промо нет слова «оплата»", "оплата" not in text.lower())
-
-    await bot.cmd_payments(make_message(bot, text="/payments"))
-    panel_text = _last_api_text()
-    check("в /payments есть счётчик промо", "Промо-доступов выдано" in panel_text,
-          panel_text[-160:].replace("\n", " "))
-
-    # Повторно — нельзя
-    check("после активации промо скрыт из тарифов", bot.promo_visible(TG_TG_ID) is False)
-    repeat_refused = False
-    try:
-        await bot.grant_promo(TG_TG_ID, TG_TG_ID)
-    except Exception as exc:
-        repeat_refused = "уже активирован" in str(exc)
-    check("повторная выдача промо отклонена", repeat_refused)
-    check("повторная попытка не создала второй заказ",
-          bot.payment_store.stats()["promo_count"] == 1)
-
-    # Кнопка в тарифах доводит клиента до готового ключа (как это делает пользователь)
-    reset_all()
-    click = new_bot({"mode": "platega"}, store_file + ".click")
-    user_id = 999001
-    cb = _FakeCallback(click, "buy_promo", uid=user_id)
-    await click.cb_buy(cb)
-    click_client = panel_client(f"tg-paid-{user_id}")
-    check("нажатие «Промо» выдаёт ключ", click_client is not None)
-    check("подписка после нажатия кнопки активна на 15 дней",
-          round(days_left(click_client)) == 15, str(days_left(click_client)))
-    check("клиент увидел уведомление о выдаче", "Активирую промо-доступ" in " ".join(cb.answers),
-          str(cb.answers))
-    second = _FakeCallback(click, "buy_promo", uid=user_id)
-    await click.cb_buy(second)
-    check("повторное нажатие объясняет, что промо уже активирован",
-          any("уже активирован" in t for t in second.message.sent), str(second.message.sent)[:120])
-
-    # PROMO_ENABLED=0 — пункта нет и выдача отклоняется
-    reset_all()
-    off = new_bot({"mode": "platega", "promo_enabled": "0"}, store_file)
-    check("PROMO_ENABLED=0 выключает промо", off.promo_enabled() is False)
-    check("выключенный промо не виден", off.promo_visible(TG_TG_ID) is False)
-    try:
-        await off.grant_promo(TG_TG_ID, TG_TG_ID)
-        off_marker = False
-    except Exception as exc:
-        off_marker = "закрыт" in str(exc)
-    check("выключенный промо не выдаётся", off_marker)
-
-    # PROMO_ONCE=0 — промо не считается использованным (для проверок на своём аккаунте):
-    # после /revoke выданный ранее промо можно активировать заново.
-    reset_all()
-    many = new_bot({"mode": "platega", "promo_once": "0"}, store_file + ".once")
-    await many.grant_promo(TG_TG_ID, TG_TG_ID)
-    check("PROMO_ONCE=0 не помечает промо использованным",
-          many.promo_used(TG_TG_ID) is False and many.promo_visible(TG_TG_ID) is True)
-    rvk = make_message(many, text=f"/revoke {TG_TG_ID}")
-    await many.cmd_revoke(rvk)
-    await many.grant_promo(TG_TG_ID, TG_TG_ID)
-    check("после /revoke промо выдаётся повторно",
-          many.payment_store.stats()["promo_count"] == 2,
-          str(many.payment_store.stats()["promo_count"]))
-
-    # Тем, у кого уже есть платная подписка, промо не выдаётся —
-    # иначе промо переписало бы лимиты оплаченного тарифа на 10 ГБ.
-    reset_all()
-    paid = new_bot({"mode": "platega"}, store_file + ".paid")
-    runner = await paid.run_webhook_server()
-    try:
-        await paid.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
-        order = [o for o in paid.payment_store.orders.values()][-1]
-        status, body = await post_platega_callback(order["id"], paid.TARIFFS[BASIC]["price"])
-        check("платная подписка активирована", body.strip() == "ok" and panel_client(email) is not None, body)
-        total_before = panel_client(email)["totalGB"]
-        paid_refused = False
-        try:
-            await paid.grant_promo(TG_TG_ID, TG_TG_ID)
-        except Exception as exc:
-            paid_refused = "уже есть действующая подписка" in str(exc)
-        check("промо не выдаётся при активной подписке", paid_refused)
-        check("лимиты оплаченного тарифа не тронуты",
-              panel_client(email)["totalGB"] == total_before,
-              f"{total_before} -> {panel_client(email)['totalGB']}")
-
-        # Просроченная подписка: промо тоже не выдаём (аккаунт с историей оплат),
-        # но и не говорим «у тебя активная подписка».
-        async def expired_sub(_tg_id):
-            return {"client": {}, "inbound": {}, "used_bytes": 0, "total_bytes": 0,
-                    "expiry_ms": int(time.time() * 1000) - 86_400_000, "enable": True}
-
-        paid.get_paid_subscription = expired_sub
-        expired_refused = False
-        try:
-            await paid.grant_promo(TG_TG_ID, TG_TG_ID)
-        except Exception as exc:
-            expired_refused = ("только новым пользователям" in str(exc)
-                               and "действующая подписка" not in str(exc))
-        check("промо не выдаётся тем, у кого подписка была и закончилась", expired_refused)
-    finally:
-        await runner.cleanup()
-
-
 async def test_cancel_order(store_file):
     print("\n▶ 14г. Отмена заказа: статус, проверка оплаты и позднее поступление денег")
     reset_all()
@@ -2480,6 +2342,7 @@ class _FakeCbMessage:
 
     async def edit_text(self, text, **kwargs):
         self.sent.append(text)
+        TG["calls"].append({"method": "editMessageText", "params": {"chat_id": TG_TG_ID, "text": text, **kwargs}})
 
     async def delete(self):
         pass
@@ -2550,7 +2413,6 @@ async def main():
         await test_myid_payments_diag(store_for("myid"))
         await test_production_handlers(store_for("prodhandlers"))
         await test_cancel_order(store_for("cancelorder"))
-        await test_promo_tariff(store_for("promo"))
         await test_subscription_link(store_for("sub_link"))
         await test_admin_access(store_for("admin"))
     finally:
