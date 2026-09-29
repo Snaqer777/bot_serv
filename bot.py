@@ -78,7 +78,8 @@ def _parse_id_list(raw: str) -> list[int]:
 
 def _float_env(name: str, default: float = 0.0) -> float:
     """Безопасно считывает число (можно с дробной частью) из переменной окружения."""
-    val = (os.getenv(name) or "").replace(",", ".").strip()
+    # Прощаем типичные записи значения: «8%», «8 %», «0,5».
+    val = (os.getenv(name) or "").replace(",", ".").replace("%", "").strip()
     if not val:
         return default
     try:
@@ -378,6 +379,57 @@ PLATEGA_METHODS = {
 # только если касса присылает сумму за вычетом комиссии (нетто) и клиент платит ровно
 # цену: тогда, например, 5 примет оплату от 95 % суммы заказа. Больше 90 не применяется.
 PLATEGA_AMOUNT_TOLERANCE_PERCENT = _int_env("PLATEGA_AMOUNT_TOLERANCE_PERCENT", 0)
+
+# Имена платёжных переменных — образец для поиска опечаток в окружении (см.
+# payment_env_typo_hints): Railway не подсказывает об опечатке, переменная просто
+# не читается, и настройка выглядит «невключённой».
+PAYMENT_ENV_NAMES = (
+    "PAYMENTS_MODE",
+    "PUBLIC_BASE_URL",
+    "PLATEGA_MERCHANT_ID",
+    "PLATEGA_SECRET",
+    "PLATEGA_API_URL",
+    "PLATEGA_METHOD",
+    "PLATEGA_CURRENCY",
+    "PLATEGA_WEBHOOK_PATH",
+    "PLATEGA_RETURN_URL",
+    "PLATEGA_FAILED_URL",
+    "PLATEGA_AMOUNT_TOLERANCE_PERCENT",
+    "PLATEGA_PAYER_FEE_PERCENT",
+)
+
+
+def payment_env_typo_hints() -> list[str]:
+    """
+    Ищет в окружении переменные, похожие на нужные боту, но написанные с опечаткой.
+
+    Пример: PLATEGA_PAYER_FEE_PERCEN (без последней «T») или имя, введённое вместе со
+    значением («PLATEGA_PAYER_FEE_PERCENT=8»). Сравниваем имена без разделителей и
+    регистра, поэтому такие записи распознаются и бот подсказывает верное имя.
+    """
+    hints: list[str] = []
+    known = {re.sub(r"[^A-Z0-9]", "", name): name for name in PAYMENT_ENV_NAMES}
+    for key in os.environ:
+        raw = str(key).split("=")[0].strip()
+        normalized = re.sub(r"[^A-Z0-9]", "", raw.upper())
+        if len(normalized) < 8 or normalized in known:
+            continue
+        if not (normalized.startswith("PLATEGA") or normalized.startswith("PAYMENT")):
+            continue
+        matches = difflib.get_close_matches(normalized, list(known), n=1, cutoff=0.85)
+        if not matches:
+            continue
+        hints.append(
+            f"⚠️ Похоже на опечатку в имени переменной: <b>{escape(raw)}</b> — "
+            f"верное имя <code>{known[matches[0]]}</code>"
+        )
+    if hints:
+        hints.append(
+            "В Railway имя и значение вводятся в разные поля: имя без «=» и пробелов, "
+            "значение — отдельно. После правки переменной сервис перезапускается сам."
+        )
+    return hints
+
 
 # Комиссия кассы, которую берём на себя (в процентах). По умолчанию 0: счёт выставляется
 # ровно на цену тарифа, и если касса добавляет свою комиссию плательщику, клиент платит
@@ -4524,6 +4576,13 @@ async def platega_self_check() -> str:
            if PLATEGA_METHOD
            else "плательщик выбирает на странице Platega")
     )
+    if 0 < PLATEGA_PAYER_FEE_PERCENT < 1:
+        lines.append(
+            f"⚠️ Комиссия задана как <b>{PLATEGA_PAYER_FEE_PERCENT:g}</b> — похоже, это доля, "
+            "а не проценты. Если хотел 8 %, поставь <code>PLATEGA_PAYER_FEE_PERCENT=8</code>."
+        )
+    for hint in payment_env_typo_hints():
+        lines.append(hint)
     if PLATEGA_PAYER_FEE_PERCENT > 0:
         sample_tariff = min(
             (t for t in TARIFFS.values() if float(t.get("price") or 0) > 0),
@@ -6949,6 +7008,8 @@ async def cmd_payments(message: Message):
                 "• Комиссия кассы: если она добавляется сверху и её нужно взять на себя, "
                 "задай <code>PLATEGA_PAYER_FEE_PERCENT</code> (например, 8)"
             )
+        for hint in payment_env_typo_hints():
+            lines.append(hint)
 
     if PAYMENTS_MODE == "stars":
         lines.append(f"• Курс пересчёта: 1 ⭐️ ≈ {STARS_RUB_RATE} ₽ (меняется через STARS_RUB_RATE)")

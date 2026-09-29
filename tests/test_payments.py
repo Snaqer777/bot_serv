@@ -925,6 +925,9 @@ async def test_platega_api_and_amounts():
           fee_bot.platega_amount_matches({**fee_order, "payment_amount_rub": 64.81}, 64.81) is True)
     check("а недоплата по счёту — отказ",
           fee_bot.platega_amount_matches({**fee_order, "payment_amount_rub": 64.81}, 60) is False)
+    check("значение со знаком процента («8%») читается как 8",
+          new_bot({"mode": "platega", "payer_fee": "8%"}, store_file)
+          .PLATEGA_PAYER_FEE_PERCENT == 8.0)
     check("комиссия больше 90 % не применяется целиком (150 % → берём 90 %)",
           new_bot({"mode": "platega", "payer_fee": "150"}, store_file)
           .platega_checkout_amount(fee_order) == 36.84)
@@ -1959,6 +1962,38 @@ async def test_platega_self_check(store_file):
               "Самопроверка сервера: ✅" in text, text[-200:])
         check("в адрес API реально ушёл запрос балансов",
               any(c[0] == "GET /balance/all" for c in PLAT["calls"]))
+
+        # Опечатка в имени переменной: Railway не подсказывает, поэтому бот ищет похожие
+        # имена сам — иначе настройка выглядит «невключённой» (PLATEGA_PAYER_FEE_PERCEN).
+        os.environ["PLATEGA_PAYER_FEE_PERCEN"] = "8"
+        try:
+            text = await bot.platega_self_check()
+            check("опечатка в имени переменной видна в /platega_check",
+                  "PLATEGA_PAYER_FEE_PERCEN" in text
+                  and "PLATEGA_PAYER_FEE_PERCENT" in text
+                  and "опечатку" in text,
+                  [ln for ln in text.split("\n") if "опечатк" in ln][:1])
+            msg = make_message(bot, text="/payments")
+            await bot.cmd_payments(msg)
+            check("опечатка видна и в /payments",
+                  "опечатку" in _last_api_text() and "PLATEGA_PAYER_FEE_PERCENT" in _last_api_text())
+        finally:
+            os.environ.pop("PLATEGA_PAYER_FEE_PERCEN", None)
+
+        text = await bot.platega_self_check()
+        check("после исправления имени подсказка про опечатку исчезает", "опечатк" not in text)
+
+        # Включённый режим «комиссия на нас» виден сразу, с примером суммы
+        # (переменная читается при загрузке бота, поэтому берём новый экземпляр)
+        fee_bot = new_bot({"mode": "platega", "payer_fee": "8"}, store_file)
+        text = await fee_bot.platega_self_check()
+        check("режим «комиссия на нас» показан в отчёте с примером суммы",
+              "берём на себя" in text and "64.81" in text,
+              [ln for ln in text.split("\n") if "Комиссия кассы" in ln][:1])
+        dot_bot = new_bot({"mode": "platega", "payer_fee": "0.08"}, store_file)
+        text = await dot_bot.platega_self_check()
+        check("значение-доля (0,08) распознаётся с подсказкой",
+              "похоже, это доля" in text, [ln for ln in text.split("\n") if "доля" in ln][:1])
 
         msg = make_message(bot, text="/platega_check")
         await bot.cmd_platega_check(msg)
