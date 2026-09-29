@@ -29,9 +29,9 @@ from panel import PANEL, load_bot, make_app, reset
 # В боте теперь сетка «тип подписки × уровень»: time_<уровень> (ограничение по
 # времени) и traffic_<уровень> (только трафик). В сценариях используем понятные
 # псевдонимы: цены, лимиты и сроки берём из bot.TARIFFS, чтобы тесты читались.
-BASIC = "time_4"       # 450 ₽, 30 дней, 200 ГБ, безлимит устройств (Призрак)
-FAMILY = "time_3"      # 250 ₽, 30 дней, 100 ГБ, 5 устройств (Кибер-самурай)
-SCHOOL = "time_1"      # 70 ₽, 15 дней, 10 ГБ, 1 устройство (Новичок)
+BASIC = "time_4"       # 450 ₽, 30 дней, безлимитный трафик, 6 устройств
+FAMILY = "time_3"      # 250 ₽, 30 дней, 100 ГБ, 5 устройств
+SCHOOL = "time_1"      # 70 ₽, 15 дней, 15 ГБ, 1 устройство
 PREMIUM = "time_2"     # 130 ₽, 15 дней, 50 ГБ, 3 устройства
 TRAFFIC = "traffic_3"  # 300 ₽, без ограничения по времени, 100 ГБ, 5 устройств
 
@@ -496,9 +496,7 @@ async def test_stars_flow(store_file):
           f"{days_left(client) if client else '—'} дн.")
     basic_ips = bot.TARIFFS[BASIC]["ip_limit"]
     check(f"лимит устройств взят из тарифа ({basic_ips})", client and client.get("limitIp") == basic_ips)
-    check("трафик — 200 ГБ из тарифа «Призрак» по времени",
-          client and round(client.get("totalGB", 0) / (1024 ** 3)) == bot.TARIFFS[BASIC]["traffic_gb"],
-          str(client.get("totalGB") if client else None))
+    check("трафик безлимитный (totalGB=0) — уровень «Призрак» по времени", client and client.get("totalGB") == 0)
     check("tgId записан в панель", client and client.get("tgId") == TG_TG_ID)
     check("в комментарии — id тарифа и дата", client and client["comment"].startswith(f"{BASIC} до "))
     sent = [m for m in tg_calls("sendMessage") if str(m["params"].get("chat_id")) == str(TG_TG_ID)]
@@ -1743,10 +1741,8 @@ async def test_simulated_payment(store_file):
     check("срок взят из тарифа: 30 дней", client and 29 <= days_left(client) <= 30,
           f"{days_left(client) if client else '—'} дн.")
     basic_ips = bot.TARIFFS[BASIC]["ip_limit"]
-    check(f"лимиты взяты из тарифа ({basic_ips} устройств, 200 ГБ)",
-          client and client.get("limitIp") == basic_ips
-          and round(client.get("totalGB", 0) / (1024 ** 3)) == bot.TARIFFS[BASIC]["traffic_gb"],
-          str((client or {}).get("totalGB")))
+    check(f"лимиты взяты из тарифа ({basic_ips} устройств, безлимитный трафик)",
+          client and client.get("limitIp") == basic_ips and client.get("totalGB") == 0)
     check("в панели сохранился id тарифа и дата", client and client["comment"].startswith(f"{BASIC} до "))
 
     texts = [m["params"].get("text", "") for m in tg_calls("sendMessage")]
@@ -2484,7 +2480,6 @@ class _FakeCbMessage:
 
     async def edit_text(self, text, **kwargs):
         self.sent.append(text)
-        TG["calls"].append({"method": "editMessageText", "params": {"chat_id": TG_TG_ID, "text": text, **kwargs}})
 
     async def delete(self):
         pass

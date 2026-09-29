@@ -86,44 +86,6 @@ INBOUND2 = {
     }),
 }
 
-# Подключения под остальные протоколы: в боте клиент выбирает протоколы (шаг 4),
-# и по каждому бот заводит клиента в соответствующее подключение локации.
-def _proto_inbound(inbound_id: int, remark: str, port: int, security: str = "none",
-                   network: str = "tcp") -> dict:
-    stream = {"network": network, "security": security}
-    if security == "reality":
-        stream["realitySettings"] = {
-            "dest": "www.microsoft.com:443",
-            "serverNames": ["www.microsoft.com"],
-            "shortIds": ["0123456789abcdef"],
-            "settings": {"publicKey": "PUBKEY", "fingerprint": "chrome", "spiderX": "/"},
-        }
-    return {
-        "id": inbound_id,
-        "remark": remark,
-        "protocol": "vless" if security == "reality" else "wireguard",
-        "port": port,
-        "settings": json.dumps({"clients": [], "decryption": "none"}),
-        "streamSettings": json.dumps(stream),
-    }
-
-
-PROTOCOL_INBOUNDS = [
-    _proto_inbound(3, "Stockholm-AmneziaWG", 51820, network="udp"),
-    _proto_inbound(4, "Stockholm-WireGuard", 51821, network="udp"),
-    _proto_inbound(5, "Stockholm-Hysteria2", 51822, network="udp"),
-    _proto_inbound(6, "Stockholm-Shadowsocks-2022", 51823),
-    _proto_inbound(7, "Stockholm-TUIC", 51824, network="udp"),
-    _proto_inbound(8, "Warsaw-AmneziaWG", 52820, network="udp"),
-    _proto_inbound(9, "Warsaw-WireGuard", 52821, network="udp"),
-    _proto_inbound(10, "Warsaw-Hysteria2", 52822, network="udp"),
-    _proto_inbound(11, "Warsaw-Shadowsocks-2022", 52823),
-    _proto_inbound(12, "Warsaw-TUIC", 52824, network="udp"),
-]
-
-# Все подключения панели в порядке «локация → протокол»: VLESS идёт первым.
-ALL_INBOUNDS = [INBOUND, INBOUND2, *PROTOCOL_INBOUNDS]
-
 SERVER_TIME_SHIFT = 0  # сдвиг заголовка Date (для проверки учёта рассинхрона часов)
 
 
@@ -168,7 +130,7 @@ def emails() -> list:
 def inbounds_snapshot() -> list:
     """Подключения панели вместе с клиентами (как ответ /panel/api/inbounds/list)."""
     return [(inbound, dict(PANEL["inbound_clients"].get(inbound["id"], {})))
-            for inbound in ALL_INBOUNDS]
+            for inbound in (INBOUND, INBOUND2)]
 
 
 def reset(**kwargs):
@@ -181,8 +143,8 @@ def reset(**kwargs):
         "sub": {"enable": True, "port": None, "path": "/sub/", "domain": "", "uri": ""},
     })
     PANEL.update(kwargs)
-    for inbound in ALL_INBOUNDS:
-        inbound["settings"] = json.dumps({"clients": [], "decryption": "none"})
+    INBOUND["settings"] = json.dumps({"clients": [], "decryption": "none"})
+    INBOUND2["settings"] = json.dumps({"clients": [], "decryption": "none"})
     # clients=... в reset() — клиенты основной локации (Стокгольм): так сценарии
     # про группы могут «предзаполнить» панель клиентом.
     seed = kwargs.get("clients")
@@ -269,13 +231,13 @@ def _inbound_view(inbound: dict, clients: dict) -> dict:
 
 async def inbounds_list(request):
     """Панель отдаёт клиентов из своего состояния; трафик — в clientStats."""
-    views = [_inbound_view(inbound, clients_of(inbound["id"])) for inbound in ALL_INBOUNDS]
+    views = [_inbound_view(INBOUND, clients_of(1)), _inbound_view(INBOUND2, clients_of(2))]
     return web.json_response({"success": True, "obj": views})
 
 
 async def inbound_get(request):
     wanted = int(request.match_info["id"])
-    for inbound in ALL_INBOUNDS:
+    for inbound in (INBOUND, INBOUND2):
         if int(inbound["id"]) == wanted:
             return web.json_response({"success": True,
                                       "obj": _inbound_view(inbound, clients_of(wanted))})
