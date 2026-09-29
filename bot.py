@@ -6476,7 +6476,7 @@ def protocol_pick_text(tariff: dict, selection: dict) -> str:
             f"{mark} <b>{protocol_title(key)}</b>{star} — <i>{protocol_hint(key)}</i>\n"
             f"    {total} {tunnels_word(total)}: "
             + ", ".join(variant_title(key, variant) for variant in got)
-            + (f" (× {len(spots)} сервера)" if len(spots) > 1 else "")
+            + (f" ({servers_where_label(len(spots))})" if len(spots) > 1 else "")
         )
     lines.append("")
     if keys and not selection_tunnels(tariff, selection):

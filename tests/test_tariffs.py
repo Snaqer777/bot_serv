@@ -276,7 +276,7 @@ async def test_four_steps(store_file):
           many_text[:200].replace("\n", " | "))
     check("шаг 4: у каждого протокола общее число туннелей с учётом двух серверов",
           "6 туннелей: VLESS Reality" in many_text.replace("\n", " ")
-          and "(× 2 сервера)" in many_text,
+          and "(на 2 серверах)" in many_text,
           many_text[200:520].replace("\n", " | "))
     check("шаг 4: можно выбрать другой протокол, но не больше трёх",
           "tpro_shadowsocks" in many_buttons and "tpro_wireguard" in many_buttons)
