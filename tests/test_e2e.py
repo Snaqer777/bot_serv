@@ -361,10 +361,16 @@ async def step_payment(bot):
                                                   "WireGuard", "Hysteria2"))
           and step4_text.count("✅") == 3,
           step4_text[:160].replace("\n", " "))
-    check("шаг 4: подписано, сколько туннелей даёт протокол (с учётом двух серверов)",
-          "6 туннелей: VLESS Reality" in step4_text.replace("\n", " ")
-          or "6 туннелей" in step4_text,
+    check("шаг 4: протоколы в порядке VLESS → Hysteria2 → AmneziaWG → WireGuard → Shadowsocks-2022",
+          [i for i in ("VLESS", "Hysteria2", "AmneziaWG", "WireGuard", "Shadowsocks-2022")
+           if f"<b>{i}</b>" in step4_text]
+          == ["VLESS", "Hysteria2", "AmneziaWG", "WireGuard", "Shadowsocks-2022"]
+          and step4_text.index("<b>Hysteria2</b>") < step4_text.index("<b>Shadowsocks-2022</b>"),
           step4_text[:200].replace("\n", " "))
+    check("шаг 4: подписано, сколько туннелей даёт протокол на сервер и всего",
+          "3 туннеля на сервер (2 сервера — 6): VLESS Reality" in step4_text.replace("\n", " ")
+          and "1 туннель на сервер (2 сервера — 2): Hysteria2" in step4_text.replace("\n", " "),
+          step4_text[:220].replace("\n", " "))
     check("шаг 4: протоколы отмечены, есть кнопка «Продолжить»",
           "tcont" in buttons(last_edit(ADMIN)), str(buttons(last_edit(ADMIN))))
 
@@ -374,7 +380,7 @@ async def step_payment(bot):
     check("подтверждение: тип, тариф, сервер, протоколы, туннели и цена",
           "Кибер-самурай" in confirm_text and "Стокгольм" in confirm_text
           and "VLESS Reality" in confirm_text and "Вы получаете" in confirm_text
-          and "14 туннелей" in confirm_text and "Цена" in confirm_text
+          and "10 туннелей" in confirm_text and "Цена" in confirm_text
           and "buyat_time_3" in buttons(last_edit(ADMIN)),
           confirm_text[:220].replace("\n", " | "))
 
@@ -383,8 +389,8 @@ async def step_payment(bot):
     check("после оплаты клиент создан в панели", client is not None)
     check("срок подписки 30 дней", 29 <= (days_left(client) or 0) <= 30,
           f"{days_left(client)} дн.")
-    check("выданы туннели всех выбранных протоколов на двух серверах: 7 вариантов × 2 = 14",
-          len(panel_subscriptions(ADMIN)) == 14
+    check("выданы туннели всех выбранных протоколов на двух серверах: 5 вариантов × 2 = 10",
+          len(panel_subscriptions(ADMIN)) == 10
           and panel_client_in(2, ADMIN) is not None,
           f"записей: {len(panel_subscriptions(ADMIN))}")
     check("клиенты в разных локациях — разные подключения панели",
@@ -401,8 +407,8 @@ async def step_payment(bot):
           "Кибер-самурай" in key_msg and "Действует до" in key_msg)
     check("в сообщении перечислены оба сервера и все варианты протоколов",
           "Стокгольм" in key_msg and "Варшава" in key_msg
-          and "VLESS Reality + XHTTP" in key_msg and "Shadowsocks-2022 · AES-128-GCM" in key_msg
-          and "AmneziaWG" in key_msg and "14 туннелей" in key_msg,
+          and "VLESS Reality + XHTTP" in key_msg and "VLESS Reality + gRPC" in key_msg
+          and "Hysteria2" in key_msg and "AmneziaWG" in key_msg and "10 туннелей" in key_msg,
           key_msg[:240].replace("\n", " | "))
     check("кнопки после оплаты: инструкция, ключ, главное меню",
           {"help_menu", "profile", "main_menu"} <= set(buttons(last_sent(ADMIN))))

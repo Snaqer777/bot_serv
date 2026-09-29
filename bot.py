@@ -5284,22 +5284,13 @@ PROTOCOLS = {
              "aliases": ("grpc",)},
         ),
     },
-    "shadowsocks": {
-        "title": "Shadowsocks-2022",
-        "hint": "Проверенный и совместимый",
+    "hysteria2": {
+        "title": "Hysteria2",
+        "hint": "Скорость на нестабильных сетях",
         "variants": (
-            {"key": "aes128", "title": "Shadowsocks-2022 · AES-128-GCM",
-             "hint": "Лёгкий и быстрый", "env": "SHADOWSOCKS_AES128",
-             "aliases": ("aes-128", "aes128", "aes_128"),
-             "methods": ("aes-128-gcm",)},
-            {"key": "aes256", "title": "Shadowsocks-2022 · AES-256-GCM",
-             "hint": "Усиленное шифрование", "env": "SHADOWSOCKS_AES256",
-             "aliases": ("aes-256", "aes256", "aes_256"),
-             "methods": ("aes-256-gcm",)},
-            {"key": "chacha20", "title": "Shadowsocks-2022 · ChaCha20-Poly1305",
-             "hint": "Быстр на слабом процессоре", "env": "SHADOWSOCKS_CHACHA20",
-             "aliases": ("chacha20", "chacha"),
-             "methods": ("chacha20-poly1305", "chacha20-ietf-poly1305")},
+            {"key": "default", "title": "Hysteria2",
+             "hint": "Скорость на нестабильных сетях", "env": "HYSTERIA2",
+             "aliases": ("hysteria", "hy2")},
         ),
     },
     "amneziawg": {
@@ -5320,17 +5311,29 @@ PROTOCOLS = {
              "aliases": ("wireguard", "wg")},
         ),
     },
-    "hysteria2": {
-        "title": "Hysteria2",
-        "hint": "Скорость на нестабильных сетях",
+    "shadowsocks": {
+        "title": "Shadowsocks-2022",
+        "hint": "Проверенный и совместимый",
         "variants": (
-            {"key": "default", "title": "Hysteria2",
-             "hint": "Скорость на нестабильных сетях", "env": "HYSTERIA2",
-             "aliases": ("hysteria", "hy2")},
+            {"key": "aes128", "title": "Shadowsocks-2022 · AES-128-GCM",
+             "hint": "Лёгкий и быстрый", "env": "SHADOWSOCKS_AES128",
+             "aliases": ("aes-128", "aes128", "aes_128"),
+             "methods": ("aes-128-gcm",)},
+            {"key": "aes256", "title": "Shadowsocks-2022 · AES-256-GCM",
+             "hint": "Усиленное шифрование", "env": "SHADOWSOCKS_AES256",
+             "aliases": ("aes-256", "aes256", "aes_256"),
+             "methods": ("aes-256-gcm",)},
+            {"key": "chacha20", "title": "Shadowsocks-2022 · ChaCha20-Poly1305",
+             "hint": "Быстр на слабом процессоре", "env": "SHADOWSOCKS_CHACHA20",
+             "aliases": ("chacha20", "chacha"),
+             "methods": ("chacha20-poly1305", "chacha20-ietf-poly1305")},
         ),
     },
 }
-PROTOCOL_ORDER = ("vless", "shadowsocks", "amneziawg", "wireguard", "hysteria2")
+# Порядок протоколов в интерфейсе и текстах: VLESS → Hysteria2 → AmneziaWG → WireGuard →
+# Shadowsocks-2022. Он же задаёт набор по умолчанию: на уровнях с выбором одного
+# протокола — VLESS (⭐ рекомендуемый), у Кибер-самурая — первые три из списка.
+PROTOCOL_ORDER = ("vless", "hysteria2", "amneziawg", "wireguard", "shadowsocks")
 
 # Уровни: сколько серверов входит, сколько протоколов выбирает клиент
 # (0 = все протоколы, выбор не нужен) и лимит устройств (0 = без ограничений).
@@ -5345,7 +5348,7 @@ TARIFF_LEVEL_ORDER = (1, 2, 3, 4)
 
 
 def protocol_title(key: str) -> str:
-    """Название протокола для кнопок и текстов: VLESS, Shadowsocks-2022, …"""
+    """Название протокола для кнопок и текстов: VLESS, Hysteria2, …"""
     meta = PROTOCOLS.get(key) or {}
     return meta.get("title") or key
 
@@ -6471,12 +6474,17 @@ def protocol_pick_text(tariff: dict, selection: dict) -> str:
         mark = "✅" if key in selected else "◻️"
         star = " ⭐" if key == "vless" and need == 1 else ""
         per_server = len(got)
-        total = per_server * max(1, len(spots))
+        servers_count = max(1, len(spots))
+        total = per_server * servers_count
+        if servers_count > 1:
+            count_label = (f"{per_server} {tunnels_word(per_server)} на сервер "
+                           f"({servers_count} сервера — {total})")
+        else:
+            count_label = f"{per_server} {tunnels_word(per_server)}"
         lines.append(
             f"{mark} <b>{protocol_title(key)}</b>{star} — <i>{protocol_hint(key)}</i>\n"
-            f"    {total} {tunnels_word(total)}: "
+            f"    {count_label}: "
             + ", ".join(variant_title(key, variant) for variant in got)
-            + (f" ({servers_where_label(len(spots))})" if len(spots) > 1 else "")
         )
     lines.append("")
     if keys and not selection_tunnels(tariff, selection):
@@ -6502,9 +6510,13 @@ def protocol_pick_kb(selection: dict, tariff_key_value: str) -> InlineKeyboardMa
                if ((selection.get("available") or {}).get(key) or {}).get(variant)]
         mark = "✅" if all_included or key in selected else "◻️"
         star = "⭐ " if key == "vless" and need == 1 else ""
-        total = len(got) * max(1, len(spots))
+        servers_count = max(1, len(spots))
+        if servers_count > 1:
+            count_label = f"по {len(got)} на сервер"
+        else:
+            count_label = f"{len(got)} {tunnels_word(len(got))}"
         rows.append([InlineKeyboardButton(
-            text=f"{mark} {star}{protocol_title(key)} · {total} {tunnels_word(total)}",
+            text=f"{mark} {star}{protocol_title(key)} · {count_label}",
             callback_data=f"tpro_{key}",
         )])
     rows.append([InlineKeyboardButton(text="➡️ Продолжить", callback_data="tcont")])
@@ -6619,7 +6631,7 @@ def welcome_text(tg_id: int) -> str:
     return (
         "👋 <b>Добро пожаловать в быстрый и надёжный VPN!</b>\n\n"
         "Работаем на пяти современных протоколах — <b>VLESS</b> (Reality, XHTTP, gRPC), "
-        "<b>Shadowsocks-2022</b>, <b>AmneziaWG</b>, <b>WireGuard</b> и <b>Hysteria2</b>: "
+        "<b>Hysteria2</b>, <b>AmneziaWG</b>, <b>WireGuard</b> и <b>Shadowsocks-2022</b>: "
         "выбираешь нужные при покупке, а стабильное соединение держится даже на "
         "нестабильных сетях.\n\n"
         + trial_line +

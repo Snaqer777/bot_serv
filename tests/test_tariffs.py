@@ -5,7 +5,8 @@
   1. каталог: 8 платных тарифов (4 уровня × 2 типа), цены/трафик/сроки/устройства,
      серверы по уровням (1 / 2 / 2 / 2) и туннели (1–3 / 2–6 / 6–14 / 18);
   2. протоколы: пять базовых, у VLESS и Shadowsocks-2022 по три варианта (Reality/XHTTP/gRPC
-     и три шифра), у AmneziaWG / WireGuard / Hysteria2 — по одному;
+     и три шифра), у Hysteria2 / AmneziaWG / WireGuard — по одному;
+     порядок протоколов в меню: VLESS → Hysteria2 → AmneziaWG → WireGuard → Shadowsocks-2022;
   3. путь покупки: тип → уровень → сервер → протоколы → подтверждение → оплата;
      уровень 1 выбирает сервер и один протокол, уровень 3 — три протокола из пяти,
      уровень 4 — все протоколы без выбора;
@@ -48,7 +49,7 @@ TRAFFIC_GRID = {
 }
 LEVEL_NAMES = {1: "Новичок", 2: "Нетраннер", 3: "Кибер-самурай", 4: "Призрак"}
 LEVEL_CHOICES = {1: 1, 2: 1, 3: 3, 4: 0}          # сколько протоколов выбирает клиент
-PROTOCOL_BASE = ("VLESS", "Shadowsocks-2022", "AmneziaWG", "WireGuard", "Hysteria2")
+PROTOCOL_BASE = ("VLESS", "Hysteria2", "AmneziaWG", "WireGuard", "Shadowsocks-2022")
 VLESS_VARIANTS = ("VLESS Reality", "VLESS Reality + XHTTP", "VLESS Reality + gRPC")
 SS_VARIANTS = ("Shadowsocks-2022 · AES-128-GCM", "Shadowsocks-2022 · AES-256-GCM",
                "Shadowsocks-2022 · ChaCha20-Poly1305")
@@ -107,7 +108,7 @@ async def test_catalog(store_file):
           and bot.TARIFFS["trial"]["traffic_gb"] == 10 and bot.TARIFFS["trial"]["days"] == 15)
 
     check("пять базовых протоколов, у VLESS и Shadowsocks — по три варианта",
-          list(bot.PROTOCOL_ORDER) == ["vless", "shadowsocks", "amneziawg", "wireguard", "hysteria2"]
+          list(bot.PROTOCOL_ORDER) == ["vless", "hysteria2", "amneziawg", "wireguard", "shadowsocks"]
           and bot.protocol_variant_count("vless") == 3
           and bot.protocol_variant_count("shadowsocks") == 3
           and all(bot.protocol_variant_count(key) == 1
@@ -218,8 +219,18 @@ async def test_four_steps(store_file):
           step4_text[:200].replace("\n", " | "))
     check("шаг 4: у протоколов видны варианты и число туннелей",
           all(name in step4_text for name in VLESS_VARIANTS + SS_VARIANTS)
-          and "3 туннеля: VLESS Reality" in step4_text,
-          step4_text[200:500].replace("\n", " | "))
+          and "3 туннеля: VLESS Reality" in step4_text
+          and "3 туннеля: Shadowsocks-2022 · AES-128-GCM" in step4_text.replace("\n", " "),
+          step4_text[200:520].replace("\n", " | "))
+    check("шаг 4: Shadowsocks-2022 — три туннеля на сервер, как и VLESS",
+          bot.protocol_variant_count("shadowsocks") == 3
+          and len(bot.protocol_tunnel_titles("shadowsocks")) == 3)
+    check("шаг 4: протоколы идут в порядке VLESS → Hysteria2 → AmneziaWG → WireGuard → Shadowsocks",
+          [line.split(" ")[1] for line in step4_text.split("\n") if line.startswith(("✅ ", "◻️ "))]
+          == list(PROTOCOL_BASE),
+          str([line.split(" ")[1] for line in step4_text.split("\n") if line.startswith(("✅ ", "◻️ "))]))
+    check("по умолчанию у Новичка отмечен VLESS — рекомендуемый",
+          bot.PROTOCOL_SELECTION[TG_TG_ID]["selected"] == ["vless"])
     check("шаг 4: VLESS — рекомендуемый и уже отмечен (⭐ ✅)",
           "✅ VLESS ⭐" in step4_text)
     check("шаг 4: подписано, что выбирается один протокол",
@@ -274,9 +285,10 @@ async def test_four_steps(store_file):
           "Шаг 4. Выберите протокол(ы)" in many_text and many_text.count("✅") == 3
           and "Выбери 3 протокола" in many_text,
           many_text[:200].replace("\n", " | "))
-    check("шаг 4: у каждого протокола общее число туннелей с учётом двух серверов",
-          "6 туннелей: VLESS Reality" in many_text.replace("\n", " ")
-          and "(на 2 серверах)" in many_text,
+    check("шаг 4: у каждого протокола подписано число туннелей на сервер и всего",
+          "3 туннеля на сервер (2 сервера — 6): VLESS Reality" in many_text.replace("\n", " ")
+          and "1 туннель на сервер (2 сервера — 2): Hysteria2" in many_text.replace("\n", " ")
+          and "3 туннеля на сервер (2 сервера — 6): Shadowsocks-2022" in many_text.replace("\n", " "),
           many_text[200:520].replace("\n", " | "))
     check("шаг 4: можно выбрать другой протокол, но не больше трёх",
           "tpro_shadowsocks" in many_buttons and "tpro_wireguard" in many_buttons)
@@ -295,7 +307,7 @@ async def test_four_steps(store_file):
     check("можно заменить протокол в наборе (три из пяти)",
           len(chosen) == 3 and "wireguard" in chosen and "amneziawg" not in chosen, str(chosen))
     # Убираем всё до одного — последний убрать нельзя
-    for key in ("wireguard", "shadowsocks"):
+    for key in ("wireguard", "hysteria2"):
         TG["calls"].clear()
         await bot.cb_tariff_protocol(_FakeCallback(bot, f"tpro_{key}"))
     last = _FakeCallback(bot, "tpro_vless")
@@ -392,7 +404,7 @@ async def _delivery_level4(bot, email):
     await bot.start_checkout(TG_TG_ID, TG_TG_ID, "traffic_4")
     order = [o for o in bot.payment_store.orders.values()][-1]
     check("«Призрак» берёт все пять протоколов без выбора",
-          order.get("protocols") == ["vless", "shadowsocks", "amneziawg", "wireguard", "hysteria2"],
+          order.get("protocols") == ["vless", "hysteria2", "amneziawg", "wireguard", "shadowsocks"],
           str(order.get("protocols")))
     status, body = await post_platega_callback(order["id"], order["amount_rub"], transaction_id="701002")
     check("оплата подтверждена", status == 200 and body.strip() == "ok")
@@ -418,16 +430,15 @@ async def _delivery_level4(bot, email):
 
     # Уровень 3: три протокола на двух серверах
     reset_all()
-    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "time_3", None, ["vless", "shadowsocks", "wireguard"])
+    await bot.start_checkout(TG_TG_ID, TG_TG_ID, "time_3", None, ["vless", "shadowsocks", "hysteria2"])
     order3 = [o for o in bot.payment_store.orders.values()][-1]
     status, body = await post_platega_callback(order3["id"], order3["amount_rub"], transaction_id="701003")
     check("оплата уровня 3 подтверждена", status == 200 and body.strip() == "ok")
     subs3 = clients_named(email)
     check("7 вариантов трёх протоколов × 2 сервера = 14 туннелей", len(subs3) == 14,
           f"записей: {len(subs3)}")
-    check("в туннелях нет невыбранных протоколов (AmneziaWG и Hysteria2 отсутствуют)",
-          "Stockholm-AmneziaWG" not in {c.get("comment") and "" or "" for c in subs3}
-          and len([c for c in subs3 if c["id"] in {8, 9, 16, 17, 10, 18}]) == 0,
+    check("в туннелях нет невыбранных протоколов (AmneziaWG и WireGuard отсутствуют)",
+          len([c for c in subs3 if c["id"] in {8, 9, 16, 17}]) == 0,
           str(sorted(c["id"] for c in subs3)))
 
     # «Мои подписки»: протоколы, варианты и серверы
@@ -437,7 +448,7 @@ async def _delivery_level4(bot, email):
     check("/profile перечисляет протоколы, варианты и серверы",
           "Туннелей: 14" in profile_text
           and all(name in profile_text for name in VLESS_VARIANTS + SS_VARIANTS)
-          and "WireGuard" in profile_text
+          and "Hysteria2" in profile_text
           and "Стокгольм" in profile_text and "Варшава" in profile_text,
           [line for line in profile_text.split("\n") if "Туннелей" in line or "получает" in line])
 
