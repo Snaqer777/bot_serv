@@ -443,7 +443,8 @@ async def test_trial_visibility():
     opened_start = FakeMsg(uid=555, text="/start")
     await open_bot.cmd_start(opened_start)
     check("и /start снова обещает бесплатный тест",
-          "Бесплатный тестовый доступ" in opened_start.last)
+          "Бесплатный тест" in opened_start.last and "10 ГБ" in opened_start.last,
+          opened_start.last[:140].replace("\n", " | "))
     check("кнопка теста есть в меню у всех",
           "get_test_key_btn" in callbacks_of(open_bot.main_menu_kb(555)))
     check("при TRIAL_PUBLIC=1 и TRIAL_BUTTON=1 тестовый пункт вернулся и в тарифы",
@@ -458,13 +459,15 @@ async def test_trial_visibility():
     hidden_start = FakeMsg(uid=555, text="/start")
     await hidden.cmd_start(hidden_start)
     check("в приветствии нет строки про кнопку теста",
-          "Бесплатный тестовый доступ" not in hidden_start.last)
+          "Бесплатный тест" not in hidden_start.last)
     hidden_tariffs = FakeCallback("tariffs", FakeMsg(uid=555), uid=555)
     await hidden.cb_tariffs(hidden_tariffs)
     check("в тарифах остались только платные пункты",
-          "Тестовый период" not in hidden_tariffs.message.last
-          and "Новичок" in hidden_tariffs.message.last
-          and "По времени" in hidden_tariffs.message.last)
+          "Бесплатный тест" not in hidden_tariffs.message.last
+          and "Шаг 1" in hidden_tariffs.message.last
+          and "По времени" in hidden_tariffs.message.last
+          and "По трафику" in hidden_tariffs.message.last,
+          hidden_tariffs.message.last[:140].replace("\n", " | "))
     profile = FakeMsg(uid=555, text="/profile")
     await hidden.send_profile(profile, 555)
     check("в профиле кнопки теста нет",

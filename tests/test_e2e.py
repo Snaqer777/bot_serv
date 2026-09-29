@@ -177,17 +177,19 @@ def days_left(client):
     return round((int(client["expiryTime"]) - int(time.time() * 1000)) / 86_400_000, 1)
 
 
-async def pay_via_platega(bot, uid, tariff, *, confirmed=True, location=None):
+async def pay_via_platega(bot, uid, tariff, *, confirmed=True, location=None, via_confirm=False):
     """
     Полный путь оплаты: ссылка на оплату → callback Platega → выдача ключа.
 
-    location — выбранный сервер для тарифов с одним туннелем (как в кнопке
-    «💳 Оплатить» после трёх шагов выбора).
+    location — выбранный сервер для тарифа с одним сервером; via_confirm — оплата
+    кнопкой «💳 Оплатить» после четырёх шагов выбора (тип → уровень → сервер →
+    протоколы → подтверждение).
     """
     cb = click(bot, "tariffs", uid=uid)
     await bot.cb_tariffs(cb)
-    if location:
-        cb = click(bot, f"buyat_{tariff}_{location}", uid=uid)
+    if location or via_confirm:
+        data = f"buyat_{tariff}" + (f"_{location}" if location else "")
+        cb = click(bot, data, uid=uid)
         await bot.cb_buy_at(cb)
     else:
         cb = click(bot, f"buy_{tariff}", uid=uid)
@@ -329,48 +331,59 @@ async def step_payment(bot):
     check("шаг 2: показаны четыре уровня с ценами",
           all(level in levels_text for level in ("Новичок", "Нетраннер", "Кибер-самурай", "Призрак")),
           levels_text[:120].replace("\n", " "))
-    check("в уровнях видны трафик, срок, устройства и туннели",
-          "15 ГБ" in levels_text and "30 дней" in levels_text
-          and "устройств" in levels_text and "туннел" in levels_text)
+    check("в уровнях видны трафик, срок, устройства и протоколы",
+          "10 ГБ" in levels_text and "30 дней" in levels_text
+          and "устройств" in levels_text and "протокол" in levels_text,
+          levels_text[:160].replace("\n", " | "))
     check("кнопка возврата ведёт назад к типам", "tariffs" in buttons(last_edit(ADMIN)))
 
-    # Шаг 3 для многотуннельного тарифа: сервер не выбирается, сразу подтверждение
+    # Шаг 4 для тарифа на несколько серверов: сервер не выбирается, сразу протоколы
     fp.TG["calls"].clear()
     cb = click(bot, "tlvl_time_3", uid=ADMIN)
     await bot.cb_tariff_level(cb)
-    confirm_text = last_edit(ADMIN).get("text", "")
-    check("шаг 3 (тариф на несколько туннелей): подтверждение без выбора сервера",
-          "Кибер-самурай" in confirm_text and "все серверы" in confirm_text
+    step4_text = last_edit(ADMIN).get("text", "")
+    check("шаг 4: у Кибер-самурая доступны три протокола, выбора сервера нет",
+          "Шаг 4. Выберите протокол(ы)" in step4_text and "AmneziaWG" in step4_text
+          and "Hysteria2" not in step4_text
           and not any(b.startswith("tlocs_") for b in buttons(last_edit(ADMIN))),
-          confirm_text[:120].replace("\n", " "))
-    check("в подтверждении есть цена, туннели и кнопка оплаты",
-          "Цена" in confirm_text and "Туннелей" in confirm_text
-          and f"buyat_time_3" in buttons(last_edit(ADMIN)))
+          step4_text[:120].replace("\n", " "))
+    check("шаг 4: протоколы отмечены, есть кнопка «Продолжить»",
+          "tcont" in buttons(last_edit(ADMIN)), str(buttons(last_edit(ADMIN))))
 
-    order_id = await pay_via_platega(bot, ADMIN, "time_3")
+    fp.TG["calls"].clear()
+    await bot.cb_tariff_protocol_done(click(bot, "tcont", uid=ADMIN))
+    confirm_text = last_edit(ADMIN).get("text", "")
+    check("подтверждение: тип, тариф, сервер, протоколы и цена",
+          "Кибер-самурай" in confirm_text and "все серверы" in confirm_text
+          and "VLESS Reality" in confirm_text and "Цена" in confirm_text
+          and "buyat_time_3" in buttons(last_edit(ADMIN)),
+          confirm_text[:160].replace("\n", " | "))
+
+    order_id = await pay_via_platega(bot, ADMIN, "time_3", via_confirm=True)
     client = panel_client(ADMIN)
     check("после оплаты клиент создан в панели", client is not None)
     check("срок подписки 30 дней", 29 <= (days_left(client) or 0) <= 30,
           f"{days_left(client)} дн.")
-    check("тариф на несколько туннелей выдан во всех локациях сразу",
-          len(panel_subscriptions(ADMIN)) == 2
+    check("тариф на несколько серверов и три протокола выдан сразу: 2 сервера × 3 = 6 записей",
+          len(panel_subscriptions(ADMIN)) == 6
           and panel_client_in(2, ADMIN) is not None,
           f"записей: {len(panel_subscriptions(ADMIN))}")
     check("клиенты в разных локациях — разные подключения панели",
           {c["limitIp"] for c in panel_subscriptions(ADMIN)} == {5})
     key_msg = last_text(ADMIN)
-    check("доступ отправлен сообщением (ссылки-подписки по локациям)",
-          "/sub/" in key_msg and "ссылки-подписки" in key_msg,
-          key_msg[:80].replace("\n", " "))
+    check("доступ отправлен сообщением (одна ссылка-подписка на все протоколы)",
+          "/sub/" in key_msg and "ссылка-подписка" in key_msg
+          and key_msg.count("/sub/") == 1,
+          key_msg[:120].replace("\n", " "))
     check("отдельный ключ vless в сообщении не показывается", "vless://" not in key_msg)
     check("в сообщении нет внутреннего адреса панели",
           "XUI_URL" not in key_msg, key_msg[:70].replace("\n", " "))
     check("в сообщении есть тариф, срок и дата",
           "Кибер-самурай" in key_msg and "Действует до" in key_msg)
-    check("в сообщении перечислены оба сервера со своими ссылками",
+    check("в сообщении перечислены оба сервера и протоколы подписки",
           "Стокгольм" in key_msg and "Варшава" in key_msg
-          and key_msg.count("/sub/") >= 2,
-          key_msg[:160].replace("\n", " "))
+          and "VLESS Reality" in key_msg and "AmneziaWG" in key_msg,
+          key_msg[:200].replace("\n", " "))
     check("кнопки после оплаты: инструкция, ключ, главное меню",
           {"help_menu", "profile", "main_menu"} <= set(buttons(last_sent(ADMIN))))
 
@@ -380,9 +393,10 @@ async def step_payment(bot):
     check("/profile показывает активную подписку", "Активна" in profile)
     check("/profile показывает срок и ссылку-подписку",
           "Действует до" in profile and "/sub/" in profile)
-    check("/profile перечисляет серверы тарифа",
-          "Серверы" in profile and "Stockholm" in profile and "Warsaw" in profile,
-          [line for line in profile.split("\n") if "Сервер" in line])
+    check("/profile перечисляет серверы и протоколы тарифа",
+          "Серверы" in profile and "Стокгольм" in profile and "Варшава" in profile
+          and "VLESS Reality" in profile,
+          [line for line in profile.split("\n") if "Сервер" in line or "Протокол" in line])
     check("в профиле остались тарифы, а кнопки теста нет",
           {"tariffs", "main_menu"} <= set(buttons(last_sent(ADMIN)))
           and "get_test_key_btn" not in buttons(last_sent(ADMIN)),
@@ -401,8 +415,9 @@ async def step_trial_key(bot):
     check("тестовый доступ отправлен (ссылка-подписка)", "/sub/" in last_text(ADMIN),
           last_text(ADMIN)[:80].replace("\n", " "))
     check("в тестовом доступе ключ vless не показывается", "vless://" not in last_text(ADMIN))
-    check("в сообщении срок 24 часа и трафик 1 ГиБ",
-          "24 часа" in last_text(ADMIN) and "1 ГиБ" in last_text(ADMIN))
+    check("в сообщении срок 15 дней и трафик 10 ГБ",
+          "15 дней" in last_text(ADMIN) and "10 ГБ" in last_text(ADMIN),
+          last_text(ADMIN)[:160].replace("\n", " | "))
     check("кнопки под тестовым ключом",
           {"help_menu", "profile", "main_menu"} <= set(buttons(last_sent(ADMIN))))
 
