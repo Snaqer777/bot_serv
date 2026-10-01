@@ -269,6 +269,23 @@ async def test_four_steps(store_file):
     check("кнопка «Назад» возвращает на шаг 4",
           "Шаг 4. Выберите протокол(ы)" in plain(last_edit().get("text", "")))
 
+    # «Назад» на шаге 4 ведёт на шаг 3, а не перерисовывает шаг 4 (был такой баг)
+    check("шаг 4 (Новичок): «Назад» — отдельная кнопка, а не «Дальше»",
+          "tsback_time_1" in last_buttons() and "tsall_time_1" not in last_buttons(),
+          str(last_buttons()))
+    TG["calls"].clear()
+    await bot.cb_tariff_step3_back(_FakeCallback(bot, "tsback_time_1"))
+    back_text = plain(last_edit().get("text", ""))
+    check("возврат с шага 4 у Новичка — снова выбор сервера",
+          "Шаг 3. Выберите сервер" in back_text
+          and {"tlocs_time_1_warsaw", "tlocs_time_1_stockholm"} <= set(last_buttons()),
+          back_text[:120].replace("\n", " ") + " | " + str(last_buttons()))
+    # Старые сообщения с tsrv_ тоже должны вести на шаг 3, а не на шаг 4
+    TG["calls"].clear()
+    await bot.cb_tariff_server_screen(_FakeCallback(bot, "tsrv_time_1"))
+    check("старая кнопка tsrv_ ведёт на шаг 3",
+          "Шаг 3. Выберите сервер" in plain(last_edit().get("text", "")))
+
     # Шаг 3, уровень 3: оба сервера входят сразу
     TG["calls"].clear()
     await bot.cb_tariff_level(_FakeCallback(bot, "tlvl_time_3"))
@@ -293,6 +310,23 @@ async def test_four_steps(store_file):
           many_text[200:520].replace("\n", " | "))
     check("шаг 4: можно выбрать другой протокол, но не больше трёх",
           "tpro_shadowsocks" in many_buttons and "tpro_wireguard" in many_buttons)
+    check("шаг 4 (Кибер-самурай): «Назад» ведёт на шаг 3, а не на себя же",
+          "tsback_time_3" in many_buttons and "tsall_time_3" not in many_buttons,
+          str(many_buttons))
+    TG["calls"].clear()
+    await bot.cb_tariff_step3_back(_FakeCallback(bot, "tsback_time_3"))
+    back3_text = plain(last_edit().get("text", ""))
+    check("возврат с шага 4 — снова экран серверов, с кнопкой «Дальше»",
+          "Шаг 3. Серверы" in back3_text and "Стокгольм" in back3_text
+          and "tsall_time_3" in last_buttons(), back3_text[:120].replace("\n", " "))
+    check("на шаге 3 снова доступен возврат к уровням",
+          "tkind_time" in last_buttons(), str(last_buttons()))
+    TG["calls"].clear()
+    await bot.cb_tariff_servers_all(_FakeCallback(bot, "tsall_time_3"))
+    check("после возврата и «Дальше» выбор протоколов сохранился",
+          len(bot.PROTOCOL_SELECTION[TG_TG_ID]["selected"]) == 3
+          and "Шаг 4. Выберите протокол(ы)" in plain(last_edit().get("text", "")),
+          str(bot.PROTOCOL_SELECTION[TG_TG_ID]["selected"]))
 
     # Пробуем выбрать четвёртый — бот просит снять галочку
     extra = _FakeCallback(bot, "tpro_wireguard")
@@ -341,6 +375,22 @@ async def test_four_steps(store_file):
     TG["calls"].clear()
     await bot.cb_tariff_protocol_done(_FakeCallback(bot, "tcont"))
     ghost = plain(last_edit().get("text", ""))
+    TG["calls"].clear()
+    await bot.cb_tariff_level(_FakeCallback(bot, "tlvl_traffic_4"))
+    await bot.cb_tariff_servers_all(_FakeCallback(bot, "tsall_traffic_4"))
+    ghost_back = last_buttons()
+    check("шаг 4 (Призрак): «Назад» тоже ведёт на шаг 3",
+          "tsback_traffic_4" in ghost_back and "tsall_traffic_4" not in ghost_back,
+          str(ghost_back))
+    TG["calls"].clear()
+    await bot.cb_tariff_step3_back(_FakeCallback(bot, "tsback_traffic_4"))
+    check("возврат с шага 4 у «Призрака» — экран серверов",
+          "Шаг 3. Серверы" in plain(last_edit().get("text", ""))
+          and "tsall_traffic_4" in last_buttons())
+    TG["calls"].clear()
+    await bot.cb_tariff_servers_all(_FakeCallback(bot, "tsall_traffic_4"))
+    TG["calls"].clear()
+    await bot.cb_tariff_protocol_done(_FakeCallback(bot, "tcont"))
     check("подтверждение «Призрака»: 18 туннелей на обоих серверах",
           "18 туннелей на 2 серверах" in ghost
           and "9 туннелей на каждом сервере" in ghost

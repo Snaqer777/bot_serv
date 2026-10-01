@@ -6631,11 +6631,10 @@ def protocol_pick_kb(selection: dict, tariff_key_value: str) -> InlineKeyboardMa
             callback_data=f"tpro_{key}",
         )])
     rows.append([InlineKeyboardButton(text="➡️ Продолжить", callback_data="tcont")])
-    if tariff_servers(tariff) <= 1:
-        back = f"tsrv_{tariff_key_value}"
-    else:
-        back = f"tsall_{tariff_key_value}"
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=back)])
+    # Возврат на шаг 3 — отдельный callback: раньше у многосерверных тарифов тут стоял
+    # «tsall_…», тот же, что у кнопки «Дальше: протоколы», и «Назад» просто
+    # перерисовывал шаг 4.
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"tsback_{tariff_key_value}")])
     rows.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -7568,6 +7567,16 @@ async def show_screen(cb: CallbackQuery, text: str, keyboard: InlineKeyboardMark
         await cb.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 
+async def step3_screen(plan: dict, tariff_key_value: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Экран шага 3: выбор сервера у односерверного тарифа или список серверов тарифа."""
+    kind, level = plan["kind"], int(plan["level"])
+    if tariff_servers(plan) <= 1:
+        return server_pick_text(kind, level), server_pick_kb(kind, level)
+    availability = await tunnel_availability(plan, None)
+    text = servers_all_text(kind, level) + unavailable_locations_note(plan, availability)
+    return text, servers_all_kb(kind, level)
+
+
 @dp.callback_query(F.data.startswith("tlvl_"))
 async def cb_tariff_level(cb: CallbackQuery):
     """Шаг 3: у односерверного тарифа — выбор сервера, у остальных — сразу экран серверов."""
@@ -7582,12 +7591,8 @@ async def cb_tariff_level(cb: CallbackQuery):
         await cb.answer("Такого тарифа нет.", show_alert=True)
         return
 
-    if tariff_servers(plan) <= 1:
-        await show_screen(cb, server_pick_text(kind, level), server_pick_kb(kind, level))
-    else:
-        availability = await tunnel_availability(plan, None)
-        text = servers_all_text(kind, level) + unavailable_locations_note(plan, availability)
-        await show_screen(cb, text, servers_all_kb(kind, level))
+    text, keyboard = await step3_screen(plan, tariff_key(kind, level))
+    await show_screen(cb, text, keyboard)
 
 
 @dp.callback_query(F.data.startswith("tsall_"))
@@ -7603,17 +7608,30 @@ async def cb_tariff_servers_all(cb: CallbackQuery):
     await show_screen(cb, text, keyboard)
 
 
+@dp.callback_query(F.data.startswith("tsback_"))
+async def cb_tariff_step3_back(cb: CallbackQuery):
+    """«◀️ Назад» с шага 4: возврат на шаг 3 (серверы) для тарифов любого размера."""
+    await cb.answer()
+    tariff_key_value = cb.data.removeprefix("tsback_")
+    plan = TARIFFS.get(tariff_key_value)
+    if plan is None:
+        await cb.answer("Такого тарифа нет.", show_alert=True)
+        return
+    text, keyboard = await step3_screen(plan, tariff_key_value)
+    await show_screen(cb, text, keyboard)
+
+
 @dp.callback_query(F.data.startswith("tsrv_"))
 async def cb_tariff_server_screen(cb: CallbackQuery):
-    """Возврат на шаг 3 (выбор сервера) с шага 4."""
+    """Совместимость: старые сообщения с кнопкой tsrv_ тоже ведут на шаг 3."""
     await cb.answer()
     tariff_key_value = cb.data.removeprefix("tsrv_")
     plan = TARIFFS.get(tariff_key_value)
     if plan is None:
         await cb.answer("Такого тарифа нет.", show_alert=True)
         return
-    kind, level = plan["kind"], int(plan["level"])
-    await show_screen(cb, server_pick_text(kind, level), server_pick_kb(kind, level))
+    text, keyboard = await step3_screen(plan, tariff_key_value)
+    await show_screen(cb, text, keyboard)
 
 
 @dp.callback_query(F.data.startswith("tback_"))
