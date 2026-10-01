@@ -4144,11 +4144,11 @@ async def activate_paid_subscription(
             raise XUIError(
                 "❌ В панели 3x-ui нет подходящих подключений для туннелей: "
                 + ", ".join(wanted)
-                + ".\n\nПроверь раздел Inbounds: в названии подключения должны быть локация "
-                "и протокол (например «Warsaw-Hysteria2»), либо задай его ID переменной "
-                "<code>XUI_INBOUND_&lt;ЛОКАЦИЯ&gt;_&lt;ВАРИАНТ&gt;</code> "
-                "(например <code>XUI_INBOUND_WARSAW_VLESS_XHTTP</code> или "
-                "<code>XUI_INBOUND_STOCKHOLM_SHADOWSOCKS_AES256</code>)."
+                + ".\n\nЧто делать: 1) создай подключения в панели (Inbounds → +), чтобы "
+                "в названии были локация и протокол — например «Warsaw-Hysteria2»; "
+                "2) или привяжи уже существующие командой /panel_map — переменные Railway "
+                "не нужны; 3) либо задай ID переменной XUI_INBOUND_<ЛОКАЦИЯ>_<ВАРИАНТ>, "
+                "например XUI_INBOUND_WARSAW_VLESS_XHTTP. Что бот видит — /panel_debug."
             )
 
         entries: list[dict] = []
@@ -4923,6 +4923,12 @@ async def simulate_successful_payment(chat_id: int, tg_id: int, tariff_key: str,
             "2. Проверь выдачу на другом аккаунте: там эта команда создаст ключ тем же путём."
         )
 
+    tariff = TARIFFS[tariff_key]
+    readiness = await location_readiness(tariff)
+    test_spots = tariff_spots(tariff, location_key)
+    if readiness is not None and sum(int(readiness.get(spot["key"], 0)) for spot in test_spots) <= 0:
+        raise PaymentError(no_tunnels_message(tariff, test_spots, readiness, tg_id))
+
     order = await payment_store.create(new_test_order(tg_id, tariff_key, location_key))
     charge_id = f"test-{order['id']}"
     logger.info(
@@ -5170,6 +5176,12 @@ async def start_checkout(chat_id: int, tg_id: int, tariff_key: str,
         location_key = None
     if not protocols:
         protocols = default_protocols(tariff, list(PROTOCOL_ORDER))
+    # Предохранитель: если под выбранные протоколы и серверы в панели нет ни одного
+    # подключения, ключ выдать нечем — счёт не выставляем, деньги не списываются.
+    readiness = await location_readiness(tariff, protocols)
+    checkout_spots = tariff_spots(tariff, location_key)
+    if readiness is not None and sum(int(readiness.get(spot["key"], 0)) for spot in checkout_spots) <= 0:
+        raise PaymentError(no_tunnels_message(tariff, checkout_spots, readiness, tg_id))
     if tariff["price"] <= 0:
         if trial_available_for(tg_id):
             raise PaymentError("Этот тариф бесплатный — просто получи тестовый ключ командой /test_vpn.")
@@ -6395,21 +6407,98 @@ def tariff_summary_lines(tariff: dict) -> str:
     )
 
 
-def server_pick_text(kind: str, level: int) -> str:
+async def location_readiness(tariff: dict, protocols: list[str] | None = None) -> dict[str, int] | None:
+    """
+    Сколько туннелей тарифа реально найдено в панели по каждой локации.
+
+    Нужно до оплаты: если на выбранном сервере нет ни одного подключения под
+    протоколы клиента, ключ выдать нечем — счёт выставлять нельзя. None означает
+    «панель недоступна, проверить не удалось»: тогда продажу не блокируем, а работаем
+    как раньше (разберётся выдача).
+    """
+    chosen = [key for key in (protocols or []) if key in PROTOCOL_ORDER]
+    if not chosen:
+        chosen = default_protocols(tariff, list(PROTOCOL_ORDER))
+    inbounds = await fetch_inbounds_cached()
+    if not inbounds:
+        return None
+    ready: dict[str, int] = {}
+    for spot in configured_locations():
+        count = 0
+        for protocol in chosen:
+            for meta in protocol_variants(protocol):
+                if match_tunnel_inbound(inbounds, spot, protocol, str(meta.get("key"))) is not None:
+                    count += 1
+        ready[spot["key"]] = count
+    return ready
+
+
+def not_ready_locations(readiness: dict[str, int] | None, spots: list[dict]) -> list[dict]:
+    """Локации из списка, где не нашлось ни одного подключения."""
+    if readiness is None:
+        return []
+    return [spot for spot in spots if int(readiness.get(spot["key"], 0)) <= 0]
+
+
+def no_tunnels_message(tariff: dict, spots: list[dict], readiness: dict[str, int] | None,
+                       viewer_id: int | None = None) -> str:
+    """Человеческое объяснение, почему оплата не начата: сервер ещё не настроен."""
+    empty = not_ready_locations(readiness, spots) or spots
+    empty_titles = ", ".join(str(spot.get("title")) for spot in empty)
+    # Предлагаем сервер, который реально работает: подсказка «выбери другой» бесполезна
+    # без названия. Берём локации вне выбранного набора, чтобы не советовать то же самое.
+    delivery_keys = {spot.get("key") for spot in spots}
+    ready_titles = [str(spot.get("title")) for spot in configured_locations()
+                    if spot.get("key") not in delivery_keys
+                    and int((readiness or {}).get(spot.get("key"), 0)) > 0]
+    lines = [
+        "🛠 <b>Сервер пока настраивается.</b>",
+        "",
+        f"В панели ещё нет подключений под выбранные протоколы для «{empty_titles}», "
+        "поэтому ключ выдать нечем. Оплату не начинаю — деньги не спишутся.",
+    ]
+    if ready_titles:
+        lines.append("")
+        lines.append("• Работает: <b>" + ", ".join(ready_titles) + "</b> — можно выбрать его.")
+    lines.append("• Если сервер нужен срочно — напиши в поддержку.")
+    if viewer_id is not None and is_admin(viewer_id):
+        lines += [
+            "",
+            "<i>Администратору: добавь подключения в панели (Inbounds → +) или привяжи "
+            "уже существующие командой /panel_map — переменные Railway не нужны. "
+            "Что бот видит сейчас — /panel_debug.</i>",
+        ]
+    return "\n".join(lines)
+
+
+def server_pick_text(kind: str, level: int, readiness: dict[str, int] | None = None,
+                     viewer_id: int | None = None) -> str:
     """Третий экран: выбор сервера для тарифа с одним сервером (уровень 1)."""
     tariff = TARIFFS[tariff_key(kind, level)]
-    return (
+    spots = configured_locations()
+    text = (
         "🌍 <b>Шаг 3. Выберите сервер:</b>\n\n"
         "В этот тариф входит один сервер — выбери, где будет твой VPN.\n\n"
         + tariff_summary_lines(tariff)
     )
+    empty = not_ready_locations(readiness, spots)
+    if empty and len(empty) < len(spots):
+        text += ("\n\n⚠️ <i>Пока настраивается: "
+                 + ", ".join(str(spot.get("title")) for spot in empty)
+                 + " — в панели ещё нет подключений, выбери другой сервер.</i>")
+    elif empty and spots:
+        text += "\n\n" + no_tunnels_message(tariff, spots, readiness, viewer_id)
+    return text
 
 
-def server_pick_kb(kind: str, level: int) -> InlineKeyboardMarkup:
+def server_pick_kb(kind: str, level: int, not_ready: tuple[str, ...] = ()) -> InlineKeyboardMarkup:
     """Кнопки выбора сервера (только для тарифов с одним сервером)."""
-    rows = [[InlineKeyboardButton(text=LOCATIONS[key]["title"],
-                                  callback_data=f"tlocs_{kind}_{level}_{key}")]
-            for key in LOCATION_ORDER]
+    rows = []
+    for key in LOCATION_ORDER:
+        title = LOCATIONS[key]["title"]
+        if key in not_ready:
+            title = f"🔥 {title} · настраивается"
+        rows.append([InlineKeyboardButton(text=title, callback_data=f"tlocs_{kind}_{level}_{key}")])
     rows.append([InlineKeyboardButton(text="◀️ Назад к уровням", callback_data=f"tkind_{kind}")])
     rows.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -8123,11 +8212,15 @@ async def show_screen(cb: CallbackQuery, text: str, keyboard: InlineKeyboardMark
         await cb.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 
-async def step3_screen(plan: dict, tariff_key_value: str) -> tuple[str, InlineKeyboardMarkup]:
+async def step3_screen(plan: dict, tariff_key_value: str,
+                       viewer_id: int | None = None) -> tuple[str, InlineKeyboardMarkup]:
     """Экран шага 3: выбор сервера у односерверного тарифа или список серверов тарифа."""
     kind, level = plan["kind"], int(plan["level"])
     if tariff_servers(plan) <= 1:
-        return server_pick_text(kind, level), server_pick_kb(kind, level)
+        readiness = await location_readiness(plan)
+        empty = tuple(spot["key"] for spot in not_ready_locations(readiness, configured_locations()))
+        return (server_pick_text(kind, level, readiness, viewer_id),
+                server_pick_kb(kind, level, empty))
     availability = await tunnel_availability(plan, None)
     text = servers_all_text(kind, level) + unavailable_locations_note(plan, availability)
     return text, servers_all_kb(kind, level)
@@ -8173,7 +8266,7 @@ async def cb_tariff_step3_back(cb: CallbackQuery):
     if plan is None:
         await cb.answer("Такого тарифа нет.", show_alert=True)
         return
-    text, keyboard = await step3_screen(plan, tariff_key_value)
+    text, keyboard = await step3_screen(plan, tariff_key_value, cb.from_user.id)
     await show_screen(cb, text, keyboard)
 
 
@@ -8186,7 +8279,7 @@ async def cb_tariff_server_screen(cb: CallbackQuery):
     if plan is None:
         await cb.answer("Такого тарифа нет.", show_alert=True)
         return
-    text, keyboard = await step3_screen(plan, tariff_key_value)
+    text, keyboard = await step3_screen(plan, tariff_key_value, cb.from_user.id)
     await show_screen(cb, text, keyboard)
 
 
@@ -8217,6 +8310,16 @@ async def cb_tariff_location(cb: CallbackQuery):
     plan = TARIFFS.get(tariff_key(kind, level))
     if plan is None:
         await cb.answer("Такого тарифа нет.", show_alert=True)
+        return
+
+    readiness = await location_readiness(plan)
+    spot = location_by_key(location_key) or {}
+    if readiness is not None and int(readiness.get(location_key, 0)) <= 0:
+        # Сервер ещё не настроен: доводить клиента до оплаты нельзя.
+        await cb.answer(f"{spot.get('short') or 'Сервер'} пока настраивается — подключений нет.",
+                        show_alert=True)
+        text, keyboard = await step3_screen(plan, tariff_key(kind, level), cb.from_user.id)
+        await show_screen(cb, text, keyboard)
         return
 
     text, keyboard = await protocol_screen(cb.from_user.id, plan, tariff_key(kind, level), location_key)

@@ -809,6 +809,89 @@ async def test_panel_map_command(store_file):
 
 
 
+# ---------------- 3д. Сервер без подключений: счёт не выставляем ----------------
+
+async def test_not_ready_location(store_file):
+    print("\n▶ 3д. Сервер без подключений: покупка не начинается, деньги не списываются")
+    reset_all()
+    bot = new_bot({"mode": "platega", "admin_tools": "1"}, store_file + ".notready")
+    # В панели нет ни одного подключения Варшавы (частый случай: сервер ещё настраивают).
+    removed = [item for item in list(ALL_INBOUNDS) if item["remark"].startswith("Warsaw")]
+    for item in removed:
+        ALL_INBOUNDS.remove(item)
+    bot._INBOUNDS_CACHE.update({"at": 0.0, "items": []})
+    try:
+        # Шаг 3 у «Новичка»: Варшава помечена как ненастроенная
+        await bot.cb_tariff_level(_FakeCallback(bot, "tlvl_time_1"))
+        step3_text = plain(last_edit().get("text", ""))
+        check("шаг 3 предупреждает, что Варшава ещё настраивается",
+              "Пока настраивается: 🇵🇱 Варшава" in step3_text
+              and "нет подключений" in step3_text,
+              step3_text[-200:].replace("\n", " "))
+        check("кнопка ненастроенного сервера помечена",
+              any("настраивается" in text for text in _button_texts()),
+              str(_button_texts()))
+        check("настроенный сервер в кнопках остался обычным",
+              "🇸🇪 Стокгольм" in _button_texts(), str(_button_texts()))
+
+        # Тап по Варшаве не ведёт к выбору протоколов
+        TG["calls"].clear()
+        cb = _FakeCallback(bot, "tlocs_time_1_warsaw")
+        await bot.cb_tariff_location(cb)
+        check("тап по ненастроенному серверу: подсказка вместо шага 4",
+              any("настраивается" in answer for answer in cb.answers), str(cb.answers))
+        check("экран остался шагом 3",
+              "Шаг 3. Выберите сервер" in plain(last_edit().get("text", "")))
+        check("выбор протоколов не начался", not bot.PROTOCOL_SELECTION.get(TG_TG_ID))
+
+        # Даже если кнопка старая: счёт не выставляется и заказ не создаётся
+        TG["calls"].clear()
+        await bot.cb_buy_at(_FakeCallback(bot, "buyat_time_1_warsaw"))
+        buy_text = plain(tp._last_api_text())
+        check("оплата ненастроенного сервера не начинается",
+              "Сервер пока настраивается" in buy_text and "деньги не спишутся" in buy_text,
+              buy_text[:200].replace("\n", " "))
+        check("в сообщении предложен работающий сервер",
+              "Стокгольм" in buy_text, buy_text[:220].replace("\n", " "))
+        check("заказ не создан — деньги списать не с чего", not bot.payment_store.orders,
+              str(list(bot.payment_store.orders)))
+
+        # Тот же предохранитель для /test_pay
+        test_bot = new_bot({"mode": "platega", "allow_test_pay": "1", "admin_tools": "1"},
+                           store_file + ".notready.test")
+        try:
+            await test_bot.cmd_test_pay(make_message(test_bot, text="/test_pay time_1 warsaw"))
+            check("тестовая выдача на ненастроенный сервер тоже не проходит",
+                  "Сервер пока настраивается" in plain(tp._last_api_text()),
+                  plain(tp._last_api_text())[:160].replace("\n", " "))
+            check("тестовый заказ не создан", not test_bot.payment_store.orders)
+        except Exception as exc:
+            check("тестовая выдача на ненастроенный сервер отклонена понятной ошибкой",
+                  False, f"{type(exc).__name__}: {exc}")
+
+        # Рабочий сервер по-прежнему продаётся: заказ создаётся
+        TG["calls"].clear()
+        await bot.cb_buy_at(_FakeCallback(bot, "buyat_time_1_stockholm"))
+        check("настроенный сервер оплачивается как обычно",
+              len(bot.payment_store.orders) == 1, str(list(bot.payment_store.orders)))
+    finally:
+        for item in removed:
+            if item not in ALL_INBOUNDS:
+                ALL_INBOUNDS.append(item)
+        bot._INBOUNDS_CACHE.update({"at": 0.0, "items": []})
+
+
+def _button_texts() -> list:
+    """Подписи кнопок последнего экрана (sendMessage: словарь, edit: объект)."""
+    for call in reversed(TG["calls"]):
+        markup = call["params"].get("reply_markup")
+        if markup is None:
+            continue
+        if isinstance(markup, dict):
+            return [b.get("text") or "" for row in markup.get("inline_keyboard", []) for b in row]
+        return [b.text for row in markup.inline_keyboard for b in row]
+    return []
+
 # ---------------- 4. Тариф «по трафику» ----------------
 
 async def test_traffic_tariff(store_file):
@@ -1014,6 +1097,7 @@ async def main():
         await test_test_pay(store_for("testpay"))
         await test_inbounds_diag(store_for("diag"))
         await test_panel_map_command(store_for("panelmap"))
+        await test_not_ready_location(store_for("notready"))
     finally:
         for runner in runners:
             await runner.cleanup()
