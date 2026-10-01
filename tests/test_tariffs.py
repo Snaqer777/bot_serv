@@ -28,7 +28,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from aiohttp import web
-from panel import ALL_INBOUNDS, client_of, clients_named, load_bot, make_app, reset
+from panel import (ALL_INBOUNDS, _tunnel_inbound, client_of, clients_named, load_bot,
+                   make_app, reset)
 import test_payments as tp
 from test_payments import (TG, TG_TG_ID, check, make_message, new_bot, reset_all,
                            tg_calls, _FakeCallback, post_platega_callback)
@@ -453,6 +454,111 @@ async def _delivery_level4(bot, email):
           [line for line in profile_text.split("\n") if "Туннелей" in line or "получает" in line])
 
 
+# ---------------- 3б. Чего нет в панели: отчёт, а не тишина ----------------
+
+async def test_missing_tunnels(store_file):
+    print("\n▶ 3б. Нет подключений в панели: покупателю выдаём что есть, админу — отчёт")
+    reset_all()
+    # Покупатель — 4242, админ — тоже он и 777: уведомление уйдёт в чат 777,
+    # поэтому его можно прочитать отдельно от сообщений покупателя.
+    bot = new_bot({"mode": "platega", "admin_id": f"{TG_TG_ID}, 777"}, store_file + ".missing")
+    runner = await bot.run_webhook_server()
+    email = f"tg-paid-{TG_TG_ID}"
+    # Убираем из панели всю Варшаву и один вариант Стокгольма.
+    removed = [item for item in list(ALL_INBOUNDS)
+               if item["remark"].startswith("Warsaw") or item["remark"] == "Stockholm-Hysteria2"]
+    for item in removed:
+        ALL_INBOUNDS.remove(item)
+    try:
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "time_4")
+        order = [o for o in bot.payment_store.orders.values()][-1]
+        status, body = await post_platega_callback(order["id"], order["amount_rub"], transaction_id="701010")
+        check("оплата подтверждена, несмотря на неполную панель",
+              status == 200 and body.strip() == "ok")
+        subs = clients_named(email)
+        check("выданы туннели, которые есть: 8 из Стокгольма (9 туннелей минус Hysteria2)",
+              len(subs) == 8, f"записей: {len(subs)}")
+        check("в подписке нет ни одного клиента Варшавы",
+              not any(c["id"] in {i["id"] for i in removed} for c in subs))
+
+        admin_text = "".join(m["params"].get("text", "") for m in tg_calls("sendMessage")
+                             if str(m["params"].get("chat_id")) == "777")
+        check("админу пришёл отчёт о ненайденных подключениях",
+              "Не найдены подключения в панели" in admin_text
+              and "Варшава · VLESS Reality + XHTTP" in admin_text,
+              [line for line in admin_text.split("\n") if "Варшава ·" in line][:2])
+        check("в отчёте админу указаны переменные для подключений",
+              "XUI_INBOUND_WARSAW_VLESS_XHTTP" in admin_text
+              and "XUI_INBOUND_WARSAW_SHADOWSOCKS_AES128" in admin_text)
+        check("админ видит, что туннелей выдано меньше оплаченного, и подсказку про /panel_debug",
+              "8 из 18" in admin_text and "/panel_debug" in admin_text,
+              [line for line in admin_text.split("\n") if "Туннелей" in line])
+
+        buyer_text = [m["params"]["text"] for m in tg_calls("sendMessage")
+                      if str(m["params"].get("chat_id")) == str(TG_TG_ID)
+                      and "Оплата получена" in m["params"].get("text", "")][-1]
+        check("покупатель видит, что выдали не все туннели, и куда писать",
+              "выдано 8 из 18" in buyer_text and "поддерж" in buyer_text.lower(),
+              [line for line in buyer_text.split("\n") if "выдано" in line][:1])
+
+        await bot.cmd_panel_debug(make_message(bot, text="/panel_debug"))
+        debug_text = "".join(m["params"].get("text", "") for m in tg_calls("sendMessage"))
+        check("/panel_debug показывает «ни одного подключения» для выпавшей локации",
+              "Варшава: найдено 0 из 9" in debug_text
+              and "ни одного подключения этой локации" in debug_text,
+              [line for line in debug_text.split("\n") if "Варшава: найдено" in line][:1])
+        check("/panel_debug перечисляет ненайденное с переменными",
+              "Не хватает подключений" in debug_text
+              and "Варшава · AmneziaWG — <code>XUI_INBOUND_WARSAW_AMNEZIAWG</code>" in debug_text,
+              [line for line in debug_text.split("\n") if "AmneziaWG —" in line][:1])
+        check("/panel_debug считает итог по туннелям",
+              "Итого туннелей: 8 из 18" in debug_text,
+              [line for line in debug_text.split("\n") if "Итого" in line][:1])
+        # Покупатель на шаге 3 видит, что Варшава ещё настраивается
+        reset_all()
+        bot2 = new_bot({"mode": "platega"}, store_file + ".note")
+        await bot2.cb_tariff_level(_FakeCallback(bot2, "tlvl_time_3"))
+        step3 = tp.tg_calls("editMessageText")[-1]["params"]["text"]
+        check("шаг 3 предупреждает, что сервер ещё настраивается",
+              "Пока настраивается" in step3 and "Варшава" in step3,
+              [line for line in step3.split("\n") if "настраивается" in line][:1])
+        check("шаг 3 при этом продолжает работать: оба сервера и кнопка «Дальше» на месте",
+              "Стокгольм" in step3 and any(
+                  b.callback_data == "tsall_time_3"
+                  for row in tp.tg_calls("editMessageText")[-1]["params"]["reply_markup"].inline_keyboard
+                  for b in row))
+    finally:
+        ALL_INBOUNDS.extend(removed)
+        await runner.cleanup()
+
+
+async def test_duplicate_inbound(store_file):
+    print("\n▶ 3в. Один inbound на два варианта: второй не выдаём и предупреждаем")
+    reset_all()
+    bot = new_bot({"mode": "platega"}, store_file + ".dup")
+    runner = await bot.run_webhook_server()
+    email = f"tg-paid-{TG_TG_ID}"
+    # Варшавский XHTTP подключён тем же ID, что и Reality (частая ошибка настройки)
+    duplicate = next(item for item in ALL_INBOUNDS if item["remark"] == "Warsaw-VLESS-XHTTP")
+    original_id = duplicate["id"]
+    duplicate["id"] = int(next(i["id"] for i in ALL_INBOUNDS if i["remark"] == "Warsaw-Reality"))
+    try:
+        info = await bot.activate_paid_subscription(
+            TG_TG_ID, "time_4", order_id="dup-1", payment_ref="dup-ref",
+            protocols=["vless"],
+        )
+        check("дубликат не заводят дважды: выданы Reality, gRPC и оба Стокгольма",
+              len(info["entries"]) == 5, f"записей: {len(info['entries'])}")
+        check("в отчёте помечено, что XHTTP указывает на то же подключение",
+              any("то же подключение" in item.get("reason", "") for item in info["missing"]),
+              str([item.get("reason") for item in info["missing"]]))
+        check("подсказка называет переменную для XHTTP",
+              any(item.get("env") == "XUI_INBOUND_WARSAW_VLESS_XHTTP" for item in info["missing"]))
+    finally:
+        duplicate["id"] = original_id
+        await runner.cleanup()
+
+
 # ---------------- 4. Тариф «по трафику» ----------------
 
 async def test_traffic_tariff(store_file):
@@ -586,6 +692,28 @@ async def test_inbounds_diag(store_file):
     finally:
         ALL_INBOUNDS.append(removed)
 
+    # Варианты, как их называет сама панель: методы формата 2022-blake3-*,
+    # транспорт splithttp и grpcSettings — бот должен узнавать и их
+    panel_style = [
+        _tunnel_inbound(101, "Stockholm-SS-A", 8501, protocol="shadowsocks",
+                        network="tcp", security="none", method="2022-blake3-aes-128-gcm"),
+        _tunnel_inbound(102, "Stockholm-SS-B", 8502, protocol="shadowsocks",
+                        network="tcp", security="none", method="2022-blake3-aes-256-gcm"),
+        _tunnel_inbound(103, "Stockholm-SS-C", 8503, protocol="shadowsocks",
+                        network="tcp", security="none", method="2022-blake3-chacha20-poly1305"),
+        _tunnel_inbound(104, "Stockholm-X", 8504, network="splithttp"),
+        _tunnel_inbound(105, "Stockholm-G", 8505, network="tcp",
+                        security="reality"),
+    ]
+    variant_map = {int(item["id"]): bot.inbound_variant_key(item, "shadowsocks")
+                   for item in panel_style[:3]}
+    check("методы панели 2022-blake3-* раскладываются по вариантам Shadowsocks",
+          variant_map == {101: "aes128", 102: "aes256", 103: "chacha20"}, str(variant_map))
+    check("транспорт splithttp считается вариантом XHTTP",
+          bot.inbound_protocol_key(panel_style[3]) == "vless"
+          and bot.inbound_variant_key(panel_style[3], "vless") == "xhttp",
+          f"{bot.inbound_protocol_key(panel_style[3])}/{bot.inbound_variant_key(panel_style[3], 'vless')}")
+
     # Диагностика — на свежем модуле (после reload'ов выше)
     bot = new_bot({"mode": "platega", "admin_tools": "1", "allow_test_pay": "1"},
                   store_file + ".diag")
@@ -629,6 +757,8 @@ async def main():
         await test_catalog(store_for("catalog"))
         await test_four_steps(store_for("steps"))
         await test_delivery_tunnels(store_for("delivery"))
+        await test_missing_tunnels(store_for("missing"))
+        await test_duplicate_inbound(store_for("duplicate"))
         await test_traffic_tariff(store_for("traffic"))
         await test_test_pay(store_for("testpay"))
         await test_inbounds_diag(store_for("diag"))

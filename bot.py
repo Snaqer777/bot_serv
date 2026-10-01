@@ -3943,24 +3943,45 @@ async def activate_paid_subscription(
             sub_id = secrets.token_hex(8)
 
         # Что выдаём: подключение на каждую пару «сервер + вариант протокола».
+        # Если чего-то нет в панели — не молчим: собираем список пропущенного,
+        # чтобы показать его админу (клиент мог оплатить тариф с большим числом туннелей).
         targets: list[tuple[dict, str, str, dict]] = []
+        missing: list[dict] = []
+        used_inbounds: dict[int, str] = {}
         for spot in spots:
             for protocol in chosen:
                 for meta in protocol_variants(protocol):
                     variant = str(meta.get("key"))
+                    title = variant_title(protocol, variant)
+                    env_name = tunnel_env_name(spot.get("key", ""), protocol, variant)
                     matched = match_tunnel_inbound(inbounds, spot, protocol, variant)
                     if matched is None or not matched.get("id"):
-                        logger.warning(
-                            "Заказ %s: туннель %s в %s недоступен — пропускаю.",
-                            order_id, variant_title(protocol, variant), spot.get("title"),
-                        )
+                        logger.warning("Заказ %s: туннель %s в %s не найден в панели — пропускаю.",
+                                       order_id, title, spot.get("title"))
+                        missing.append({"location_title": spot.get("title"), "title": title,
+                                        "reason": "не найдено подключение", "env": env_name,
+                                        "inbound_id": 0})
+                        continue
+                    inbound_id = int(matched.get("id"))
+                    if inbound_id in used_inbounds:
+                        # Один inbound на два варианта: второй раз клиента туда не заводим.
+                        logger.warning("Заказ %s: подключение #%s уже занято туннелем «%s» — "
+                                       "для «%s» нужен отдельный inbound.",
+                                       order_id, inbound_id, used_inbounds[inbound_id], title)
+                        missing.append({"location_title": spot.get("title"), "title": title,
+                                        "reason": f"то же подключение, что «{used_inbounds[inbound_id]}»",
+                                        "env": env_name, "inbound_id": inbound_id})
                         continue
                     try:
-                        inbound = await client.get_inbound(int(matched.get("id")))
+                        inbound = await client.get_inbound(inbound_id)
                     except Exception as exc:
                         logger.warning("Заказ %s: подключение #%s недоступно (%s) — пропускаю.",
-                                       order_id, matched.get("id"), exc)
+                                       order_id, inbound_id, exc)
+                        missing.append({"location_title": spot.get("title"), "title": title,
+                                        "reason": f"панель не отдала подключение #{inbound_id}",
+                                        "env": env_name, "inbound_id": inbound_id})
                         continue
+                    used_inbounds[inbound_id] = title
                     targets.append((spot, protocol, variant, inbound))
 
         if not targets:
@@ -4088,6 +4109,8 @@ async def activate_paid_subscription(
     tunnels = tunnels_from_entries(entries)
     return {
         "email": target_email,
+        "missing": missing,
+        "expected": len(targets) + len(missing),
         "already": all(entry["status"] == "already" for entry in entries),
         "status": primary["status"],
         "expiry_ms": primary["expiry_ms"],
@@ -4139,6 +4162,31 @@ def tunnels_from_entries(entries: list[dict]) -> list[dict]:
         if title and title not in index[key]["location_titles"]:
             index[key]["location_titles"].append(title)
     return summary
+
+
+def missing_tunnels_text(missing: list[dict], *, limit: int = 12) -> str:
+    """
+    Строка для админа: чего не нашлось в панели и какой переменной это лечится.
+
+    Молча выдать половину туннелей нельзя: клиент оплатил тариф с большим числом
+    туннелей, поэтому админ сразу видит список и подсказку по подключениям.
+    """
+    if not missing:
+        return ""
+    lines = ["⚠️ <b>Не найдены подключения в панели:</b>"]
+    for item in missing[:limit]:
+        lines.append(f"• {escape(str(item.get('location_title') or ''))} · "
+                     f"{escape(str(item.get('title') or ''))} — {escape(str(item.get('reason') or ''))}")
+    if len(missing) > limit:
+        lines.append(f"• …и ещё {len(missing) - limit}")
+    env_names = sorted({str(item.get("env") or "") for item in missing if item.get("env")})
+    if env_names:
+        lines.append("")
+        lines.append("Создай входящие подключения в панели или задай их ID переменными:")
+        lines.append(" ".join(f"<code>{name}</code>" for name in env_names[:10]))
+        if len(env_names) > 10:
+            lines.append(f"<i>…и ещё {len(env_names) - 10} переменных — полный список в /panel_debug</i>")
+    return "\n".join(lines)
 
 
 def tunnels_summary_text(entries: list[dict], *, limit: int | None = None) -> str:
@@ -4353,9 +4401,18 @@ def order_paid_message(order: dict, info: dict) -> str:
     served = " + ".join(servers)
     protocols_served = info.get("protocols_label") or protocols_label(tariff)
     tunnels_block = tunnels_summary_text(info.get("entries") or [])
+    missing_count = len(info.get("missing") or [])
+    if missing_count:
+        partial_note = (f"ℹ️ <b>Туннелей выдано {len(info.get('entries') or [])} из "
+                        f"{info.get('expected') or len(info.get('entries') or [])}.</b> "
+                        "Часть подключений ещё настраивается — они появятся в подписке "
+                        "автоматически, а если что-то не работает, напиши в поддержку.\n\n")
+    else:
+        partial_note = ""
     tunnels_line = (
         f"🧩 <b>Протоколы:</b> {protocols_served}\n"
         + ((tunnels_block + "\n\n") if tunnels_block else "")
+        + partial_note
     )
 
     return (
@@ -4428,11 +4485,15 @@ async def notify_payment_success(order: dict, info: dict) -> bool:
             header
             + f"• Тариф: {order['tariff_name']}\n"
             f"• Протоколы: {escape(info.get('protocols_label') or protocols_label(info.get('tariff') or {}))}\n"
-            f"• Туннелей: {len(info.get('entries') or [])}\n"
+            f"• Туннелей: {len(info.get('entries') or [])}"
+            + (f" из {info.get('expected')}" if info.get("missing") else "") + "\n"
             f"• Пользователь: <code>{order['tg_id']}</code>\n"
             f"• Заказ: <code>{order['id']}</code>\n"
             f"• Действует до: <code>{format_date(info['expiry_ms'])}</code>"
             + access_note
+            + (("\n\n" + missing_tunnels_text(info.get("missing") or []))
+               if info.get("missing") else "")
+            + ("\n\nПолная карта подключений: /panel_debug" if info.get("missing") else "")
         )
 
     return delivered
@@ -5318,15 +5379,16 @@ PROTOCOLS = {
             {"key": "aes128", "title": "Shadowsocks-2022 · AES-128-GCM",
              "hint": "Лёгкий и быстрый", "env": "SHADOWSOCKS_AES128",
              "aliases": ("aes-128", "aes128", "aes_128"),
-             "methods": ("aes-128-gcm",)},
+             "methods": ("aes-128-gcm", "2022-blake3-aes-128-gcm")},
             {"key": "aes256", "title": "Shadowsocks-2022 · AES-256-GCM",
              "hint": "Усиленное шифрование", "env": "SHADOWSOCKS_AES256",
              "aliases": ("aes-256", "aes256", "aes_256"),
-             "methods": ("aes-256-gcm",)},
+             "methods": ("aes-256-gcm", "2022-blake3-aes-256-gcm")},
             {"key": "chacha20", "title": "Shadowsocks-2022 · ChaCha20-Poly1305",
              "hint": "Быстр на слабом процессоре", "env": "SHADOWSOCKS_CHACHA20",
              "aliases": ("chacha20", "chacha"),
-             "methods": ("chacha20-poly1305", "chacha20-ietf-poly1305")},
+             "methods": ("chacha20-poly1305", "chacha20-ietf-poly1305",
+                         "2022-blake3-chacha20-poly1305")},
         ),
     },
 }
@@ -6132,6 +6194,23 @@ def servers_all_text(kind: str, level: int) -> str:
     )
 
 
+def unavailable_locations_note(tariff: dict, availability: dict[str, dict[str, list[str]]]) -> str:
+    """
+    Предупреждение для экрана серверов: какие локации тарифа пока не настроены.
+
+    Если панель недоступна, доступность подставляется «всё есть» — тогда молчим,
+    чтобы не пугать покупателя ложной тревогой.
+    """
+    spots = tariff_locations(tariff)
+    prepared = {key for variants in availability.values()
+                for places in variants.values() for key in places}
+    missing = [spot["title"] for spot in spots if spot["key"] not in prepared]
+    if not missing or len(missing) == len(spots):
+        return ""
+    return ("\n\n⚠️ <i>Пока настраивается: " + ", ".join(missing)
+            + " — доступ на этом сервере появится позже, в подписке он обновится сам.</i>")
+
+
 def servers_all_kb(kind: str, level: int) -> InlineKeyboardMarkup:
     """Кнопки третьего экрана для уровней 2–4: дальше — протоколы."""
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -6185,7 +6264,7 @@ def tunnel_env_inbound_id(location_key: str, protocol: str, variant: str) -> int
 
 
 def inbound_network(inbound: dict) -> str:
-    """Транспорт подключения из streamSettings (tcp, xhttp, grpc, …)."""
+    """Транспорт подключения из streamSettings (tcp, xhttp, splithttp, grpc, …)."""
     stream = as_dict(inbound.get("streamSettings"))
     return str(stream.get("network") or "").strip().lower()
 
@@ -6213,28 +6292,45 @@ def inbound_protocol_key(inbound: dict) -> str | None:
         return "shadowsocks"
     if protocol in ("wireguard", "wg") or re.search(r"(wireguard|\bwg\b)", remark):
         return "wireguard"
-    if protocol in ("vless", "vmess") or re.search(r"(vless|reality|xhttp|grpc|xtls)", remark):
+    if protocol in ("vless", "vmess") or re.search(r"(vless|reality|xhttp|splithttp|grpc|xtls)", remark):
         return "vless"
     return None
 
 
 def inbound_variant_key(inbound: dict, protocol: str) -> str | None:
-    """Какому варианту протокола соответствует подключение (по транспорту, шифру, названию)."""
+    """
+    Какому варианту протокола соответствует подключение.
+
+    Вариант определяется по названию подключения, а если там ничего нет — по
+    настройкам: у VLESS это транспорт (xhttp / splithttp / grpc / tcp-raw для
+    Reality), у Shadowsocks-2022 — метод шифрования, включая панельные названия
+    вида «2022-blake3-aes-128-gcm».
+    """
     remark = inbound_remark_lower(inbound)
     if protocol == "vless":
+        # Название важнее настроек: «Warsaw-VLESS-gRPC» указывает на вариант явно.
+        for meta in protocol_variants("vless"):
+            if any(str(alias) in remark for alias in meta.get("aliases") or ()):
+                return str(meta.get("key"))
+        stream = as_dict(inbound.get("streamSettings"))
         network = inbound_network(inbound)
-        if network == "xhttp":
+        if network in ("xhttp", "splithttp") or stream.get("xhttpSettings") or stream.get("splithttpSettings"):
             return "xhttp"
-        if network == "grpc":
+        if network == "grpc" or stream.get("grpcSettings"):
             return "grpc"
-        if network in ("tcp", "raw", ""):
+        if network in ("tcp", "raw", "", "none"):
             return "reality"
         return None
     if protocol == "shadowsocks":
         method = inbound_method(inbound)
-        for meta in protocol_variants("shadowsocks"):
-            if method and method in [str(value).lower() for value in meta.get("methods") or ()]:
-                return str(meta.get("key"))
+        if method:
+            # «2022-blake3-aes-256-gcm» — подстрока важнее точного совпадения:
+            # панель называет методы по-своему, и полного равенства тут не добиться.
+            for meta in protocol_variants("shadowsocks"):
+                needles = [str(value).lower() for value in meta.get("methods") or ()]
+                needles += [str(alias).lower() for alias in meta.get("aliases") or ()]
+                if any(needle and needle in method for needle in needles):
+                    return str(meta.get("key"))
         for meta in protocol_variants("shadowsocks"):
             if any(str(alias) in remark for alias in meta.get("aliases") or ()):
                 return str(meta.get("key"))
@@ -6287,9 +6383,12 @@ def match_tunnel_inbound(inbounds: list[dict], spot: dict, protocol: str,
         for inbound in inbounds:
             if inbound_is_plain_location(inbound, spot):
                 return inbound
+        # Общий XUI_INBOUND_ID берём только когда он и правда про эту локацию:
+        # иначе Варшава получила бы стокгольмское подключение (и наоборот).
         fallback = next((item for item in inbounds
                          if int(item.get("id") or 0) == int(XUI_INBOUND_ID or 0)), None)
-        if fallback is not None:
+        if fallback is not None and (inbound_matches_location(fallback, spot)
+                                     or len(configured_locations()) <= 1):
             return fallback
     return None
 
@@ -7201,13 +7300,23 @@ async def cmd_panel_debug(message: Message):
                             for item in inbounds[:24])
             )
             lines.append("   🧩 <b>Туннели (локация × вариант протокола):</b>")
+            missing_tunnels: list[tuple[str, str, str, str]] = []
             for key in LOCATION_ORDER:
                 spot = LOCATIONS[key]
+                found_here = 0
                 for protocol in PROTOCOL_ORDER:
                     parts = []
                     for meta in protocol_variants(protocol):
                         variant = str(meta.get("key"))
                         matched = match_tunnel_inbound(inbounds, spot, protocol, variant)
+                        if matched:
+                            found_here += 1
+                        else:
+                            missing_tunnels.append((
+                                str(spot.get("title")), protocol_title(protocol),
+                                variant_title(protocol, variant),
+                                tunnel_env_name(key, protocol, variant),
+                            ))
                         parts.append(
                             f"{variant_title(protocol, variant)}: "
                             + (f"#{matched.get('id')}"
@@ -7215,6 +7324,9 @@ async def cmd_panel_debug(message: Message):
                         )
                     lines.append(f"      {spot['title']} · {protocol_title(protocol)}: "
                                  + ", ".join(parts))
+                expected_here = sum(protocol_variant_count(protocol) for protocol in PROTOCOL_ORDER)
+                note = "" if found_here else " — ⚠️ ни одного подключения этой локации не найдено"
+                lines.append(f"      <i>{spot['title']}: найдено {found_here} из {expected_here}{note}</i>")
                 lines.append("")
             availability_note = []
             for protocol in PROTOCOL_ORDER:
@@ -7224,6 +7336,23 @@ async def cmd_panel_debug(message: Message):
                 expected = len(LOCATION_ORDER) * protocol_variant_count(protocol)
                 availability_note.append(f"{protocol_title(protocol)}: {found}/{expected}")
             lines.append("   🧩 <b>Найдено подключений:</b> " + "; ".join(availability_note))
+            total_expected = len(LOCATION_ORDER) * sum(
+                protocol_variant_count(protocol) for protocol in PROTOCOL_ORDER)
+            total_found = total_expected - len(missing_tunnels)
+            lines.append(f"   <b>Итого туннелей: {total_found} из {total_expected}</b>"
+                         + ("" if not missing_tunnels else
+                            " — покупателю предлагаются только найденные"))
+            if missing_tunnels:
+                lines.append("")
+                lines.append("   ⚠️ <b>Не хватает подключений (создай в панели или задай ID переменной):</b>")
+                for location_title, protocol_name, variant_name, env_name in missing_tunnels[:20]:
+                    lines.append(f"      • {location_title} · {variant_name} — "
+                                 f"<code>{env_name}</code>")
+                if len(missing_tunnels) > 20:
+                    lines.append(f"      • …и ещё {len(missing_tunnels) - 20}")
+                lines.append("      <i>Созданные подключения называй как «Stockholm-VLESS-XHTTP» "
+                             "или «Warsaw-Shadowsocks-AES-256» — бот найдёт их сам.</i>")
+                lines.append("")
             declared = max(TARIFF_LEVELS[level]["servers"] for level in TARIFF_LEVEL_ORDER)
             if len(configured_locations()) < declared:
                 lines.append(
@@ -7442,7 +7571,9 @@ async def cb_tariff_level(cb: CallbackQuery):
     if tariff_servers(plan) <= 1:
         await show_screen(cb, server_pick_text(kind, level), server_pick_kb(kind, level))
     else:
-        await show_screen(cb, servers_all_text(kind, level), servers_all_kb(kind, level))
+        availability = await tunnel_availability(plan, None)
+        text = servers_all_text(kind, level) + unavailable_locations_note(plan, availability)
+        await show_screen(cb, text, servers_all_kb(kind, level))
 
 
 @dp.callback_query(F.data.startswith("tsall_"))
