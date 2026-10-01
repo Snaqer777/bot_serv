@@ -2647,19 +2647,24 @@ async def extend_subscription_days(tg_id: int, days: int) -> dict | None:
     if not sub or not sub.get("client"):
         return None
 
-    client_row = dict(sub["client"])
-    inbound = sub["inbound"]
+    entries = sub.get("entries") or [sub]
     now_ms = int(time.time() * 1000)
-    current_expiry = int(client_row.get("expiryTime") or 0)
+    # Срок у всех туннелей подписки должен быть один: считаем от самой поздней даты.
+    current_expiry = max(int((entry.get("client") or {}).get("expiryTime") or 0)
+                         for entry in entries)
     base_ms = max(now_ms, current_expiry)          # продлеваем от конца оплаченного срока
     new_expiry = base_ms + days * 86400 * 1000
 
-    client_row["expiryTime"] = new_expiry
-    client_row["enable"] = True
-    client_row["comment"] = comment_with_new_expiry(client_row.get("comment"), new_expiry)
-
     async with XUIClient() as client:
-        await client.update_client(inbound.get("id"), client_row)
+        for entry in entries:
+            client_row = dict(entry.get("client") or {})
+            inbound = entry.get("inbound") or {}
+            if not client_row or not inbound.get("id"):
+                continue
+            client_row["expiryTime"] = new_expiry
+            client_row["enable"] = True
+            client_row["comment"] = comment_with_new_expiry(client_row.get("comment"), new_expiry)
+            await client.update_client(inbound.get("id"), client_row)
 
     logger.info("Подписка %s продлена на %s дней (без оплаты) — реферальный бонус.", tg_id, days)
     return {"expiry_ms": new_expiry, "days": days}
@@ -3881,6 +3886,7 @@ def _paid_client_payload(
     comment: str,
     sub_id: str = "",
     group_name: str = "",
+    email: str | None = None,
 ) -> dict:
     """Payload платного клиента: лимиты и срок берутся из тарифа."""
     stream = as_dict(inbound.get("streamSettings"))
@@ -3890,7 +3896,7 @@ def _paid_client_payload(
 
     payload = {
         "id": client_uuid,
-        "email": f"tg-paid-{telegram_id}",
+        "email": str(email or paid_subscription_email(telegram_id)),
         "flow": flow,
         "enable": True,
         "limitIp": int(tariff["ip_limit"]),
@@ -3904,6 +3910,26 @@ def _paid_client_payload(
     if XUI_CLIENT_GROUP and group_name:
         payload["group"] = group_name
     return payload
+
+
+def paid_subscription_email(telegram_id: int, index: int = 1) -> str:
+    """Email подписки в панели: «tg-paid-<id>», затем «tg-paid-<id>-2», «-3», …"""
+    number = max(1, int(index))
+    return (f"tg-paid-{int(telegram_id)}" if number == 1
+            else f"tg-paid-{int(telegram_id)}-{number}")
+
+
+def paid_email_pattern(telegram_id: int) -> re.Pattern:
+    """Регэксп email'ов подписок пользователя: чужой id не совпадает (12 — не 123)."""
+    return re.compile(rf"^tg-paid-{int(telegram_id)}(?:-(\d+))?$")
+
+
+def paid_subscription_index(email: str | None, telegram_id: int) -> int | None:
+    """Номер подписки пользователя по email клиента панели (None — это чужой email)."""
+    match = paid_email_pattern(telegram_id).match(str(email or "").strip())
+    if not match:
+        return None
+    return int(match.group(1) or 1)
 
 
 def comment_has_payment_ref(comment: str | None, payment_ref: str) -> bool:
@@ -3969,6 +3995,7 @@ async def activate_paid_subscription(
     extra_days: int = 0,
     location_key: str | None = None,
     protocols: list[str] | None = None,
+    sub_email: str | None = None,
 ) -> dict:
     """
     Создаёт или продлевает платную подписку в 3x-ui по оплаченному заказу.
@@ -3982,6 +4009,11 @@ async def activate_paid_subscription(
     Если срок тарифа не ограничен (тип «по трафику»), expiryTime = 0: подписка
     действует, пока не израсходован трафик, а реферальные бонусы (дни) задают срок.
 
+    Каждая покупка — новая подписка: своя ссылка (subId), свои лимиты и свой срок.
+    Прежние подписки не трогаем — они работают до своего срока, поэтому новая покупка
+    ничего не «подмешивает» в старые туннели. sub_email используется, когда нужно
+    дополнить конкретную подписку (/reissue) или когда вебхук пришёл повторно.
+
     Идемпотентно: если в комментарии клиента уже стоит этот платёж, повторная
     выдача не происходит (защита от дублей вебхука и перезапуска бота).
     extra_days — реферальный бонус приглашённого; к ним добавляются накопленные
@@ -3989,7 +4021,12 @@ async def activate_paid_subscription(
     Возвращает словарь с доступом, сроком и списком выданных туннелей.
     """
     tariff = TARIFFS[tariff_key]
-    target_email = f"tg-paid-{telegram_id}"
+    # Какой подписке принадлежит эта выдача: у повторного вебхука и у /reissue —
+    # своя (сохранена в заказе), у новой покупки — новая.
+    order = await payment_store.get(order_id) if order_id else None
+    reused_email = str(sub_email or (order or {}).get("email") or "").strip()
+    target_email = reused_email
+    previous_expiry_ms = 0
     bonus_days = max(0, int(extra_days))
     pending_bonus = referral_store.pending_days(telegram_id) if REFERRAL_ENABLED else 0
     bonus_days += pending_bonus
@@ -4015,6 +4052,26 @@ async def activate_paid_subscription(
     async with XUIClient() as client:
         group_name, group_state = await client.resolve_client_group()
         inbounds = await client.get_inbounds()
+
+        if not target_email:
+            # Новая покупка — новая подписка. Ищем номер, который ещё свободен:
+            # tg-paid-<id>, затем tg-paid-<id>-2, -3, … (в панели они не пересекаются).
+            used_indexes = set()
+            for inbound in inbounds:
+                settings = as_dict(inbound.get("settings"))
+                for candidate in settings.get("clients") or []:
+                    if not isinstance(candidate, dict):
+                        continue
+                    index = paid_subscription_index(candidate.get("email"), telegram_id)
+                    if index:
+                        used_indexes.add(index)
+                        previous_expiry_ms = max(previous_expiry_ms,
+                                                 int(candidate.get("expiryTime") or 0))
+            target_email = paid_subscription_email(telegram_id, max(used_indexes or {0}) + 1)
+            logger.info("Заказ %s: новая подписка %s (прежних: %s).",
+                        order_id, target_email, len(used_indexes))
+            if order_id:
+                await payment_store.update(order_id, email=target_email)
 
         # Один subId на все подключения заказа: клиент получает одну ссылку-подписку
         # со всеми протоколами, вариантами и серверами. Если подписка уже была —
@@ -4158,6 +4215,7 @@ async def activate_paid_subscription(
                 comment,
                 sub_id=sub_id,
                 group_name=group_name or "",
+                email=target_email,
             )
 
             if existing is not None:
@@ -4207,6 +4265,8 @@ async def activate_paid_subscription(
     tunnels = tunnels_from_entries(entries)
     return {
         "email": target_email,
+        "fresh_subscription": not reused_email,
+        "previous_expiry_ms": previous_expiry_ms if not reused_email else prior_expiry_ms,
         "missing": missing,
         "expected": len(targets) + len(missing),
         "already": all(entry["status"] == "already" for entry in entries),
@@ -4308,27 +4368,46 @@ def tunnels_summary_text(entries: list[dict], *, limit: int | None = None) -> st
     return "\n".join(lines)
 
 
-async def get_paid_subscription(telegram_id: int) -> dict | None:
+async def get_paid_subscription(telegram_id: int, email: str | None = None) -> dict | None:
     """
     Читает текущую подписку пользователя из панели (срок, трафик, статус).
 
     Подписка занимает по одной записи клиента на каждую пару «локация + протокол»,
     поэтому возвращаем их все (список «entries»), а поля верхнего уровня — по первой
-    записи, чтобы старые вызовы продолжали работать. В каждой записи есть ключ и
+    записи, чтобы старые вызовы продолжали работать. Каждая покупка — отдельная
+    подписка (tg-paid-<id>, -2, -3…): по умолчанию берём последнюю, а email можно
+    указать явно (например, чтобы дослать ключ по конкретному заказу). В каждой записи есть ключ и
     название локации и протокола — их показывают /profile и сообщения о выдаче.
     """
-    target_email = f"tg-paid-{telegram_id}"
+    wanted_email = str(email or "").strip()
     async with XUIClient() as client:
         inbounds = await client.get_inbounds()
         entries = []
+        found_indexes: list[int] = []
+        subscriptions: dict[int, dict] = {}
         for inbound in inbounds:
             settings = as_dict(inbound.get("settings"))
             for candidate in settings.get("clients") or []:
-                if not isinstance(candidate, dict) or str(candidate.get("email")) != target_email:
+                if not isinstance(candidate, dict):
                     continue
+                client_email = str(candidate.get("email") or "")
+                if wanted_email:
+                    if client_email != wanted_email:
+                        continue
+                    plan_index = paid_subscription_index(client_email, telegram_id) or 1
+                else:
+                    plan_index = paid_subscription_index(client_email, telegram_id)
+                    if plan_index is None:
+                        continue
+                if plan_index not in found_indexes:
+                    found_indexes.append(plan_index)
+                meta = subscriptions.setdefault(plan_index, {
+                    "index": plan_index, "email": client_email, "expiry_ms": 0, "tunnels": 0})
+                meta["expiry_ms"] = max(meta["expiry_ms"], int(candidate.get("expiryTime") or 0))
+                meta["tunnels"] += 1
                 stats = {}
                 for stat in inbound.get("clientStats") or []:
-                    if isinstance(stat, dict) and str(stat.get("email")) == target_email:
+                    if isinstance(stat, dict) and str(stat.get("email")) == client_email:
                         stats = stat
                         break
                 used = int(stats.get("up") or 0) + int(stats.get("down") or 0)
@@ -4355,9 +4434,16 @@ async def get_paid_subscription(telegram_id: int) -> dict | None:
                 })
         if not entries:
             return None
-        primary = entries[0]
-        primary = dict(primary)
+        # Каждая покупка — отдельная подписка. Показываем последнюю (самую свежую),
+        # а количество подписок — отдельным полем: остальные работают до своих сроков.
+        latest = max(found_indexes)
+        entries = [entry for entry in entries
+                   if paid_subscription_index((entry.get("client") or {}).get("email"), telegram_id) == latest]
+        primary = dict(entries[0])
         primary["entries"] = entries
+        primary["subscription_index"] = latest
+        primary["subscription_count"] = len(found_indexes)
+        primary["subscriptions"] = [subscriptions[index] for index in sorted(subscriptions)]
         return primary
 
 
@@ -4377,6 +4463,17 @@ def subscription_status_text(sub: dict | None) -> str:
         state = "✅ Активна"
 
     lines = [f"• Статус: <b>{state}</b>"]
+    if int(sub.get("subscription_count") or 1) > 1:
+        lines.append(f"• Подписок у аккаунта: <b>{int(sub['subscription_count'])}</b> — "
+                     "здесь показана последняя покупка, остальные работают до своих сроков")
+        for other in sub.get("subscriptions") or []:
+            if int(other.get("index") or 0) == int(sub.get("subscription_index") or 0):
+                continue
+            other_expiry = int(other.get("expiry_ms") or 0)
+            term = (f"до {format_date(other_expiry)}" if other_expiry
+                    else "без ограничения по времени")
+            lines.append(f"   ◦ <code>{escape(str(other.get('email') or ''))}</code> — {term}, "
+                         f"{int(other.get('tunnels') or 0)} {tunnels_word(int(other.get('tunnels') or 0))}")
     if expiry_ms > 0:
         left_days = max(0, (expiry_ms - int(time.time() * 1000)) // 86_400_000)
         date = format_date(expiry_ms)
@@ -4494,6 +4591,12 @@ def order_paid_message(order: dict, info: dict) -> str:
         term_line = f"⏳ <b>Действует до:</b> {expiry}\n"
     else:
         term_line = "⏳ <b>Срок:</b> без ограничения по времени — пока не израсходован трафик\n"
+    if info.get("fresh_subscription") and info.get("previous_expiry_ms"):
+        # Покупка создаёт новую подписку, прежняя остаётся рабочей до своего срока:
+        # клиенту важно понять, что ссылку в приложении нужно добавить новую.
+        term_line += ("🆕 <b>Это новая подписка</b> — у неё своя ссылка и свои лимиты.\n"
+                      f"Прежняя подписка продолжает работать до "
+                      f"{format_date(int(info['previous_expiry_ms']))}.\n")
     servers: list[str] = []
     for entry in info.get("entries") or []:
         title_spot = str(entry.get("location_title") or "")
@@ -4631,7 +4734,7 @@ async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str 
             # на адресе панели и уже не работать.
             entries: list[dict] = []
             try:
-                sub = await get_paid_subscription(order["tg_id"])
+                sub = await get_paid_subscription(order["tg_id"], email=order.get("email"))
                 if sub:
                     async with XUIClient() as client:
                         for entry in sub.get("entries") or []:
@@ -4726,6 +4829,7 @@ async def fulfill_order(order: dict, *, charge_id: str, provider_charge_id: str 
     await payment_store.update(
         order["id"],
         provisioned=True,
+        email=info.get("email"),
         expiry_ms=info["expiry_ms"],
         link=info.get("link"),          # сохраняем ключ: пригодится, если сообщение не дошло
         sub_link=info.get("sub_link"),
@@ -4778,8 +4882,11 @@ async def simulate_successful_payment(chat_id: int, tg_id: int, tariff_key: str,
     # потом снесло бы весь ключ. Поэтому сначала убеждаемся, что подписки нет.
     existing = await get_paid_subscription(tg_id)
     if existing:
+        existing_email = str((existing.get("client") or {}).get("email")
+                             or paid_subscription_email(tg_id))
         raise PaymentError(
-            f"🧪 <b>У этого аккаунта уже есть платная подписка</b> (<code>tg-paid-{tg_id}</code>).\n\n"
+            f"🧪 <b>У этого аккаунта уже есть платная подписка</b> "
+            f"(<code>{escape(existing_email)}</code>).\n\n"
             "Проверять выдачу на нём нельзя: тест продлил бы настоящий ключ, а кнопка удаления "
             "убрала бы его целиком.\n\n"
             "<b>Варианты:</b>\n"
@@ -4811,7 +4918,7 @@ async def simulate_successful_payment(chat_id: int, tg_id: int, tariff_key: str,
         "🧪 <b>Проверка выдачи ключа (оплата не производилась).</b>\n\n"
         f"• Заказ: <code>{order['id']}</code>\n"
         f"• Тариф: {TARIFFS[tariff_key]['name']}\n"
-        f"• Клиент в панели: <code>tg-paid-{tg_id}</code>\n"
+        f"• Клиент в панели: <code>{escape(str(info.get('email') or paid_subscription_email(tg_id)))}</code>\n"
         + ((tunnels_block + "\n") if tunnels_block else "")
         + f"• Действует до: <b>{expiry}</b>\n\n"
         "Бот прошёл ровно тот же путь, что и после настоящей оплаты: создал клиента в 3x-ui "
@@ -8231,6 +8338,7 @@ async def cmd_reissue(message: Message):
             payment_ref=payment_ref,
             location_key=order.get("location"),
             protocols=order.get("protocols"),
+            sub_email=order.get("email"),
         )
     except Exception as exc:
         logger.error("Досборка туннелей не удалась (заказ %s): %s", order["id"], exc)
@@ -8981,7 +9089,7 @@ async def cb_testpay_del(cb: CallbackQuery):
         return
 
     await cb.answer("Удаляю тестовую подписку...")
-    email = f"tg-paid-{order['tg_id']}"
+    email = str(order.get("email") or paid_subscription_email(order["tg_id"]))
     reference = f"test-{order_id}"
 
     try:
@@ -9086,6 +9194,31 @@ async def delete_paid_clients(client, email: str) -> int:
     return removed
 
 
+async def delete_user_subscriptions(client, telegram_id: int) -> tuple[int, list[str]]:
+    """
+    Удаляет все подписки пользователя (все покупки) во всех подключениях панели.
+
+    Возвращает, сколько записей удалено и какие email'ы затронуты: у клиента может
+    быть несколько подписок, и /revoke должен снимать доступ целиком.
+    """
+    inbounds = await client.get_inbounds()
+    removed = 0
+    emails: list[str] = []
+    for inbound in inbounds:
+        settings = as_dict(inbound.get("settings"))
+        for candidate in settings.get("clients") or []:
+            if not isinstance(candidate, dict):
+                continue
+            email = str(candidate.get("email") or "")
+            if paid_subscription_index(email, telegram_id) is None:
+                continue
+            await client.delete_client(inbound.get("id"), email, candidate.get("id"))
+            removed += 1
+            if email not in emails:
+                emails.append(email)
+    return removed, sorted(emails)
+
+
 async def cmd_revoke(message: Message):
     """Удаляет платную подписку (для возвратов и блокировок)."""
     if not is_admin(message.from_user.id):
@@ -9098,11 +9231,10 @@ async def cmd_revoke(message: Message):
         await message.answer("Использование: <code>/revoke [telegram_id]</code>", parse_mode="HTML")
         return
 
-    wait_msg = await message.answer(f"⏳ Удаляю платную подписку пользователя <code>{target}</code>...")
+    wait_msg = await message.answer(f"⏳ Удаляю подписки пользователя <code>{target}</code>...")
     try:
         async with XUIClient() as client:
-            email = f"tg-paid-{target}"
-            removed = await delete_paid_clients(client, email)
+            removed, emails = await delete_user_subscriptions(client, int(target))
 
         try:
             await wait_msg.delete()
@@ -9110,15 +9242,17 @@ async def cmd_revoke(message: Message):
             pass
 
         if removed:
+            label = ", ".join(f"<code>{escape(email)}</code>" for email in emails)
             await message.answer(
-                f"🗑 <b>Подписка <code>{email}</code> удалена из панели "
-                f"({removed} {tunnels_word(removed)}: все локации тарифа).</b>\n\n"
+                f"🗑 <b>Подписки удалены из панели: {removed} {tunnels_word(removed)} "
+                f"({label}).</b>\n\n"
                 "<i>Если это возврат по оплате — сделай возврат в личном кабинете "
                 "платёжной системы (ЮKassa) или через @BotFather для Stars.</i>",
                 parse_mode="HTML",
             )
         else:
-            await message.answer(f"ℹ️ Подписки <code>{email}</code> в панели нет.", parse_mode="HTML")
+            await message.answer(
+                f"ℹ️ Подписок пользователя <code>{target}</code> в панели нет.", parse_mode="HTML")
     except Exception as exc:
         try:
             await wait_msg.delete()

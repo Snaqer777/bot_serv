@@ -399,6 +399,19 @@ def panel_client(email):
     return PANEL["clients"].get(email)
 
 
+def sub_emails(tg_id=TG_TG_ID):
+    """Email'ы всех подписок пользователя: каждая покупка — своя (tg-paid-<id>, -2, -3…)."""
+    prefix = f"tg-paid-{int(tg_id)}"
+    found = [e for e in PANEL["clients"] if e == prefix or e.startswith(prefix + "-")]
+    return sorted(found, key=lambda e: int(e.rsplit("-", 1)[1]) if e != prefix else 1)
+
+
+def newest_sub(tg_id=TG_TG_ID):
+    """Клиент последней покупки (самая свежая подписка)."""
+    emails = sub_emails(tg_id)
+    return PANEL["clients"].get(emails[-1]) if emails else None
+
+
 def days_left(client):
     return round((int(client["expiryTime"]) - int(time.time() * 1000)) / 86_400_000, 1)
 
@@ -587,15 +600,21 @@ async def test_stars_guards(store_file, bot, order_id):
         "telegram_payment_charge_id": "tg-charge-3", "provider_payment_charge_id": "",
     }))
     order2_final = await bot.payment_store.get(order2["id"])
-    client2 = panel_client(email)
+    # Вторая покупка — отдельная подписка (tg-paid-<id>-2): своя ссылка и свой срок,
+    # первая продолжает работать до своего.
+    client2 = panel_client(f"tg-paid-{TG_TG_ID}-2")
     check("повторная доставка платежа завершает выдачу (без повторного списания)",
           order2_final.get("provisioned") and client2 is not None)
-    expected_total = bot.TARIFFS[BASIC]["days"] + bot.TARIFFS[FAMILY]["days"]
-    check(f"срок продлён: {bot.TARIFFS[BASIC]['days']} дн. + "
-          f"{bot.TARIFFS[FAMILY]['days']} дн. ≈ {expected_total}",
-          expected_total - 2 <= days_left(client2) <= expected_total, f"{days_left(client2)} дн.")
-    check("на каждого покупателя — ровно одна запись в панели",
-          sorted(PANEL["clients"]) == [f"tg-paid-{TG_TG_ID}", "tg-paid-5555"])
+    family_days = bot.TARIFFS[FAMILY]["days"]
+    check(f"новая подписка получила свой срок ({family_days} дн.), а не сумму платежей",
+          family_days - 2 <= days_left(client2) <= family_days, f"{days_left(client2)} дн.")
+    check("первая подписка осталась со своим сроком",
+          bot.TARIFFS[BASIC]["days"] - 2 <= days_left(panel_client(email))
+          <= bot.TARIFFS[BASIC]["days"], f"{days_left(panel_client(email))} дн.")
+    check("каждая покупка — своя запись в панели",
+          sorted(PANEL["clients"]) == [f"tg-paid-{TG_TG_ID}", f"tg-paid-{TG_TG_ID}-2",
+                                       "tg-paid-5555"],
+          str(sorted(PANEL["clients"])))
 
 
 async def test_provider_flow(store_file):
@@ -1019,8 +1038,9 @@ async def test_platega_flow(store_file):
         status, body = await post_platega_callback(order_id, basic_price, transaction_id=transaction_id)
         check("повтор callback снова подтверждается (200)", status == 200 and body.strip() == "ok", body[:40])
         check("повтор не продлевает подписку", 29 <= days_left(panel_client(email)) <= 30)
-        check("повтор не создаёт второго клиента",
-              len([e for e in PANEL["clients"] if e == email]) == 1)
+        check("повтор не создаёт второй подписки",
+              len([e for e in PANEL["clients"] if e.startswith(email)]) == 1,
+              str(sorted(PANEL["clients"])))
 
         # Оплата с комиссией плательщика: касса добавила к счёту 5.6 ₽ (70 ₽ + 8 %)
         await bot.start_checkout(TG_TG_ID, TG_TG_ID, SCHOOL)
@@ -1037,19 +1057,24 @@ async def test_platega_flow(store_file):
               abs(float(saved_fee.get("paid_amount") or 0) - (fee_price + 5.6)) < 0.01,
               str(saved_fee.get("paid_amount")))
         school_days = bot.TARIFFS[SCHOOL]["days"]
-        added = round((int(panel_client(email)["expiryTime"]) - expiry_before_fee) / 86_400_000, 1)
-        check(f"подписка продлена на {school_days} дней несмотря на переплату", added == school_days, f"+{added} дн.")
+        fee_client = newest_sub()
+        check(f"новая подписка получила {school_days} дней несмотря на переплату",
+              school_days - 1 <= days_left(fee_client) <= school_days,
+              f"{days_left(fee_client)} дн.")
+        check("первая подписка при этом не изменилась",
+              int(panel_client(email)["expiryTime"]) == expiry_before_fee)
 
-        # Вторая оплата — другой тариф
-        expiry_first = int(panel_client(email)["expiryTime"])
+        # Вторая оплата — другой тариф: снова отдельная подписка
         await bot.start_checkout(TG_TG_ID, TG_TG_ID, FAMILY)
         order2 = [o for o in bot.payment_store.orders.values()][-1]
         status, body = await post_platega_callback(
             order2["id"], bot.TARIFFS[FAMILY]["price"], transaction_id=str(order2["payment_id"]))
         check("вторая оплата принята", status == 200, f"{status} {body[:40]}")
         family_days = bot.TARIFFS[FAMILY]["days"]
-        added = round((int(panel_client(email)["expiryTime"]) - expiry_first) / 86_400_000, 1)
-        check(f"вторая оплата продлила подписку на {family_days} дней", added == family_days, f"+{added} дн.")
+        third = panel_client(f"tg-paid-{TG_TG_ID}-3")
+        check(f"третья покупка — третья подписка на {family_days} дней",
+              third is not None and family_days - 1 <= days_left(third) <= family_days,
+              f"{days_left(third)} дн.")
 
         # Подмена суммы, валюты и возврат средств
         await bot.start_checkout(TG_TG_ID, TG_TG_ID, PREMIUM)
@@ -1105,9 +1130,9 @@ async def test_platega_flow(store_file):
         cb = _FakeCallback(bot, f"checkpay_{order4['id']}")
         await bot.cb_check_payment(cb)
         premium_days = bot.TARIFFS[PREMIUM]["days"]
-        added = round((int(panel_client(email)["expiryTime"]) - expiry_before) / 86_400_000, 1)
-        check(f"подтверждение через кнопку выдаёт ключ и продлевает подписку на {premium_days} дней",
-              added == premium_days, f"+{added} дн.")
+        check(f"подтверждение через кнопку выдаёт ключ и новую подписку на {premium_days} дней",
+              premium_days - 1 <= days_left(newest_sub()) <= premium_days,
+              f"{days_left(newest_sub())} дн.")
         PLAT["status_override"] = None
     finally:
         if runner is not None:
@@ -1271,8 +1296,9 @@ async def test_platega_diagnostics(store_file):
         cb = _FakeCallback(bot, f"checkorder_{pending['id']}")
         await bot.cb_admin_check_order(cb)
         premium_days = bot.TARIFFS[PREMIUM]["days"]
-        added = round((int(panel_client(f"tg-paid-{TG_TG_ID}")["expiryTime"]) - expiry_before) / 86_400_000, 1)
-        check("админская перепроверка выдала ключ по подтверждённой оплате", added == premium_days, f"+{added} дн.")
+        check("админская перепроверка выдала ключ по подтверждённой оплате",
+              premium_days - 1 <= days_left(newest_sub()) <= premium_days,
+              f"{days_left(newest_sub())} дн.")
         check("админу сказано, что ключ выдан",
               any("Оплата подтверждена" in t for t in cb.message.sent),
               json.dumps(cb.message.sent, ensure_ascii=False)[:90])
@@ -1316,9 +1342,9 @@ async def test_platega_diagnostics(store_file):
         cb = _FakeCallback(bot, f"forcerelease_{short['id']}")
         await bot.cb_force_release_order(cb)
         basic_days = bot.TARIFFS[BASIC]["days"]
-        added = round((int(panel_client(f"tg-paid-{TG_TG_ID}")["expiryTime"]) - expiry_before) / 86_400_000, 1)
         check("ручная выдача админом: ключ выдан и подписка активирована",
-              added == basic_days, f"+{added} дн.")
+              basic_days - 1 <= days_left(newest_sub()) <= basic_days,
+              f"{days_left(newest_sub())} дн.")
         saved_short = await bot.payment_store.get(short["id"])
         check("в заказе отмечены ручная выдача, автор и фактическая сумма",
               saved_short.get("manual_release") is True
@@ -1332,9 +1358,11 @@ async def test_platega_diagnostics(store_file):
         # Пришедший позже callback по тому же заказу ничего не ломает и не продлевает подписку дважды
         status, body = await post_platega_callback(short["id"], short["amount_rub"] - 5,
                                                    transaction_id=str(short["payment_id"]))
-        added = round((int(panel_client(f"tg-paid-{TG_TG_ID}")["expiryTime"]) - expiry_before) / 86_400_000, 1)
-        check("повторный callback после ручной выдачи: 200 ok и без второго продления",
-              status == 200 and body.strip() == "ok" and added == basic_days, f"{status} +{added} дн.")
+        check("повторный callback после ручной выдачи: 200 ok и без второй подписки",
+              status == 200 and body.strip() == "ok"
+              and basic_days - 1 <= days_left(newest_sub()) <= basic_days
+              and len(sub_emails()) == len(set(sub_emails())),
+              f"{status} {len(sub_emails())} подписок")
         PLAT["status_override"] = None
     finally:
         await runner.cleanup()
@@ -1446,13 +1474,14 @@ async def test_duplicate_guard(store_file):
         PLAT["status_override"] = None
 
         await post_platega_callback(order2["id"], order2["amount_rub"], transaction_id="123457")
-        extended = int(panel_client(email)["expiryTime"])
         family_days = bot.TARIFFS[FAMILY]["days"]
-        check(f"callback продлевает подписку на {family_days} дней",
-              round((extended - expiry_after_first) / 86_400_000, 1) == family_days,
-              f"прибавка {round((extended - expiry_after_first) / 86_400_000, 1)} дн.")
+        check(f"callback выдаёт новую подписку на {family_days} дней",
+              family_days - 1 <= days_left(newest_sub()) <= family_days,
+              f"{days_left(newest_sub())} дн.")
+        check("первая подписка не тронута — у неё свой срок",
+              int(panel_client(email)["expiryTime"]) == expiry_after_first)
         check("в комментарии клиента — id последней транзакции",
-              "platega-123457" in str(panel_client(email)["comment"]), str(panel_client(email)["comment"]))
+              "platega-123457" in str(newest_sub()["comment"]), str(newest_sub()["comment"]))
     finally:
         await runner.cleanup()
 
@@ -1537,8 +1566,10 @@ async def test_yookassa_button_and_revoke(store_file):
 
         rvk = make_message(bot, text=f"/revoke {TG_TG_ID}")
         await bot.cmd_revoke(rvk)
-        check("ревок удалил клиента из панели", panel_client(email) is None)
-        check("ревок сообщил об удалении", "удалена" in _last_api_text())
+        check("ревок удалил все подписки пользователя из панели",
+              panel_client(email) is None and not sub_emails())
+        check("ревок сообщил об удалении", "удален" in _last_api_text(),
+              _last_api_text()[:120].replace("\n", " "))
 
         other = make_message(bot, uid=999, text="/payments")
         await bot.cmd_payments(other)
@@ -2373,6 +2404,96 @@ async def _get_healthz():
             return resp.status == 200 and data.get("ok") is True
 
 
+# ---------------- 15. Повторная покупка — отдельная подписка ----------------
+
+def client_rows(email: str) -> list:
+    """Записи клиента с этим email по всем подключениям панели."""
+    return [row[email] for _inbound, row in sorted(PANEL["inbound_clients"].items())
+            if email in row]
+
+
+async def test_new_subscription_per_purchase(store_file):
+    print("\n▶ 16. Новая покупка — новая подписка: свои лимиты, ссылка и срок")
+    reset_all()
+    bot = new_bot({"mode": "platega"}, store_file)
+    runner = await bot.run_webhook_server()
+    email = f"tg-paid-{TG_TG_ID}"
+    try:
+        # Первая покупка: «Новичок» по времени, один сервер, один протокол
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, SCHOOL, "warsaw", ["vless"])
+        order = [o for o in bot.payment_store.orders.values()][-1]
+        status, _body = await post_platega_callback(order["id"], order["amount_rub"],
+                                                    transaction_id="900001")
+        first_rows = client_rows(email)
+        check("первая покупка выдала свою подписку", status == 200 and len(first_rows) == 3,
+              f"{len(first_rows)} записей")
+        first_snapshot = {(row["id"], row["subId"], int(row["expiryTime"]),
+                           int(row["totalGB"]), int(row["limitIp"])) for row in first_rows}
+        first_sub_id = first_rows[0]["subId"]
+        first_expiry = int(first_rows[0]["expiryTime"])
+        check("лимиты первой подписки — из тарифа «Новичок»",
+              int(first_rows[0]["totalGB"]) == 10 * 1024 ** 3 and int(first_rows[0]["limitIp"]) == 1)
+
+        # Вторая покупка: «Призрак» по времени — 200 ГБ, безлимит устройств, 18 туннелей
+        tg_calls("sendMessage").clear()
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
+        order2 = [o for o in bot.payment_store.orders.values()][-1]
+        status, _body = await post_platega_callback(order2["id"], order2["amount_rub"],
+                                                    transaction_id="900002")
+        second_email = f"{email}-2"
+        second_rows = client_rows(second_email)
+        check("вторая покупка создала отдельную подписку",
+              status == 200 and len(second_rows) == 18 and sub_emails() == [email, second_email],
+              f"{len(second_rows)} записей, подписки: {sub_emails()}")
+        check("у новой подписки свои лимиты (200 ГБ, безлимит устройств)",
+              int(second_rows[0]["totalGB"]) == 200 * 1024 ** 3
+              and int(second_rows[0]["limitIp"]) == 0,
+              f"{int(second_rows[0]['totalGB']) // 1024 ** 3} ГБ, limitIp={second_rows[0]['limitIp']}")
+        check("у новой подписки своя ссылка (другой subId)",
+              second_rows[0]["subId"] != first_sub_id)
+        check("срок новой подписки — из её тарифа, а не сумма с прежней",
+              29 <= days_left(second_rows[0]) <= 30, f"{days_left(second_rows[0])} дн.")
+        check("прежняя подписка не тронута",
+              {(row["id"], row["subId"], int(row["expiryTime"]),
+                int(row["totalGB"]), int(row["limitIp"])) for row in client_rows(email)}
+              == first_snapshot)
+        buyer_msgs = [m["params"]["text"] for m in tg_calls("sendMessage")
+                      if str(m["params"].get("chat_id")) == str(TG_TG_ID)]
+        check("покупателю объяснили, что это новая подписка",
+              any("Это новая подписка" in text for text in buyer_msgs)
+              and any(bot.format_date(first_expiry) in text for text in buyer_msgs),
+              (buyer_msgs[-1][:160].replace("\n", " ") if buyer_msgs else "нет сообщений"))
+        check("в сообщении — ссылка именно новой подписки",
+              any(f"/sub/{second_rows[0]['subId']}" in text for text in buyer_msgs),
+              second_rows[0]["subId"])
+
+        # Повторный вебхук по второй оплате не создаёт третью подписку
+        await post_platega_callback(order2["id"], order2["amount_rub"], transaction_id="900002")
+        check("повтор вебхука не плодит подписки", sub_emails() == [email, second_email],
+              str(sub_emails()))
+
+        # Профиль: показывает последнюю подписку и предупреждает, что их несколько
+        await bot.send_profile(make_message(bot), TG_TG_ID)
+        profile_text = _last_api_text()
+        check("профиль показывает последнюю подписку",
+              f"Подписок у аккаунта: <b>2</b>" in profile_text
+              and second_rows[0]["subId"] in profile_text,
+              [line for line in profile_text.split("\n") if "Подписок" in line][:1])
+        check("в профиле перечислены и остальные подписки с их сроками",
+              f"<code>{email}</code>" in profile_text
+              and bot.format_date(first_expiry) in profile_text
+              and "3 туннеля" in profile_text,
+              [line for line in profile_text.split("\n") if "◦" in line][:1])
+
+        # /revoke снимает все подписки пользователя
+        await bot.cmd_revoke(make_message(bot, text=f"/revoke {TG_TG_ID}"))
+        check("/revoke снял все подписки пользователя",
+              panel_client(email) is None and panel_client(second_email) is None
+              and not sub_emails(), str(sub_emails()))
+    finally:
+        await runner.cleanup()
+
+
 async def main():
     runners = []
     for port, app in ((PANEL_PORT, make_app()), (TG_PORT, make_tg_app()),
@@ -2416,6 +2537,7 @@ async def main():
         await test_cancel_order(store_for("cancelorder"))
         await test_subscription_link(store_for("sub_link"))
         await test_admin_access(store_for("admin"))
+        await test_new_subscription_per_purchase(store_for("newsub"))
     finally:
         for runner in runners:
             await runner.cleanup()
