@@ -78,6 +78,19 @@ def last_buttons() -> list:
     return []
 
 
+def sent_buttons() -> list:
+    """Кнопки последнего экрана: и sendMessage (markup — словарь), и editMessageText."""
+    for call in reversed(TG["calls"]):
+        markup = call["params"].get("reply_markup")
+        if markup is None:
+            continue
+        if isinstance(markup, dict):
+            return [b.get("callback_data") or b.get("url") or ""
+                    for row in markup.get("inline_keyboard", []) for b in row]
+        return kb_buttons(markup)
+    return []
+
+
 def plain(text: str) -> str:
     """Текст без HTML-разметки — для проверки подписей с жирным/курсивом."""
     return (text.replace("<b>", "").replace("</b>", "")
@@ -676,6 +689,126 @@ async def test_reissue_command(store_file):
         await runner.cleanup()
 
 
+# ---------------- 6б. /panel_map: привязка подключений без переменных ----------------
+
+async def test_panel_map_command(store_file):
+    print("\n▶ 6б. /panel_map: привязка подключений кнопками и текстом")
+    reset_all()
+    # Сценарии выше могли оставить переменные XUI_INBOUND_* в окружении процесса
+    # (например, XUI_INBOUND_WARSAW_VLESS_XHTTP из диагностики). Здесь нужна
+    # «панель без понятных названий», поэтому переменные убираем.
+    for name in [key for key in os.environ if key.startswith("XUI_INBOUND")]:
+        os.environ.pop(name, None)
+    map_file = store_file + ".inbound_map.json"
+    bot = new_bot({"mode": "platega", "admin_tools": "1"}, store_file + ".map",
+                  extra_env={"INBOUND_MAP_FILE": map_file})
+
+    # Панель с нестандартными названиями: у Варшавы вместо «Warsaw-…» — «Node-…»,
+    # локацию по названию не определить. Такую панель и лечит /panel_map.
+    renamed = [(item, item["remark"]) for item in ALL_INBOUNDS
+               if str(item["remark"]).startswith("Warsaw")]
+    try:
+        for item, _remark in renamed:
+            item["remark"] = f"Node-{item['id']}"
+        bot._INBOUNDS_CACHE.update({"at": 0.0, "items": []})
+
+        await bot.cmd_panel_map(make_message(bot, text="/panel_map"))
+        text = plain(tp._last_api_text())
+        check("/panel_map сообщает, сколько туннелей нашлось",
+              "Найдено туннелей: 9 из 18" in text, text[:160].replace("\n", " "))
+        check("/panel_map перечисляет ненайденные туннели Варшавы",
+              "🇵🇱 Варшава · Hysteria2" in text and "🇵🇱 Варшава · AmneziaWG" in text
+              and "🇵🇱 Варшава · VLESS Reality + XHTTP" in text,
+              [line for line in text.split("\n") if "Варшава" in line][:2])
+        check("на каждый ненайденный туннель есть кнопка привязки",
+              "pmap_o_warsaw|hysteria2|default" in sent_buttons()
+              and "pmap_o_warsaw|vless|xhttp" in sent_buttons(),
+              str(sent_buttons()))
+        check("подсказана и текстовая форма",
+              "/panel_map Warsaw_Hysteria2=18" in text.replace("\u00a0", " "), text[-200:])
+
+        # Кнопками: туннель → подключение
+        TG["calls"].clear()
+        await bot.cb_panel_map_open(_FakeCallback(bot, "pmap_o_warsaw|hysteria2|default"))
+        candidates = sent_buttons()
+        check("показаны подключения того же протокола (Hysteria2 в обеих локациях)",
+              set(candidates) == {"pmap_c_18_warsaw|hysteria2|default",
+                                  "pmap_c_10_warsaw|hysteria2|default", "pmap"},
+              str(candidates))
+        TG["calls"].clear()
+        await bot.cb_panel_map_bind(_FakeCallback(bot, "pmap_c_18_warsaw|hysteria2|default"))
+        check("привязка сохранена в боте",
+              bot.inbound_map.get("warsaw", "hysteria2", "default") == 18,
+              str(bot.inbound_map.items()))
+        check("после привязки счётчик стал 10 из 18",
+              "Найдено туннелей: 10 из 18" in plain(last_edit().get("text", "")),
+              plain(last_edit().get("text", ""))[:120].replace("\n", " "))
+        matched = bot.match_tunnel_inbound([dict(item) for item in ALL_INBOUNDS],
+                                           bot.location_by_key("warsaw"), "hysteria2", "default")
+        check("привязка сразу работает в подборе туннелей",
+              (matched or {}).get("id") == 18, str((matched or {}).get("id")))
+        check("файл привязок записан рядом с журналом оплат",
+              json.load(open(map_file, encoding="utf-8"))["map"]["warsaw|hysteria2|default"] == 18,
+              map_file)
+
+        # Текстом: 8 оставшихся туннелей Варшавы, одним сообщением
+        TG["calls"].clear()
+        await bot.cmd_panel_map(make_message(
+            bot, text="/panel_map Warsaw_VLESS_Reality=2 Warsaw_VLESS_XHTTP=11 "
+                      "Warsaw_VLESS_gRPC=12 Warsaw_Shadowsocks_AES128=13 "
+                      "Warsaw_Shadowsocks_AES256=14 Warsaw_Shadowsocks_ChaCha20=15 "
+                      "Warsaw_AmneziaWG=16 Warsaw_WireGuard=17"))
+        text = plain(tp._last_api_text())
+        check("текстовая форма привязала все оставшиеся туннели",
+              "Сохранено привязок: 8 из 8" in text, text[:200].replace("\n", " "))
+        check("теперь найдены все 18 туннелей",
+              "Найдено туннелей: 18 из 18" in text and "✅ Все подключения найдены" in text,
+              text[-160:].replace("\n", " "))
+        check("без «Не найдены подключения» на экране не осталось",
+              "не нашёл подключения" not in text)
+        check("AmneziaWG привязан к wireguard-подключению с предупреждением",
+              bot.inbound_map.get("warsaw", "amneziawg", "default") == 16
+              and "проверь обфускацию" in text, text[:160].replace("\n", " "))
+
+        # Ошибки видно сразу: чужой протокол и опечатка в названии
+        TG["calls"].clear()
+        await bot.cmd_panel_map(make_message(bot, text="/panel_map Warsaw_Hysteria2=17"))
+        text = plain(tp._last_api_text())
+        check("подключение другого протокола не принимается",
+              "это WireGuard, а нужен Hysteria2" in text and "Сохранено привязок: 0 из 1" in text,
+              text[:220].replace("\n", " "))
+        check("неверная привязка не перезаписала рабочую",
+              bot.inbound_map.get("warsaw", "hysteria2", "default") == 18)
+        TG["calls"].clear()
+        await bot.cmd_panel_map(make_message(bot, text="/panel_map Warsaw_Hysteria=18"))
+        check("опечатка в названии туннеля объясняется",
+              "не знаю туннель" in plain(tp._last_api_text()),
+              plain(tp._last_api_text())[:160].replace("\n", " "))
+
+        # Привязки переживают перезапуск бота: читаются из того же файла
+        again = new_bot({"mode": "platega", "admin_tools": "1"}, store_file + ".map2",
+                        extra_env={"INBOUND_MAP_FILE": map_file})
+        check("привязки читаются после перезапуска",
+              again.inbound_map.get("warsaw", "shadowsocks", "chacha20") == 15
+              and again.inbound_map.get("stockholm", "hysteria2", "default") == 0,
+              str(again.inbound_map.items()[:3]))
+
+        # Снятие привязок возвращает подбор по названию
+        saved_before = len(again.inbound_map.items())
+        await again.cmd_panel_map(make_message(again, text="/panel_map clear"))
+        check("«/panel_map clear» снимает привязки",
+              again.inbound_map.get("warsaw", "hysteria2", "default") == 0
+              and f"Привязки сняты: {saved_before}" in plain(tp._last_api_text()),
+              plain(tp._last_api_text())[:120].replace("\n", " "))
+        check("после снятия снова находится 9 из 18",
+              "Найдено туннелей: 9 из 18" in plain(tp._last_api_text()))
+    finally:
+        for item, remark in renamed:
+            item["remark"] = remark
+        bot._INBOUNDS_CACHE.update({"at": 0.0, "items": []})
+
+
+
 # ---------------- 4. Тариф «по трафику» ----------------
 
 async def test_traffic_tariff(store_file):
@@ -880,6 +1013,7 @@ async def main():
         await test_traffic_tariff(store_for("traffic"))
         await test_test_pay(store_for("testpay"))
         await test_inbounds_diag(store_for("diag"))
+        await test_panel_map_command(store_for("panelmap"))
     finally:
         for runner in runners:
             await runner.cleanup()

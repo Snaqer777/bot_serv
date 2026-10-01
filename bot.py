@@ -524,6 +524,8 @@ TERMS_UPDATED = (os.getenv("TERMS_UPDATED") or "22.09.2026").strip()
 TERMS_ACCEPT = (os.getenv("TERMS_ACCEPT") or "1").strip().lower() not in ("0", "false", "no", "off")
 # Файл с отметками о принятии соглашения (кто и когда подтвердил).
 TERMS_STORE_FILE = (os.getenv("TERMS_STORE_FILE") or "data/terms.json").strip()
+# Привязки подключений, заданные админом прямо в боте (/panel_map) — без переменных Railway.
+INBOUND_MAP_FILE = (os.getenv("INBOUND_MAP_FILE") or "data/inbound_map.json").strip()
 
 # Лимит одного сообщения Telegram. Документы (соглашение, политика) упакованы в
 # раскрывающуюся цитату и обычно умещаются целиком; если из-за длинных SERVICE_NAME
@@ -2436,6 +2438,92 @@ class TermsStore:
         return True
 
 
+class InboundMapStore:
+    """
+    Привязки «локация + вариант протокола» → ID подключения (inbound) панели.
+
+    Нужны, когда подключения называются нестандартно: вместо переменных Railway
+    админ задаёт соответствие прямо в боте командой /panel_map, а бот сохраняет его
+    в JSON на том же volume (INBOUND_MAP_FILE). Формат:
+    {"map": {"warsaw|vless|xhttp": 11, "stockholm|shadowsocks|aes128": 5}}
+    Чтение — синхронное (используется в подборе подключений), запись — атомарная.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.map: dict[str, int] = {}
+        self._lock = asyncio.Lock()
+        self._loaded = False
+
+    @staticmethod
+    def key(location_key: str, protocol: str, variant: str) -> str:
+        return f"{str(location_key).lower()}|{str(protocol).lower()}|{str(variant).lower()}"
+
+    def load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        if not self.path:
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            items = data.get("map") if isinstance(data, dict) else None
+            if isinstance(items, dict):
+                self.map = {str(k): int(v) for k, v in items.items() if str(v).isdigit()}
+                logger.info("Привязки подключений загружены: %s из %s", len(self.map), self.path)
+        except FileNotFoundError:
+            logger.info("Привязок подключений нет — создам %s при первой привязке.", self.path)
+        except Exception as exc:
+            logger.warning("Не удалось прочитать привязки подключений (%s): %s", self.path, exc)
+
+    def _write(self) -> None:
+        if not self.path:
+            return
+        try:
+            directory = os.path.dirname(self.path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            tmp = f"{self.path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "map": self.map}, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)
+        except Exception as exc:
+            logger.warning("Не удалось сохранить привязки подключений (%s): %s", self.path, exc)
+
+    def get(self, location_key: str, protocol: str, variant: str) -> int:
+        """ID подключения, привязанного к туннелю (0 — не привязано)."""
+        self.load()
+        return int(self.map.get(self.key(location_key, protocol, variant)) or 0)
+
+    def items(self) -> list[tuple[str, int]]:
+        self.load()
+        return sorted(self.map.items())
+
+    async def bind(self, location_key: str, protocol: str, variant: str, inbound_id: int) -> None:
+        async with self._lock:
+            self.load()
+            self.map[self.key(location_key, protocol, variant)] = int(inbound_id)
+            self._write()
+
+    async def unbind(self, location_key: str, protocol: str, variant: str) -> None:
+        async with self._lock:
+            self.load()
+            self.map.pop(self.key(location_key, protocol, variant), None)
+            self._write()
+
+    async def clear(self) -> int:
+        async with self._lock:
+            self.load()
+            count = len(self.map)
+            self.map = {}
+            self._write()
+        return count
+
+
+inbound_map = InboundMapStore(INBOUND_MAP_FILE)
+
+
 terms_store = TermsStore(TERMS_STORE_FILE)
 
 # Username бота нужен для реферальной ссылки: спрашиваем у Telegram один раз и кэшируем.
@@ -4192,10 +4280,13 @@ def missing_tunnels_text(missing: list[dict], *, limit: int = 12) -> str:
     env_names = sorted({str(item.get("env") or "") for item in missing if item.get("env")})
     if env_names:
         lines.append("")
-        lines.append("Создай входящие подключения в панели или задай их ID переменными:")
+        lines.append("Создай входящие подключения в панели, привяжи их в боте командой "
+                     "<code>/panel_map</code> (без переменных) или задай ID переменными:")
         lines.append(" ".join(f"<code>{name}</code>" for name in env_names[:10]))
         if len(env_names) > 10:
             lines.append(f"<i>…и ещё {len(env_names) - 10} переменных — полный список в /panel_debug</i>")
+        lines.append("<i>Проще всего: /panel_map — бот покажет ненайденные туннели и даст "
+                     "выбрать для них подключения кнопками.</i>")
     return "\n".join(lines)
 
 
@@ -6382,6 +6473,16 @@ def match_tunnel_inbound(inbounds: list[dict], spot: dict, protocol: str,
         found = next((item for item in inbounds if int(item.get("id") or 0) == env_id), None)
         return found or {"id": env_id, "remark": f"{spot.get('short')} · {variant_title(protocol, variant)}"}
 
+    # Привязка из /panel_map: работает, когда подключение названо нестандартно,
+    # а задавать переменные Railway не хочется.
+    mapped_id = inbound_map.get(spot.get("key", ""), protocol, variant)
+    if mapped_id > 0:
+        found = next((item for item in inbounds if int(item.get("id") or 0) == mapped_id), None)
+        if found is not None:
+            return found
+        logger.warning("Привязка туннеля %s в %s указывает на подключение #%s, которого нет в панели.",
+                       variant_title(protocol, variant), spot.get("short"), mapped_id)
+
     for inbound in inbounds:
         if inbound_protocol_key(inbound) != protocol:
             continue
@@ -6446,6 +6547,201 @@ async def tunnel_availability(tariff: dict, location_key: str | None = None) -> 
 def availability_protocols(availability: dict[str, dict[str, list[str]]]) -> list[str]:
     """Протоколы, доступные хотя бы одним вариантом (в порядке каталога)."""
     return [key for key in PROTOCOL_ORDER if availability.get(key)]
+
+
+# ---------- Привязка подключений к туннелям без переменных Railway (/panel_map) ----------
+
+def tunnel_slots() -> list[dict]:
+    """Каталог туннелей: локация × протокол × вариант (по 9 на каждый сервер)."""
+    slots: list[dict] = []
+    for key in LOCATION_ORDER:
+        spot = location_by_key(key) or {}
+        for protocol in PROTOCOL_ORDER:
+            for meta in protocol_variants(protocol):
+                variant = str(meta.get("key"))
+                slots.append({
+                    "slot": InboundMapStore.key(key, protocol, variant),
+                    "location": key,
+                    "location_title": str(spot.get("title") or key),
+                    "protocol": protocol,
+                    "protocol_title": protocol_title(protocol),
+                    "variant": variant,
+                    "variant_title": variant_title(protocol, variant),
+                    "env": tunnel_env_name(key, protocol, variant),
+                })
+    return slots
+
+
+def tunnel_slot_by_key(slot_key: str) -> dict | None:
+    """Описание туннеля по ключу «локация|протокол|вариант»."""
+    wanted = str(slot_key or "").strip().lower()
+    for slot in tunnel_slots():
+        if slot["slot"] == wanted:
+            return slot
+    return None
+
+
+def unmatched_tunnels(inbounds: list[dict]) -> list[dict]:
+    """Туннели каталога, для которых в панели нет подходящего подключения."""
+    return [slot for slot in tunnel_slots()
+            if match_tunnel_inbound(inbounds, location_by_key(slot["location"]) or {},
+                                    slot["protocol"], slot["variant"]) is None]
+
+
+async def refresh_inbounds() -> list[dict]:
+    """Свежий список подключений панели (с обновлением кэша выбора протоколов)."""
+    async with XUIClient() as client:
+        items = await client.get_inbounds()
+    _INBOUNDS_CACHE.update({"at": time.time(), "items": items})
+    return items
+
+
+def _binding_token(value: str) -> str:
+    """
+    Нормализует название туннеля для /panel_map.
+
+    «XUI_INBOUND_WARSAW_SHADOWSOCKS_AES256», «Warsaw-Shadowsocks-AES-256» и
+    «warsaw|shadowsocks|aes256» должны пониматься одинаково, поэтому убираем
+    разделители и регистр.
+    """
+    token = str(value or "").strip().upper()
+    token = token.removeprefix("XUI_INBOUND_")
+    return re.sub(r"[^A-Z0-9]+", "", token)
+
+
+def parse_tunnel_binding_args(text: str) -> tuple[list[tuple[dict, int]], list[str]]:
+    """
+    Разбирает аргументы /panel_map: «Warsaw_Hysteria2=18» или
+    «XUI_INBOUND_WARSAW_VLESS_XHTTP=11».
+
+    Возвращает привязки (туннель, ID подключения) и список непонятных кусков:
+    опечатка в названии должна быть видна админу, а не превращаться в тихую ошибку.
+    """
+    exact: dict[str, dict] = {}
+    groups: dict[str, list[dict]] = {}
+    for slot in tunnel_slots():
+        local = f'{slot["location"]}_{slot["protocol"]}_{slot["variant"]}'
+        short = f'{slot["location"]}_{slot["protocol"]}'
+        for token in (slot["env"], local, slot["slot"]):
+            exact.setdefault(_binding_token(token), slot)
+        groups.setdefault(_binding_token(short), []).append(slot)
+
+    bindings: list[tuple[dict, int]] = []
+    problems: list[str] = []
+    for chunk in str(text or "").replace(",", " ").split():
+        name, _, value = chunk.partition("=")
+        if not name.strip() or not value.strip().isdigit():
+            problems.append(f"не понял «{chunk}» — нужно «Имя_туннеля=ID», например "
+                            "Warsaw_Hysteria2=18")
+            continue
+        token = _binding_token(name)
+        slot = exact.get(token)
+        if slot is None:
+            group = groups.get(token) or []
+            if len(group) == 1:
+                slot = group[0]
+            elif len(group) > 1:
+                variants = ", ".join(item["variant"] for item in group)
+                problems.append(f"для «{chunk}» уточни вариант: {variants}")
+                continue
+        if slot is None:
+            problems.append(f"не знаю туннель «{name}» — список названий есть в /panel_debug")
+            continue
+        bindings.append((slot, int(value)))
+    return bindings, problems
+
+
+async def bind_tunnel_inbound(inbounds: list[dict], slot: dict, inbound_id: int) -> tuple[bool, str]:
+    """Сохраняет привязку туннеля к подключению панели (проверяя протокол)."""
+    inbound = next((item for item in inbounds if int(item.get("id") or 0) == int(inbound_id)), None)
+    label = f'{slot["location_title"]} · {slot["variant_title"]}'
+    if inbound is None:
+        return False, f"❌ {label}: подключения #{inbound_id} нет в панели"
+    note = ""
+    found_protocol = inbound_protocol_key(inbound)
+    if found_protocol and found_protocol != slot["protocol"]:
+        if {found_protocol, slot["protocol"]} == {"amneziawg", "wireguard"}:
+            # В панели AWG и WG — один и тот же протокол (wireguard), различает их
+            # только обфускация, поэтому привязку разрешаем с предупреждением.
+            note = (f" ⚠️ В панели это {protocol_title(found_protocol)}-подключение: "
+                    "для AmneziaWG проверь обфускацию в его настройках.")
+        else:
+            return False, (f"❌ {label}: подключение #{inbound_id} — это "
+                           f"{protocol_title(found_protocol)}, а нужен {slot['protocol_title']}")
+    await inbound_map.bind(slot["location"], slot["protocol"], slot["variant"], int(inbound_id))
+    remark = str(inbound.get("remark") or "").strip() or "без названия"
+    return True, f"✅ {label} → #{inbound_id} {escape(remark)}{note}"
+
+
+async def panel_map_screen(notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    """Экран /panel_map: чего не хватает в панели и какие привязки уже заданы."""
+    rows: list[list[InlineKeyboardButton]] = []
+    try:
+        inbounds = await refresh_inbounds()
+    except Exception as exc:
+        return (f"❌ Не удалось прочитать подключения панели: {escape(str(exc)[:140])}",
+                InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")]]))
+    slots = tunnel_slots()
+    missing = unmatched_tunnels(inbounds)
+    bindings = inbound_map.items()
+    lines = ["🔗 <b>Привязка подключений к туннелям</b>", ""]
+    if notice:
+        lines += [notice, ""]
+    lines.append(f"Найдено туннелей: <b>{len(slots) - len(missing)} из {len(slots)}</b>.")
+    if bindings:
+        lines.append(f"Задано привязок вручную: <b>{len(bindings)}</b> "
+                     f"(<code>{escape(str(INBOUND_MAP_FILE))}</code>).")
+    if not missing:
+        lines += ["", "✅ Все подключения найдены — привязывать нечего."]
+    else:
+        lines += ["", "Бот не нашёл подключения для этих туннелей. Нажми на туннель и выбери "
+                      "подходящее подключение панели — привязка сохранится в боте, "
+                      "переменные Railway не нужны.", ""]
+        for slot in missing[:12]:
+            lines.append(f"• {escape(slot['location_title'])} · {escape(slot['variant_title'])}")
+        if len(missing) > 12:
+            lines.append(f"• …и ещё {len(missing) - 12}")
+        lines += ["", "Можно и текстом: <code>/panel_map Warsaw_Hysteria2=18</code> "
+                      "(несколько привязок — через пробел)."]
+        for slot in missing[:12]:
+            rows.append([InlineKeyboardButton(
+                text=f"🔗 {slot['location_title']} · {slot['variant_title']}",
+                callback_data=f"pmap_o_{slot['slot']}")])
+    rows.append([InlineKeyboardButton(text="🔄 Обновить список", callback_data="pmap_refresh")])
+    if bindings:
+        rows.append([InlineKeyboardButton(text="🗑 Снять все привязки", callback_data="pmap_clear")])
+    rows.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def panel_map_candidates_screen(slot_key: str, notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    """Выбор подключения панели для одного туннеля."""
+    slot = tunnel_slot_by_key(slot_key)
+    if slot is None:
+        return await panel_map_screen(notice="❌ Неизвестный туннель — открой /panel_map заново.")
+    try:
+        inbounds = await refresh_inbounds()
+    except Exception as exc:
+        return await panel_map_screen(notice=f"❌ Панель недоступна: {escape(str(exc)[:120])}")
+    same_protocol = [item for item in inbounds if inbound_protocol_key(item) == slot["protocol"]]
+    candidates = same_protocol or inbounds
+    used = {int(value): key for key, value in inbound_map.items()}
+    lines = [f"🔗 <b>{escape(slot['location_title'])} · {escape(slot['variant_title'])}</b>", ""]
+    if notice:
+        lines += [notice, ""]
+    lines.append("Выбери подключение панели, которое соответствует этому туннелю:"
+                 if same_protocol else
+                 "Подключений с этим протоколом в панели не нашлось — показаны все, будь внимателен:")
+    rows = []
+    for item in candidates[:24]:
+        inbound_id = int(item.get("id") or 0)
+        mark = " · уже привязано" if used.get(inbound_id) else ""
+        rows.append([InlineKeyboardButton(
+            text=f"#{inbound_id} {str(item.get('remark') or '—')[:40]}{mark}",
+            callback_data=f"pmap_c_{inbound_id}_{slot['slot']}")])
+    rows.append([InlineKeyboardButton(text="✖️ Отмена", callback_data="pmap")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def protocol_selection_get(tg_id: int) -> dict | None:
@@ -7353,6 +7649,10 @@ async def cmd_panel_debug(message: Message):
             lines.append(f"   <b>Итого туннелей: {total_found} из {total_expected}</b>"
                          + ("" if not missing_tunnels else
                             " — покупателю предлагаются только найденные"))
+            manual_bindings = inbound_map.items()
+            if manual_bindings:
+                lines.append(f"   🔗 Привязок через <code>/panel_map</code>: "
+                             f"<b>{len(manual_bindings)}</b>")
             if missing_tunnels:
                 lines.append("")
                 lines.append("   ⚠️ <b>Не хватает подключений (создай в панели или задай ID переменной):</b>")
@@ -7363,6 +7663,8 @@ async def cmd_panel_debug(message: Message):
                     lines.append(f"      • …и ещё {len(missing_tunnels) - 20}")
                 lines.append("      <i>Созданные подключения называй как «Stockholm-VLESS-XHTTP» "
                              "или «Warsaw-Shadowsocks-AES-256» — бот найдёт их сам.</i>")
+                lines.append("      <i>Названия нестандартные? Привяжи подключения вручную: "
+                             "<code>/panel_map</code> — кнопками, без переменных Railway.</i>")
                 lines.append("      <i>Уже проданным подпискам недостающие туннели выдаёт "
                              "команда <code>/reissue &lt;tg_id&gt;</code>.</i>")
                 lines.append("")
@@ -7409,6 +7711,124 @@ async def cmd_panel_debug(message: Message):
         lines.append(f"   ❌ Не удалось проверить: <code>{escape(str(exc))}</code>")
 
     await message.answer("\n".join(lines)[:4000], parse_mode="HTML")
+
+
+async def cmd_panel_map(message: Message):
+    """
+    Привязка подключений панели к туннелям без переменных Railway.
+
+    Обычно бот находит подключение по названию (локация + протокол + транспорт/шифр).
+    Если названия нестандартные, админ привязывает их вручную: /panel_map показывает
+    ненайденные туннели и предлагает выбрать подключение кнопками, а форма
+    «/panel_map Warsaw_Hysteria2=18» задаёт привязку одной строкой. Привязки лежат
+    в файле INBOUND_MAP_FILE рядом с журналом оплат, поэтому переживают деплой.
+    """
+    if not is_admin(message.from_user.id):
+        await message.answer(admin_denied_text(message.from_user.id), parse_mode="HTML")
+        return
+    if not XUI_URL:
+        await message.answer("❌ XUI_URL не задан в Railway Variables.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    args = parts[1].strip() if len(parts) > 1 else ""
+    notice = ""
+
+    if args.lower() in ("clear", "сброс", "сбросить", "снять"):
+        removed = await inbound_map.clear()
+        notice = f"🗑 Привязки сняты: {removed}. Подключения снова ищутся по названию."
+    elif args:
+        bindings, problems = parse_tunnel_binding_args(args)
+        notes = []
+        if bindings:
+            try:
+                inbounds = await refresh_inbounds()
+            except Exception as exc:
+                await message.answer("❌ Не удалось прочитать подключения панели: "
+                                     f"{escape(str(exc)[:140])}")
+                return
+            done = 0
+            for slot, inbound_id in bindings:
+                ok, note = await bind_tunnel_inbound(inbounds, slot, inbound_id)
+                notes.append(note)
+                done += 1 if ok else 0
+            notes.insert(0, f"💾 Сохранено привязок: <b>{done}</b> из {len(bindings)}.")
+        notice = "\n".join(notes + problems)
+
+    text, keyboard = await panel_map_screen(notice=notice)
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("pmap_o_"))
+async def cb_panel_map_open(cb: CallbackQuery):
+    """Кнопка «🔗 туннель» на экране /panel_map: показываем подключения-кандидаты."""
+    if not is_admin(cb.from_user.id):
+        await cb.answer(admin_denied_text(cb.from_user.id), show_alert=True)
+        return
+    await cb.answer()
+    text, keyboard = await panel_map_candidates_screen(cb.data.removeprefix("pmap_o_"))
+    await show_screen(cb, text, keyboard)
+
+
+@dp.callback_query(F.data.startswith("pmap_c_"))
+async def cb_panel_map_bind(cb: CallbackQuery):
+    """Выбор подключения для туннеля: сохраняем привязку и возвращаем список."""
+    if not is_admin(cb.from_user.id):
+        await cb.answer(admin_denied_text(cb.from_user.id), show_alert=True)
+        return
+    await cb.answer("Сохраняю привязку…")
+    inbound_raw, _, slot_key = cb.data.removeprefix("pmap_c_").partition("_")
+    slot = tunnel_slot_by_key(slot_key)
+    if slot is None or not inbound_raw.isdigit():
+        await cb.answer("Не понял привязку — открой /panel_map заново.", show_alert=True)
+        return
+    try:
+        inbounds = await refresh_inbounds()
+    except Exception as exc:
+        text, keyboard = await panel_map_screen(
+            notice=f"❌ Панель недоступна: {escape(str(exc)[:120])}")
+        await show_screen(cb, text, keyboard)
+        return
+    ok, note = await bind_tunnel_inbound(inbounds, slot, int(inbound_raw))
+    text, keyboard = await panel_map_screen(notice=note)
+    if ok:
+        text += ("\n\n💡 Недостающие туннели можно выдать уже проданным подпискам: "
+                 "<code>/reissue &lt;tg_id&gt;</code>.")
+    await show_screen(cb, text, keyboard)
+
+
+@dp.callback_query(F.data == "pmap_refresh")
+async def cb_panel_map_refresh(cb: CallbackQuery):
+    """«🔄 Обновить список»: админ мог только что добавить подключения в панель."""
+    if not is_admin(cb.from_user.id):
+        await cb.answer(admin_denied_text(cb.from_user.id), show_alert=True)
+        return
+    await cb.answer("Обновляю список…")
+    text, keyboard = await panel_map_screen()
+    await show_screen(cb, text, keyboard)
+
+
+@dp.callback_query(F.data == "pmap_clear")
+async def cb_panel_map_clear(cb: CallbackQuery):
+    """«🗑 Снять все привязки»: снова искать подключения по названию."""
+    if not is_admin(cb.from_user.id):
+        await cb.answer(admin_denied_text(cb.from_user.id), show_alert=True)
+        return
+    removed = await inbound_map.clear()
+    await cb.answer(f"Привязки сняты: {removed}")
+    text, keyboard = await panel_map_screen(notice=f"🗑 Привязки сняты: {removed}.")
+    await show_screen(cb, text, keyboard)
+
+
+@dp.callback_query(F.data == "pmap")
+async def cb_panel_map_back(cb: CallbackQuery):
+    """«✖️ Отмена» на выборе подключения — назад к списку ненайденных туннелей."""
+    if not is_admin(cb.from_user.id):
+        await cb.answer(admin_denied_text(cb.from_user.id), show_alert=True)
+        return
+    await cb.answer()
+    text, keyboard = await panel_map_screen()
+    await show_screen(cb, text, keyboard)
 
 
 async def cmd_totp(message: Message):
@@ -9244,6 +9664,7 @@ ADMIN_COMMANDS = {
     "reset_vpn": cmd_reset_vpn,
     "groups": cmd_groups,
     "panel_debug": cmd_panel_debug,
+    "panel_map": cmd_panel_map,
     "totp": cmd_totp,
     "payments": cmd_payments,
     "revoke": cmd_revoke,

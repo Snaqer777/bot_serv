@@ -325,7 +325,7 @@ async def post_platega_callback(order_id, amount, *, status="CONFIRMED", transac
 
 # ---------------- инфраструктура ----------------
 
-def new_bot(env, store_file, admins=None):
+def new_bot(env, store_file, admins=None, extra_env=None):
     """Загружает bot.py с платёжным окружением и переключает его на фейковый Telegram."""
     full_env = {
         "PAYMENTS_MODE": env.get("mode"),
@@ -360,6 +360,7 @@ def new_bot(env, store_file, admins=None):
         "STARS_RUB_RATE": "1.6",
         "STARS_TIME_4": env.get("stars_basic"),
     }
+    full_env.update(extra_env or {})
     bot = load_bot(PANEL_PORT, admins=env.get("admin_id") if "admin_id" in env else str(admins or TG_TG_ID), env=full_env)
     session = AiohttpSession()
     session.api = TelegramAPIServer.from_base(f"http://127.0.0.1:{TG_PORT}")
