@@ -9215,25 +9215,6 @@ async def cb_platega_check(cb: CallbackQuery):
     await cb.message.answer(text, parse_mode="HTML")
 
 
-async def delete_paid_clients(client, email: str) -> int:
-    """
-    Удаляет клиента с этим email во всех подключениях панели.
-
-    Тарифы на несколько туннелей создают клиента в каждой локации — возврат
-    или блокировка должны снимать доступ везде, а не только на первом сервере.
-    """
-    inbounds = await client.get_inbounds()
-    removed = 0
-    for inbound in inbounds:
-        settings = as_dict(inbound.get("settings"))
-        for candidate in settings.get("clients") or []:
-            if isinstance(candidate, dict) and str(candidate.get("email")) == email:
-                await client.delete_client(inbound.get("id"), email, candidate.get("id"))
-                removed += 1
-                break
-    return removed
-
-
 async def delete_user_subscriptions(client, telegram_id: int) -> tuple[int, list[str]]:
     """
     Удаляет все подписки пользователя (все покупки) во всех подключениях панели.
