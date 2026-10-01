@@ -3996,6 +3996,7 @@ async def activate_paid_subscription(
     location_key: str | None = None,
     protocols: list[str] | None = None,
     sub_email: str | None = None,
+    align_limits: bool = False,
 ) -> dict:
     """
     Создаёт или продлевает платную подписку в 3x-ui по оплаченному заказу.
@@ -4174,6 +4175,32 @@ async def activate_paid_subscription(
             if existing is not None and comment_has_payment_ref(existing.get("comment"), payment_ref):
                 logger.info("Подписка %s (%s, %s) уже выдана по платежу %s — повторно не продлеваю.",
                             target_email, spot["title"], variant_title(protocol, variant), payment_ref)
+                # Досборка (/reissue) приводит лимиты уже выданных туннелей к тарифу заказа:
+                # у подписок, собранных из нескольких старых покупок, лимиты могли остаться
+                # от прежнего тарифа (например, 10 ГБ вместо 200 ГБ), а срок не меняем.
+                status = "already"
+                if align_limits:
+                    wanted_ip = int(tariff["ip_limit"])
+                    wanted_gb = int(tariff["traffic_gb"]) * (1024 ** 3)
+                    if (int(existing.get("limitIp") or 0) != wanted_ip
+                            or int(existing.get("totalGB") or 0) != wanted_gb):
+                        payload = _paid_client_payload(
+                            telegram_id,
+                            existing.get("id") or str(uuid.uuid4()),
+                            now_ms,
+                            inbound,
+                            tariff,
+                            int(existing.get("expiryTime") or 0),
+                            str(existing.get("comment") or comment),
+                            sub_id=str(existing.get("subId") or sub_id),
+                            group_name=group_name or "",
+                            email=target_email,
+                        )
+                        await client.update_client(inbound_id, payload)
+                        existing = payload
+                        status = "aligned"
+                        logger.info("Подписка %s: лимиты туннеля «%s» приведены к тарифу %s.",
+                                    target_email, variant_title(protocol, variant), tariff_key)
                 entries.append({
                     "location": spot.get("key"),
                     "location_title": spot.get("title"),
@@ -4184,7 +4211,7 @@ async def activate_paid_subscription(
                     "inbound_id": inbound_id,
                     "inbound_remark": inbound.get("remark"),
                     "resolved_by": "повторная выдача",
-                    "status": "already",
+                    "status": status,
                     "auto_picked": False,
                     "link": build_vless_link(existing, inbound, params) if protocol == "vless" else "",
                     "sub_link": await sub_link_for(existing.get("subId") or sub_id),
@@ -4263,8 +4290,10 @@ async def activate_paid_subscription(
         if entry["protocol"] not in delivered_protocols:
             delivered_protocols.append(entry["protocol"])
     tunnels = tunnels_from_entries(entries)
+    aligned = [entry for entry in entries if entry.get("status") == "aligned"]
     return {
         "email": target_email,
+        "aligned_count": len(aligned),
         "fresh_subscription": not reused_email,
         "previous_expiry_ms": previous_expiry_ms if not reused_email else prior_expiry_ms,
         "missing": missing,
@@ -8296,7 +8325,8 @@ async def cmd_reissue(message: Message):
         await message.answer(
             "🧩 <b>Дособрать туннели по оплаченному заказу</b>\n\n"
             "Пригодится, когда подключение добавили в панель уже после продажи:\n"
-            "команда выдаст недостающие туннели, не трогая выданные, и пришлёт клиенту "
+            "команда выдаст недостающие туннели, не трогая выданные, приведёт лимиты "
+            "уже выданных к тарифу заказа (срок не меняется) и пришлёт клиенту "
             "обновлённое сообщение со ссылкой-подпиской.\n\n"
             "Использование: <code>/reissue &lt;tg_id&gt; [order_id]</code>\n"
             "Например: <code>/reissue 5539948510</code> — по последнему оплаченному заказу.\n\n"
@@ -8338,7 +8368,10 @@ async def cmd_reissue(message: Message):
             payment_ref=payment_ref,
             location_key=order.get("location"),
             protocols=order.get("protocols"),
-            sub_email=order.get("email"),
+            # У заказов, выданных до появления отдельных подписок, email в заказе
+            # не сохранён: у них подписка — прежний tg-paid-<id>, его и дополняем.
+            sub_email=order.get("email") or paid_subscription_email(order["tg_id"]),
+            align_limits=True,
         )
     except Exception as exc:
         logger.error("Досборка туннелей не удалась (заказ %s): %s", order["id"], exc)
@@ -8352,6 +8385,7 @@ async def cmd_reissue(message: Message):
             pass
 
     created = [entry for entry in info["entries"] if entry.get("status") == "created"]
+    aligned_count = int(info.get("aligned_count") or 0)
     await payment_store.update(
         order["id"],
         expiry_ms=info["expiry_ms"],
@@ -8363,7 +8397,11 @@ async def cmd_reissue(message: Message):
     try:
         await bot.send_message(
             order["tg_id"],
-            "🧩 <b>Подписка обновлена — добавлены новые туннели.</b>\n\n"
+            "🧩 <b>Подписка обновлена</b>"
+            + (" — добавлены новые туннели" if created else "")
+            + (f", лимиты приведены к тарифу «{TARIFFS[tariff_key]['name']}»"
+               if aligned_count else "")
+            + ".\n\n"
             + access_block(info) + "\n\n"
             "Ссылка-подписка та же: открой её в приложении и обнови профиль, "
             "все конфиги появятся автоматически.",
@@ -8377,7 +8415,9 @@ async def cmd_reissue(message: Message):
     await message.answer(
         f"✅ <b>Заказ {escape(order['id'])}</b>\n"
         f"• Добавлено туннелей: <b>{len(created)}</b>\n"
-        f"• Всего туннелей в подписке: <b>{len(info['entries'])}</b>"
+        + (f"• Лимиты приведены к тарифу: <b>{aligned_count}</b> "
+           f"{tunnels_word(aligned_count)}\n" if aligned_count else "")
+        + f"• Всего туннелей в подписке: <b>{len(info['entries'])}</b>"
         + (f" (ожидалось {info['expected']})" if info.get("missing") else "") + "\n"
         f"• Клиент уведомлён: {'да' if delivered else '⚠️ нет — напиши ему вручную'}\n"
         + (("\n" + missing_tunnels_text(info.get("missing") or [])) if info.get("missing") else ""),

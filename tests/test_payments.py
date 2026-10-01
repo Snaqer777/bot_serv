@@ -2485,6 +2485,32 @@ async def test_new_subscription_per_purchase(store_file):
               and "3 туннеля" in profile_text,
               [line for line in profile_text.split("\n") if "◦" in line][:1])
 
+        # /reissue приводит лимиты выданных туннелей к тарифу заказа, не меняя срок:
+        # имитируем подписку, собранную из старых покупок (10 ГБ вместо 200 ГБ)
+        for row in client_rows(email):
+            row.update({"limitIp": 0, "totalGB": 1024 ** 3})   # «осталось от старого тарифа»
+        await bot.cmd_reissue(make_message(bot, text=f"/reissue {TG_TG_ID} {order['id']}"))
+        fixed_rows = client_rows(email)
+        check("досборка подтянула лимиты к тарифу заказа",
+              all(int(row["totalGB"]) == 10 * 1024 ** 3 and int(row["limitIp"]) == 1
+                  for row in fixed_rows),
+              f"{[(int(row['totalGB']) // 1024 ** 3, row['limitIp']) for row in fixed_rows]}")
+        check("срок при этом не изменился",
+              {int(row["expiryTime"]) for row in fixed_rows} == {first_expiry})
+        check("админу сказано про лимиты",
+              "Лимиты приведены к тарифу" in _last_api_text(),
+              _last_api_text()[:160].replace("\n", " "))
+
+        # Старый заказ (в журнале нет email): /reissue дополняет прежнюю подписку
+        # tg-paid-<id>, а не создаёт ещё одну
+        legacy = await bot.payment_store.get(order["id"])
+        await bot.payment_store.update(order["id"], email=None)
+        await bot.cmd_reissue(make_message(bot, text=f"/reissue {TG_TG_ID} {order['id']}"))
+        check("/reissue по старому заказу не создаёт новую подписку",
+              sub_emails() == [email, second_email],
+              f"{_last_api_text()[:120]} / {sub_emails()}")
+        await bot.payment_store.update(order["id"], email=legacy.get("email"))
+
         # /revoke снимает все подписки пользователя
         await bot.cmd_revoke(make_message(bot, text=f"/revoke {TG_TG_ID}"))
         check("/revoke снял все подписки пользователя",
