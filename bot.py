@@ -4431,15 +4431,18 @@ async def get_paid_subscription(telegram_id: int, email: str | None = None) -> d
                 if plan_index not in found_indexes:
                     found_indexes.append(plan_index)
                 meta = subscriptions.setdefault(plan_index, {
-                    "index": plan_index, "email": client_email, "expiry_ms": 0, "tunnels": 0})
+                    "index": plan_index, "email": client_email, "expiry_ms": 0, "tunnels": 0,
+                    "total_bytes": 0, "used_bytes": 0})
                 meta["expiry_ms"] = max(meta["expiry_ms"], int(candidate.get("expiryTime") or 0))
                 meta["tunnels"] += 1
+                meta["total_bytes"] = max(meta["total_bytes"], int(candidate.get("totalGB") or 0))
                 stats = {}
                 for stat in inbound.get("clientStats") or []:
                     if isinstance(stat, dict) and str(stat.get("email")) == client_email:
                         stats = stat
                         break
                 used = int(stats.get("up") or 0) + int(stats.get("down") or 0)
+                meta["used_bytes"] += used
                 protocol = inbound_protocol_key(inbound) or "vless"
                 variant = inbound_variant_key(inbound, protocol) or ""
                 spot = next((spot for spot in configured_locations()
@@ -4501,8 +4504,15 @@ def subscription_status_text(sub: dict | None) -> str:
             other_expiry = int(other.get("expiry_ms") or 0)
             term = (f"до {format_date(other_expiry)}" if other_expiry
                     else "без ограничения по времени")
+            other_total = int(other.get("total_bytes") or 0)
+            # Лимит показываем в тех же «ГБ», что и тарифы: 200 ГБ, а не 200 ГиБ.
+            quota = ("безлимит" if other_total <= 0
+                     else f"{round(other_total / (1024 ** 3))} ГБ")
+            if other_total > 0 and int(other.get("used_bytes") or 0) > 0:
+                quota += f", израсходовано {_human_bytes(int(other['used_bytes']))}"
             lines.append(f"   ◦ <code>{escape(str(other.get('email') or ''))}</code> — {term}, "
-                         f"{int(other.get('tunnels') or 0)} {tunnels_word(int(other.get('tunnels') or 0))}")
+                         f"{quota}, {int(other.get('tunnels') or 0)} "
+                         f"{tunnels_word(int(other.get('tunnels') or 0))}")
     if expiry_ms > 0:
         left_days = max(0, (expiry_ms - int(time.time() * 1000)) // 86_400_000)
         date = format_date(expiry_ms)
@@ -4513,7 +4523,8 @@ def subscription_status_text(sub: dict | None) -> str:
     total = sub["total_bytes"]
     used = sub["used_bytes"]
     if total > 0:
-        lines.append(f"• Трафик: <b>{_human_bytes(used)}</b> из {_human_bytes(total)}")
+        # Лимит — в тех же «ГБ», что и в тарифах (200 ГБ), израсходованное — «1.2 ГиБ».
+        lines.append(f"• Трафик: <b>{_human_bytes(used)}</b> из {round(total / (1024 ** 3))} ГБ")
     else:
         lines.append(f"• Трафик: <b>{_human_bytes(used)}</b> (безлимит)")
 
