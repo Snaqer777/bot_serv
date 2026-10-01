@@ -559,6 +559,73 @@ async def test_duplicate_inbound(store_file):
         await runner.cleanup()
 
 
+# ---------------- 3г. /reissue: дособрать туннели оплаченной подписке ----------
+
+async def test_reissue_command(store_file):
+    print("\n▶ 3г. /reissue: недостающие туннели доезжают до покупателя")
+    reset_all()
+    bot = new_bot({"mode": "platega", "admin_id": f"{TG_TG_ID}, 777", "admin_tools": "1",
+                   "allow_test_pay": "1"}, store_file + ".reissue")
+    runner = await bot.run_webhook_server()
+    email = f"tg-paid-{TG_TG_ID}"
+    # 1. Панель неполная: Варшавы нет вовсе, Стокгольм без Hysteria2.
+    removed = [item for item in list(ALL_INBOUNDS)
+               if item["remark"].startswith("Warsaw") or item["remark"] == "Stockholm-Hysteria2"]
+    for item in removed:
+        ALL_INBOUNDS.remove(item)
+    try:
+        await bot.start_checkout(TG_TG_ID, TG_TG_ID, "time_4")
+        order = [o for o in bot.payment_store.orders.values()][-1]
+        await post_platega_callback(order["id"], order["amount_rub"], transaction_id="701020")
+        check("сначала выдан неполный набор (8 туннелей)", len(clients_named(email)) == 8,
+              f"записей: {len(clients_named(email))}")
+        before = {c["id"] for c in clients_named(email)}
+
+        # 2. Админ доложил подключения в панель и дособрал туннели
+        ALL_INBOUNDS.extend(removed)
+        bot._INBOUNDS_CACHE.update({"at": 0.0, "items": []})
+        await bot.cmd_reissue(make_message(bot, text="/reissue"))
+        hint = tp._last_api_text()
+        check("без аргументов /reissue объясняет, как пользоваться",
+              "Использование" in hint and "tg_id" in hint)
+
+        tg_calls("sendMessage").clear()
+        await bot.cmd_reissue(make_message(bot, text=f"/reissue {TG_TG_ID}"))
+        subs = clients_named(email)
+        check("досборка довела подписку до 18 туннелей", len(subs) == 18,
+              f"записей: {len(subs)}")
+        check("ранее выданные туннели не пересоздавались",
+              before <= {c["id"] for c in subs},
+              f"было {len(before)}, стало {len({c['id'] for c in subs})}")
+        check("новые туннели получили тот же срок, что и остальная подписка",
+              len({int(c["expiryTime"]) for c in subs}) == 1,
+              str(sorted({int(c["expiryTime"]) for c in subs})))
+        check("subId по-прежнему один — ссылка у клиента не менялась",
+              len({c["subId"] for c in subs}) == 1)
+        note = tp._last_api_text()
+        check("админу отчёт: сколько добавили и что клиент уведомлён",
+              "Добавлено туннелей: <b>10</b>" in note and "Всего туннелей в подписке: <b>18</b>" in note,
+              note[:160].replace("\n", " "))
+        buyer_msgs = [m["params"]["text"] for m in tg_calls("sendMessage")
+                      if str(m["params"].get("chat_id")) == str(TG_TG_ID)]
+        check("покупателю пришло сообщение про новые туннели и ту же ссылку",
+              any("добавлены новые туннели" in text for text in buyer_msgs)
+              and any("/sub/" in text for text in buyer_msgs),
+              buyer_msgs[-1][:100].replace("\n", " ") if buyer_msgs else "нет сообщений")
+
+        # повторный вызов ничего не дублирует
+        tg_calls("sendMessage").clear()
+        await bot.cmd_reissue(make_message(bot, text=f"/reissue {TG_TG_ID}"))
+        check("повторный /reissue не плодит дубли",
+              len(clients_named(email)) == 18 and "Добавлено туннелей: <b>0</b>" in tp._last_api_text(),
+              tp._last_api_text()[:120].replace("\n", " "))
+    finally:
+        for item in removed:
+            if item not in ALL_INBOUNDS:
+                ALL_INBOUNDS.append(item)
+        await runner.cleanup()
+
+
 # ---------------- 4. Тариф «по трафику» ----------------
 
 async def test_traffic_tariff(store_file):
@@ -759,6 +826,7 @@ async def main():
         await test_delivery_tunnels(store_for("delivery"))
         await test_missing_tunnels(store_for("missing"))
         await test_duplicate_inbound(store_for("duplicate"))
+        await test_reissue_command(store_for("reissue"))
         await test_traffic_tariff(store_for("traffic"))
         await test_test_pay(store_for("testpay"))
         await test_inbounds_diag(store_for("diag"))

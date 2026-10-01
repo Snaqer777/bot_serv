@@ -3011,6 +3011,8 @@ def payments_diag_text() -> str:
         )
     elif test_pay_enabled():
         lines.append("• <code>/test_pay</code> — выдача ключа без оплаты: <b>включена</b> ✅")
+        lines.append("• <code>/reissue &lt;tg_id&gt;</code> — дособрать туннели оплаченной "
+                     "подписке после настройки панели")
     else:
         lines.append(
             "• <code>/test_pay</code> — выдача ключа без оплаты: скрыта. "
@@ -3930,15 +3932,19 @@ async def activate_paid_subscription(
         # со всеми протоколами, вариантами и серверами. Если подписка уже была —
         # сохраняем прежний subId, чтобы ссылка у клиента не менялась при продлении.
         sub_id = ""
+        # Заодно ищем, до какой даты уже выдана эта подписка: если заказ дособирают
+        # (подключение добавили в панели позже), новые туннели должны закончиться
+        # вместе с остальными, а не получить свежий срок.
+        prior_expiry_ms = 0
         for inbound in inbounds:
             settings = as_dict(inbound.get("settings"))
             for candidate in settings.get("clients") or []:
-                if (isinstance(candidate, dict) and str(candidate.get("email")) == target_email
-                        and str(candidate.get("subId") or "").strip()):
+                if not isinstance(candidate, dict) or str(candidate.get("email")) != target_email:
+                    continue
+                if (str(candidate.get("subId") or "").strip() and not sub_id):
                     sub_id = str(candidate["subId"]).strip()
-                    break
-            if sub_id:
-                break
+                if comment_has_payment_ref(candidate.get("comment"), payment_ref):
+                    prior_expiry_ms = max(prior_expiry_ms, int(candidate.get("expiryTime") or 0))
         if not sub_id:
             sub_id = secrets.token_hex(8)
 
@@ -4048,7 +4054,11 @@ async def activate_paid_subscription(
                 existing_expiry = int(existing.get("expiryTime") or 0)
                 if existing_expiry > now_ms:
                     base_ms = existing_expiry
-            expires_ms = (base_ms + total_days * 86400 * 1000) if limited else 0
+            if existing is None and prior_expiry_ms > now_ms:
+                # Досборка уже выданной подписки: тот же срок, что у остальных туннелей.
+                expires_ms = prior_expiry_ms
+            else:
+                expires_ms = (base_ms + total_days * 86400 * 1000) if limited else 0
 
             payload = _paid_client_payload(
                 telegram_id,
@@ -4493,7 +4503,9 @@ async def notify_payment_success(order: dict, info: dict) -> bool:
             + access_note
             + (("\n\n" + missing_tunnels_text(info.get("missing") or []))
                if info.get("missing") else "")
-            + ("\n\nПолная карта подключений: /panel_debug" if info.get("missing") else "")
+            + ("\n\nПосле создания подключений выдай недостающие туннели командой "
+               f"<code>/reissue {order['tg_id']}</code> — выданное она не трогает. "
+               "Полная карта подключений: /panel_debug" if info.get("missing") else "")
         )
 
     return delivered
@@ -7352,6 +7364,8 @@ async def cmd_panel_debug(message: Message):
                     lines.append(f"      • …и ещё {len(missing_tunnels) - 20}")
                 lines.append("      <i>Созданные подключения называй как «Stockholm-VLESS-XHTTP» "
                              "или «Warsaw-Shadowsocks-AES-256» — бот найдёт их сам.</i>")
+                lines.append("      <i>Уже проданным подпискам недостающие туннели выдаёт "
+                             "команда <code>/reissue &lt;tg_id&gt;</code>.</i>")
                 lines.append("")
             declared = max(TARIFF_LEVELS[level]["servers"] for level in TARIFF_LEVEL_ORDER)
             if len(configured_locations()) < declared:
@@ -7713,6 +7727,116 @@ async def cb_tariff_protocol_done(cb: CallbackQuery):
     text = tariff_confirm_text(plan, location_key, chosen)
     keyboard = tariff_confirm_kb(selection["tariff"], location_key)
     await show_screen(cb, text, keyboard)
+
+
+@dp.message(Command("reissue"))
+async def cmd_reissue(message: Message):
+    """
+    Дособирает туннели уже оплаченной подписке (только админ).
+
+    Нужна после настройки панели: клиент оплатил тариф, часть подключений в панели
+    отсутствовала, и бот выдал меньше туннелей. Команда заново проходит выдачу по
+    последнему оплаченному заказу: уже выданные туннели не трогает (они «already»),
+    недостающие создаёт с тем же сроком, что и остальная подписка, и присылает
+    покупателю свежее сообщение со ссылкой-подпиской.
+
+    Использование: /reissue <tg_id> [order_id]
+    """
+    if not is_admin(message.from_user.id):
+        await message.answer(admin_denied_text(message.from_user.id), parse_mode="HTML")
+        return
+
+    args = (message.text or "").split()
+    if len(args) < 2 or not args[1].lstrip("-").isdigit():
+        await message.answer(
+            "🧩 <b>Дособрать туннели по оплаченному заказу</b>\n\n"
+            "Пригодится, когда подключение добавили в панель уже после продажи:\n"
+            "команда выдаст недостающие туннели, не трогая выданные, и пришлёт клиенту "
+            "обновлённое сообщение со ссылкой-подпиской.\n\n"
+            "Использование: <code>/reissue &lt;tg_id&gt; [order_id]</code>\n"
+            "Например: <code>/reissue 5539948510</code> — по последнему оплаченному заказу.\n\n"
+            "Что видит бот в панели — /panel_debug.",
+            parse_mode="HTML",
+        )
+        return
+
+    tg_id = int(args[1])
+    order = None
+    if len(args) > 2:
+        order = await payment_store.get(args[2])
+        if order is None:
+            await message.answer("❓ Заказ с таким номером не найден.", parse_mode="HTML")
+            return
+    else:
+        paid = [item for item in payment_store.orders.values()
+                if int(item.get("tg_id") or 0) == tg_id and item.get("status") == "paid"
+                and not item.get("simulated")]
+        if not paid:
+            await message.answer(
+                f"❓ У пользователя <code>{tg_id}</code> нет оплаченных заказов.", parse_mode="HTML"
+            )
+            return
+        order = max(paid, key=lambda item: int(item.get("paid_at") or item.get("created_at") or 0))
+
+    tariff_key = str(order.get("tariff") or "")
+    if tariff_key not in TARIFFS or TARIFFS[tariff_key]["price"] <= 0:
+        await message.answer("❓ В заказе неизвестный тариф — дособрать нельзя.", parse_mode="HTML")
+        return
+
+    payment_ref = order_charge_id(order) or str(order.get("id"))
+    wait_msg = await message.answer("🧩 Дособираю туннели по заказу…")
+    try:
+        info = await activate_paid_subscription(
+            int(order["tg_id"]),
+            tariff_key,
+            order_id=order["id"],
+            payment_ref=payment_ref,
+            location_key=order.get("location"),
+            protocols=order.get("protocols"),
+        )
+    except Exception as exc:
+        logger.error("Досборка туннелей не удалась (заказ %s): %s", order["id"], exc)
+        await message.answer(f"❌ Не получилось: <code>{escape(_snip(str(exc), 400))}</code>",
+                             parse_mode="HTML")
+        return
+    finally:
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+
+    created = [entry for entry in info["entries"] if entry.get("status") == "created"]
+    await payment_store.update(
+        order["id"],
+        expiry_ms=info["expiry_ms"],
+        link=info.get("link"),
+        sub_link=info.get("sub_link"),
+        notified=True,
+    )
+    delivered = True
+    try:
+        await bot.send_message(
+            order["tg_id"],
+            "🧩 <b>Подписка обновлена — добавлены новые туннели.</b>\n\n"
+            + access_block(info) + "\n\n"
+            "Ссылка-подписка та же: открой её в приложении и обнови профиль, "
+            "все конфиги появятся автоматически.",
+            parse_mode="HTML",
+            reply_markup=key_actions_kb(int(order["tg_id"])),
+        )
+    except Exception as exc:
+        delivered = False
+        logger.error("Не удалось уведомить %s о досборке туннелей: %s", order["tg_id"], exc)
+
+    await message.answer(
+        f"✅ <b>Заказ {escape(order['id'])}</b>\n"
+        f"• Добавлено туннелей: <b>{len(created)}</b>\n"
+        f"• Всего туннелей в подписке: <b>{len(info['entries'])}</b>"
+        + (f" (ожидалось {info['expected']})" if info.get("missing") else "") + "\n"
+        f"• Клиент уведомлён: {'да' if delivered else '⚠️ нет — напиши ему вручную'}\n"
+        + (("\n" + missing_tunnels_text(info.get("missing") or [])) if info.get("missing") else ""),
+        parse_mode="HTML",
+    )
 
 
 @dp.callback_query(F.data == "check_payment_help")
@@ -9132,6 +9256,9 @@ elif admin_tools_enabled():
 
 # Проверка выдачи ключа без оплаты — отдельный флаг TEST_TOOLS и только когда
 # включены служебные команды: в боевом виде она не регистрируется вообще.
+if admin_tools_enabled():
+    dp.message.register(cmd_reissue, Command("reissue"))
+
 if test_tools_enabled():
     dp.message.register(cmd_test_pay, Command("test_pay"))
     dp.callback_query.register(cb_testpay_menu, F.data == "testpay_menu")
