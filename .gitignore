@@ -2,6 +2,3 @@
 __pycache__/
 *.pyc
 .venv/
-
-# журнал оплат
-data/

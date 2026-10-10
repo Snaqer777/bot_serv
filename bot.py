@@ -487,6 +487,12 @@ TRIAL_PUBLIC = (os.getenv("TRIAL_PUBLIC") or "0").strip().lower() in ("1", "true
 #   1 — кнопки показываются тем, кому доступен тест (см. TRIAL_PUBLIC).
 TRIAL_BUTTON = (os.getenv("TRIAL_BUTTON") or "0").strip().lower() in ("1", "true", "yes", "on")
 
+# --- Рассылка всем пользователям ---
+# Состояние ожидающих подтверждения рассылок (в памяти): bid → {text, entities, reply_markup, recipients}
+_pending_broadcast: dict[str, dict] = {}
+# Сколько одновременных отправок держать при рассылке (чтобы Telegram не начал отбрасывать запросы)
+BROADCAST_CONCURRENCY = 15
+
 # --- Реферальная программа («пригласи друга») ---
 # Работает во всех режимах оплаты: бонусные дни начисляются после ПЕРВОЙ оплаты
 # приглашённого. Пока приглашённый не купил подписку, ничего не начисляется —
@@ -9394,6 +9400,169 @@ async def cmd_revoke(message: Message):
         except Exception:
             pass
         await send_error_message(message, exc)
+
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    """Рассылка сообщения всем пользователям (только админ).
+
+    Использование:
+      /broadcast <текст>        — показывает превью и кнопки «Отправить / Отменить»
+      /broadcast (reply на сообщение) — разошлёт то сообщение (с форматированием и кнопками)
+    """
+    if not is_admin(message.from_user.id):
+        await message.answer(admin_denied_text(message.from_user.id), parse_mode="HTML")
+        return
+
+    referral_store.load()
+    recipients = list({int(uid): 1 for uid in referral_store.started if int(uid) > 0}.keys())
+
+    target = message.reply_to_message if getattr(message, "reply_to_message", None) else None
+    parts = (message.text or "").split(maxsplit=1)
+    text_arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if target is None and not text_arg:
+        await message.answer(
+            "📣 <b>Рассылка всем пользователям</b>\n\n"
+            "<b>Способы:</b>\n"
+            "• <code>/broadcast Текст рассылки</code> — бот покажет превью и попросит подтвердить.\n"
+            "• <i>ответьте (reply)</i> на любое сообщение в чате с ботом командой "
+            "<code>/broadcast</code> без текста — разошлёт его целиком, с форматированием и кнопками.\n\n"
+            f"<i>Получателей в базе: <b>{len(recipients)}</b>. Рассылка идёт пачками по "
+            f"{BROADCAST_CONCURRENCY} сообщений, в конце — отчёт: сколько доставлено, "
+            "сколько заблокировали бота.</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    if target is not None:
+        preview_text = target.text or target.caption or ""
+        preview_entities = target.entities or target.caption_entities
+        reply_markup = target.reply_markup
+    else:
+        preview_text = text_arg
+        preview_entities = None
+        if message.entities:
+            cmd_len = len("/broadcast ")
+            preview_entities = [
+                type(e)(**{**e.model_dump(), "offset": max(0, int(e.offset) - cmd_len)})
+                for e in message.entities if int(e.offset) >= cmd_len
+            ]
+        reply_markup = None
+
+    bid = secrets.token_hex(6)
+    _pending_broadcast[bid] = {
+        "text": preview_text,
+        "entities": preview_entities,
+        "reply_markup": reply_markup,
+        "recipients": recipients,
+    }
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Отправить всем", callback_data=f"bcast_go_{bid}"),
+        InlineKeyboardButton(text="❌ Отменить", callback_data=f"bcast_cancel_{bid}"),
+    ]])
+    try:
+        await message.answer(
+            f"📣 <b>Превью рассылки</b>\n"
+            f"Получателей: <b>{len(recipients)}</b>\n"
+            "<i>Ниже — как сообщение будет выглядеть у получателей:</i>\n",
+            parse_mode="HTML",
+        )
+        await message.answer(
+            preview_text,
+            entities=preview_entities,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+        await message.answer("Подтвердите отправку:", reply_markup=kb)
+    except Exception as exc:
+        _pending_broadcast.pop(bid, None)
+        await message.answer(
+            f"❌ Не получилось сформировать превью: <code>{escape(_snip(str(exc), 300))}</code>",
+            parse_mode="HTML",
+        )
+
+
+@dp.callback_query(F.data.startswith("bcast_cancel_"))
+async def cb_broadcast_cancel(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer(admin_denied_text(cb.from_user.id), show_alert=True)
+        return
+    _pending_broadcast.pop(cb.data.removeprefix("bcast_cancel_"), None)
+    await cb.answer("Рассылка отменена")
+    try:
+        await cb.message.edit_text("❌ Рассылка отменена.", parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("bcast_go_"))
+async def cb_broadcast_go(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer(admin_denied_text(cb.from_user.id), show_alert=True)
+        return
+    data = _pending_broadcast.pop(cb.data.removeprefix("bcast_go_"), None)
+    if not data:
+        await cb.answer("Рассылка уже отменена или отправлена", show_alert=True)
+        return
+
+    recipients = list(data.get("recipients") or [])
+    text = str(data.get("text") or "")
+    entities = data.get("entities")
+    reply_markup = data.get("reply_markup")
+
+    await cb.answer("Рассылка запущена...")
+    progress = await cb.message.answer(
+        f"📣 Рассылаю… 0 / {len(recipients)}", parse_mode="HTML")
+
+    ok = 0
+    bad = 0
+    errors: list[tuple[int, str]] = []
+    sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
+
+    async def _send_one(uid: int):
+        nonlocal ok, bad
+        try:
+            async with sem:
+                await bot.send_message(
+                    uid, text, entities=entities, reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                )
+            ok += 1
+        except Exception as exc:
+            bad += 1
+            reason = _snip(str(exc), 120)
+            errors.append((uid, reason))
+        finally:
+            done = ok + bad
+            if done % 25 == 0 or done == len(recipients):
+                try:
+                    await progress.edit_text(
+                        f"📣 Рассылаю… {done} / {len(recipients)} "
+                        f"(✅ {ok}, ❌ {bad})", parse_mode="HTML")
+                except Exception:
+                    pass
+
+    await asyncio.gather(*(_send_one(uid) for uid in recipients), return_exceptions=True)
+    try:
+        await progress.delete()
+    except Exception:
+        pass
+
+    report = (
+        f"✅ <b>Рассылка завершена</b>\n"
+        f"• Всего получателей: <b>{len(recipients)}</b>\n"
+        f"• Доставлено: <b>{ok}</b>\n"
+        f"• Не доставлено: <b>{bad}</b>"
+    )
+    if errors:
+        sample = "; ".join(f"<code>{uid}</code>: {escape(reason)}"
+                           for uid, reason in errors[:10])
+        report += f"\n\nПервые ошибки:\n{sample}"
+        if len(errors) > 10:
+            report += f"\n<i>… ещё {len(errors) - 10}.</i>"
+    await cb.message.answer(report, parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "profile")
