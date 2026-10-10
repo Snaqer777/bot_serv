@@ -29,7 +29,7 @@ from panel import PANEL, load_bot, make_app, reset
 # В боте теперь сетка «тип подписки × уровень»: time_<уровень> (ограничение по
 # времени) и traffic_<уровень> (только трафик). В сценариях используем понятные
 # псевдонимы: цены, лимиты и сроки берём из bot.TARIFFS, чтобы тесты читались.
-BASIC = "time_4"       # 450 ₽, 30 дней, 200 ГБ, безлимит устройств (Призрак)
+BASIC = "time_4"       # 450 ₽, 30 дней, безлимит трафика, безлимит устройств (Призрак)
 FAMILY = "time_3"      # 250 ₽, 30 дней, 100 ГБ, 5 устройств (Кибер-самурай)
 SCHOOL = "time_1"      # 70 ₽, 15 дней, 10 ГБ, 1 устройство (Новичок)
 PREMIUM = "time_2"     # 130 ₽, 15 дней, 50 ГБ, 3 устройства
@@ -508,8 +508,9 @@ async def test_stars_flow(store_file):
           f"{days_left(client) if client else '—'} дн.")
     basic_ips = bot.TARIFFS[BASIC]["ip_limit"]
     check(f"лимит устройств взят из тарифа ({basic_ips})", client and client.get("limitIp") == basic_ips)
-    check("трафик — 200 ГБ из тарифа «Призрак» по времени",
-          client and round(client.get("totalGB", 0) / (1024 ** 3)) == bot.TARIFFS[BASIC]["traffic_gb"],
+    check("трафик у «Призрака» по времени — безлимит (0 байт/ГБ)",
+          client and int(client.get("totalGB", 0)) == 0
+          and bot.TARIFFS[BASIC]["traffic_gb"] == 0,
           str(client.get("totalGB") if client else None))
     check("tgId записан в панель", client and client.get("tgId") == TG_TG_ID)
     check("в комментарии — id тарифа и дата", client and client["comment"].startswith(f"{BASIC} до "))
@@ -2434,7 +2435,7 @@ async def test_new_subscription_per_purchase(store_file):
         check("лимиты первой подписки — из тарифа «Новичок»",
               int(first_rows[0]["totalGB"]) == 10 * 1024 ** 3 and int(first_rows[0]["limitIp"]) == 1)
 
-        # Вторая покупка: «Призрак» по времени — 200 ГБ, безлимит устройств, 18 туннелей
+        # Вторая покупка: «Призрак» по времени — безлимит трафика, безлимит устройств, 18 туннелей
         tg_calls("sendMessage").clear()
         await bot.start_checkout(TG_TG_ID, TG_TG_ID, BASIC)
         order2 = [o for o in bot.payment_store.orders.values()][-1]
@@ -2445,9 +2446,8 @@ async def test_new_subscription_per_purchase(store_file):
         check("вторая покупка создала отдельную подписку",
               status == 200 and len(second_rows) == 18 and sub_emails() == [email, second_email],
               f"{len(second_rows)} записей, подписки: {sub_emails()}")
-        check("у новой подписки свои лимиты (200 ГБ, безлимит устройств)",
-              int(second_rows[0]["totalGB"]) == 200 * 1024 ** 3
-              and int(second_rows[0]["limitIp"]) == 0,
+        check("у новой подписки безлимитный трафик и безлимит устройств",
+              int(second_rows[0]["totalGB"]) == 0 and int(second_rows[0]["limitIp"]) == 0,
               f"{int(second_rows[0]['totalGB']) // 1024 ** 3} ГБ, limitIp={second_rows[0]['limitIp']}")
         check("у новой подписки своя ссылка (другой subId)",
               second_rows[0]["subId"] != first_sub_id)
@@ -2488,7 +2488,7 @@ async def test_new_subscription_per_purchase(store_file):
         # /reissue приводит лимиты выданных туннелей к тарифу заказа, не меняя срок:
         # имитируем подписку, собранную из старых покупок (10 ГБ вместо 200 ГБ)
         for row in client_rows(email):
-            row.update({"limitIp": 0, "totalGB": 1024 ** 3})   # «осталось от старого тарифа»
+            row.update({"limitIp": 0, "totalGB": 1 * 1024 ** 3})  # «осталось от старого тарифа»
         await bot.cmd_reissue(make_message(bot, text=f"/reissue {TG_TG_ID} {order['id']}"))
         fixed_rows = client_rows(email)
         check("досборка подтянула лимиты к тарифу заказа",
@@ -2557,12 +2557,12 @@ async def test_tariff_upgrade_flow(store_file):
         await post_platega_callback(order2["id"], order2["amount_rub"], transaction_id="910002")
         rich_email = f"tg-paid-{TG_TG_ID}-2"
         rich_rows = client_rows(rich_email)
-        check("дорогой тариф дал ОТДЕЛЬНУЮ подписку с трафиком дорогого (200 ГБ)",
-              len(rich_rows) == 18 and int(rich_rows[0]["totalGB"]) == 200 * 1024 ** 3,
+        check("дорогой тариф дал ОТДЕЛЬНУЮ подписку с безлимитом трафика (Призрак)",
+              len(rich_rows) == 18 and int(rich_rows[0]["totalGB"]) == 0,
               f"{len(rich_rows)} туннелей, {int(rich_rows[0]['totalGB']) // 1024 ** 3} ГБ")
         check("у дорогой подписки безлимит устройств (тариф «Призрак»)",
               all(int(row["limitIp"]) == 0 for row in rich_rows))
-        check("дорогой трафик не размазан по дешёвым туннелям",
+        check("дешёвые туннели не тронуты, трафик у них остался 10 ГБ",
               all(int(row["totalGB"]) == 10 * 1024 ** 3 for row in client_rows(cheap_email)),
               f"{[int(r['totalGB']) // 1024 ** 3 for r in client_rows(cheap_email)]} ГБ")
         check("срок дорогой подписки — 30 дней от оплаты, а не сумма с дешёвой",
@@ -2570,34 +2570,41 @@ async def test_tariff_upgrade_flow(store_file):
         check("израсходованное в новой подписке считается с нуля",
               int(rich_rows[0].get("up") or 0) + int(rich_rows[0].get("down") or 0) == 0,
               str(int(rich_rows[0].get("up") or 0) + int(rich_rows[0].get("down") or 0)))
-        check("все три доступа существуют одновременно и не пересекаются",
+        check("все три доступа существуют одновременно и не пересекаются (пока — 2 подписки)",
               sub_emails() == [cheap_email, rich_email]
               and {row["subId"] for row in rich_rows}.isdisjoint(
                   {row["subId"] for row in cheap_rows}),
-              f"{sub_emails()}, subId дорогой: {rich_rows[0]['subId'][:8]}…")
+              f"{sub_emails()}, subId богатой: {rich_rows[0]['subId'][:8]}…")
 
         # 4. Профиль: видно обе платные подписки с их трафиком, последняя — наверху
+        tg_calls("sendMessage").clear()
         await bot.send_profile(make_message(bot), TG_TG_ID)
-        profile_text = _last_api_text()
-        check("профиль показывает последнюю (дорогую) подписку как активную",
+        profile_text = "".join(m["params"].get("text", "") for m in tg_calls("sendMessage")
+                               if "Твой профиль" in m["params"].get("text", "")
+                               or "Подписка:" in m["params"].get("text", ""))
+        check("профиль показывает последнюю (дорогую) подписку как активную — безлимит",
               "Подписок у аккаунта: <b>2</b>" in profile_text
-              and "200 ГБ" in profile_text)
-        check("в профиле перечислена и дешёвая подписка с её лимитом",
-              f"<code>{cheap_email}</code>" in profile_text and "10 ГБ" in profile_text,
-              [line for line in profile_text.split("\n") if "◦" in line][:2])
+              and ("Безлимит" in profile_text or "безлимит" in profile_text),
+              [line for line in profile_text.split("\n") if "Трафик" in line or "Безлим" in line][:2])
+        check("в профиле перечислены обе подписки с их лимитами (дешёвая 10 ГБ, дорогая безлимит)",
+              f"<code>{cheap_email}</code>" in profile_text and "10 ГБ" in profile_text
+              and f"<code>{rich_email}</code>" not in profile_text  # rich — активная, не в «остальных»
+              and ("безлимит" in profile_text.lower()),
+              [line for line in profile_text.split("\n") if "◦" in line or "Трафик" in line][:3])
 
-        # 5. Новая покупка после дорогой: третья подписка, снова свои лимиты
+        # 5. Новая покупка (по трафику, 200 ГБ): третья подписка со своим лимитом
         await bot.start_checkout(TG_TG_ID, TG_TG_ID, "traffic_4")
         order3 = [o for o in bot.payment_store.orders.values()][-1]
         await post_platega_callback(order3["id"], order3["amount_rub"], transaction_id="910003")
         third_rows = client_rows(f"tg-paid-{TG_TG_ID}-3")
-        check("третья покупка — третья подписка со своими лимитами (безлимит устройств)",
+        check("третья покупка — третья подписка: 200 ГБ, без срока, безлимит устройств",
               len(third_rows) == 18 and int(third_rows[0]["limitIp"]) == 0
-              and int(third_rows[0]["expiryTime"]) == 0,
-              f"{len(third_rows)} туннелей, limitIp={third_rows[0]['limitIp']}, "
-              f"expiry={third_rows[0]['expiryTime']}")
-        check("подписки прежних покупок не изменились",
-              all(int(row["totalGB"]) == 200 * 1024 ** 3 for row in client_rows(rich_email))
+              and int(third_rows[0]["expiryTime"]) == 0
+              and int(third_rows[0]["totalGB"]) == 200 * 1024 ** 3,
+              f"{len(third_rows)} туннелей, ГБ={int(third_rows[0]['totalGB']) // 1024 ** 3}, "
+              f"limitIp={third_rows[0]['limitIp']}, expiry={third_rows[0]['expiryTime']}")
+        check("подписки прежних покупок не изменились (безлимит и 10 ГБ)",
+              all(int(row["totalGB"]) == 0 for row in client_rows(rich_email))
               and all(int(row["totalGB"]) == 10 * 1024 ** 3 for row in client_rows(cheap_email)))
     finally:
         await runner.cleanup()

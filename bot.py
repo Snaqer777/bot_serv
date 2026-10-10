@@ -5785,7 +5785,7 @@ TARIFF_GRID = {
         1: {"price": 70, "traffic_gb": 10, "days": 15},
         2: {"price": 130, "traffic_gb": 50, "days": 15},
         3: {"price": 250, "traffic_gb": 100, "days": 30},
-        4: {"price": 450, "traffic_gb": 200, "days": 30},
+        4: {"price": 450, "traffic_gb": 0, "days": 30},
     },
 }
 
